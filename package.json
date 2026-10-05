@@ -48,7 +48,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.client.json",
     "prepublishOnly": "npm run build",
-    "test": "node --test test/unit.test.ts",
+    "test": "node --test test/unit.test.ts test/register.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json"
   },
   "repository": {

@@ -54,6 +54,8 @@ const SLOT_ID = 'secret.request.dialog'
 const PENDING_PATH = '/api/secret.pending'
 const ANSWER_PATH = '/api/secret.answer'
 const POLL_MS = 1200
+/** How long a one-shot notice stays on screen before dismissing itself. */
+const NOTICE_MS = 8000
 
 /** Every visible string of the dialog (this profile's UI language is Chinese). */
 const TEXT = {
@@ -84,6 +86,8 @@ const TEXT = {
   busy: '提交中…',
   rejectHint: '拒绝：Agent 会停止，不会重试。',
   ignoreHint: '忽略：本次不授权，Agent 可稍后再问。',
+  expired: '该授权请求已结束（超时、被取消，或已在另一个窗口处理），对话框已自动关闭。',
+  dismiss: '关闭',
 } as const
 
 function firstView(payload: unknown): PendingViewLike | null {
@@ -102,6 +106,20 @@ function firstView(payload: unknown): PendingViewLike | null {
     variable: typeof candidate.variable === 'string' ? candidate.variable : '',
     alreadyConfigured: candidate.alreadyConfigured === true,
   }
+}
+
+/** Ids of every interaction still waiting, so a stale dialog can notice its own end. */
+function waitingIds(payload: unknown): string[] {
+  if (typeof payload !== 'object' || payload === null) return []
+  const requests = (payload as { requests?: unknown }).requests
+  if (!Array.isArray(requests)) return []
+  const ids: string[] = []
+  for (const entry of requests) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const id = (entry as { id?: unknown }).id
+    if (typeof id === 'string') ids.push(id)
+  }
+  return ids
 }
 
 const loader = (globalThis as unknown as { __ModuleLoader__?: ModuleLoaderTarget }).__ModuleLoader__
@@ -194,6 +212,7 @@ loader?.load({
       const [text, setText] = React.useState('')
       const [error, setError] = React.useState<string | null>(null)
       const [busy, setBusy] = React.useState(false)
+      const [notice, setNotice] = React.useState<string | null>(null)
 
       /** One selectable scope, with the notice that explains what it means. */
       function scopeOption(next: Scope, title: string, note: string) {
@@ -225,9 +244,25 @@ loader?.load({
         )
       }
 
+      /**
+       * The interaction currently on screen. The poll keys on this id rather than
+       * on the whole view object, so a re-poll never overwrites what the human is
+       * typing.
+       */
+      const displayedId = request === null ? null : request.id
+
       React.useEffect(() => {
-        if (request !== null) return undefined
         let alive = true
+        const adopt = (view: PendingViewLike) => {
+          setValue('')
+          setText('')
+          setError(null)
+          setMode('decide')
+          setReveal(false)
+          setScope(view.requestedScope)
+          setNotice(null)
+          setRequest(view)
+        }
         const poll = () => {
           void fetch(PENDING_PATH, {
             credentials: 'same-origin',
@@ -236,15 +271,22 @@ loader?.load({
             .then(async (response) => (response.ok ? await response.json() : undefined))
             .then((payload: unknown) => {
               if (!alive) return
-              const view = firstView(payload)
-              if (view === null) return
+              if (displayedId === null) {
+                const view = firstView(payload)
+                if (view !== null) adopt(view)
+                return
+              }
+              // Keep an open dialog while its request is still waiting, and close
+              // it the moment the Host dropped it — a timeout, a cancellation, a
+              // reload, or an answer from another window. The overlay covers the
+              // whole viewport and opts back into pointer events, so it must never
+              // outlive its request.
+              if (waitingIds(payload).includes(displayedId)) return
               setValue('')
               setText('')
               setError(null)
-              setMode('decide')
-              setReveal(false)
-              setScope(view.requestedScope)
-              setRequest(view)
+              setRequest(null)
+              setNotice(TEXT.expired)
             })
             .catch(() => undefined)
         }
@@ -254,7 +296,13 @@ loader?.load({
           alive = false
           clearInterval(timer)
         }
-      }, [request])
+      }, [displayedId])
+
+      React.useEffect(() => {
+        if (notice === null) return undefined
+        const timer = setTimeout(() => setNotice(null), NOTICE_MS)
+        return () => clearTimeout(timer)
+      }, [notice])
 
       async function submit(decision: Decision) {
         if (request === null || busy) return
@@ -277,6 +325,18 @@ loader?.load({
             | { ok?: boolean; error?: string }
             | undefined
           if (payload?.ok !== true) {
+            // A 409 means the Host is no longer waiting for this interaction
+            // (timeout, another window answered it, or the plugin reloaded).
+            // Keeping the dialog open would leave the full-viewport overlay stuck
+            // with nothing left to answer, so close it and say why.
+            if (response.status === 409) {
+              setValue('')
+              setText('')
+              setRequest(null)
+              setNotice(TEXT.expired)
+              setBusy(false)
+              return
+            }
             setError(payload?.error ?? `提交失败（HTTP ${String(response.status)}）`)
             setBusy(false)
             return
@@ -303,7 +363,52 @@ loader?.load({
         }
       }, [request, busy, scope, value, mode, text])
 
-      if (request === null) return null
+      if (request === null) {
+        if (notice === null) return null
+        // A one-shot, non-blocking notice: it never covers the UI the way the
+        // dialog does (the wrapper is click-through; only the card is not).
+        return h(
+          'div',
+          {
+            style: {
+              position: 'fixed',
+              left: '50%',
+              bottom: '24px',
+              transform: 'translateX(-50%)',
+              zIndex: 40,
+              pointerEvents: 'none',
+            },
+          },
+          h(
+            'div',
+            {
+              role: 'status',
+              style: {
+                display: 'flex',
+                gap: '10px',
+                alignItems: 'center',
+                maxWidth: 'min(560px, calc(100vw - 32px))',
+                boxSizing: 'border-box',
+                padding: '10px 12px',
+                borderRadius: 'var(--dsw-radius-md)',
+                border: '1px solid var(--dsw-alias-border-l2)',
+                background: 'var(--dsw-alias-bg-base)',
+                boxShadow: 'var(--dsw-shadow-lv2)',
+                color: 'var(--dsw-alias-label-primary)',
+                fontFamily: 'var(--dsw-font-family)',
+                fontSize: 'var(--dsw-font-s-14-font-size, 14px)',
+                pointerEvents: 'auto',
+              },
+            },
+            h('span', null, notice),
+            h(
+              'button',
+              { type: 'button', onClick: () => setNotice(null), style: buttonStyle('ghost') },
+              TEXT.dismiss,
+            ),
+          ),
+        )
+      }
 
       const scopeTitle = scope === 'persistent' ? TEXT.scopePersistent : TEXT.scopeSession
       const requestedTitle = request.requestedScope === 'persistent' ? TEXT.scopePersistent : TEXT.scopeSession

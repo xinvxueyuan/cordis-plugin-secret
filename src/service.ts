@@ -358,7 +358,7 @@ export class SecretService {
     const notice = revocation === undefined
       ? undefined
       : revocation.code === 'revoked-anchor'
-        ? '上一次授权已随会话回退（编辑/重试）失效并被撤销，本次重新授权覆盖了它。'
+        ? '上一次授权所锚定的事件已不在当前会话表面上（会话回退/重写，或该事件被压缩覆盖），因此已失效并被本次重新授权覆盖。'
         : '上一次授权已不再属于本会话（会话分叉或结束），本次重新授权覆盖了它。'
     return approvedResult(plan, context.envVar, notice)
   }

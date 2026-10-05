@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { anchorSessionOf, classifyCaller, credentialsPort, sessionOf } from '../src/adapters.ts'
 import { findAnchorSeq } from '../src/anchor.ts'
 import { approvedResult, mapNonApproved, planGrant } from '../src/decisions.ts'
+import { EnvContributorRegistry, agentIdOf } from '../src/envs.ts'
 import { GrantStore, type GrantSessionLike } from '../src/grants.ts'
 import { deriveEnvVar, effectiveEnvVar, recordKey, validateRequest } from '../src/naming.ts'
 import { PendingStore, SecretAbortedError } from '../src/pending.ts'
@@ -476,7 +478,7 @@ test('a grant is revoked when its anchor leaves the session surface and the entr
   if (result.decision === 'approved') assert.match(String(result.notice), /回退/u)
 })
 
-test('a compaction-style replaceGeneration change with the anchor present does not revoke', async () => {
+test('replaceGeneration moving on its own never revokes; a real fold that keeps the anchor does not either', async () => {
   const { service, session } = harness()
   const pending = service.request(
     { name: 'openai', label: 'OpenAI', reason: 'run completions', scope: 'session' },
@@ -484,9 +486,37 @@ test('a compaction-style replaceGeneration change with the anchor present does n
   )
   await answerNext(service, (id) => ({ id, decision: 'approved', scope: 'session', value: SECRET }))
   await pending
+
+  // The counter alone is irrelevant: it is recorded for diagnosis, never compared.
   session.replaceGeneration += 3
   assert.equal(service.grants.resolve(session, 'openai').code, 'ok')
+
+  // A compaction folds earlier events into a summary: the surface really is
+  // rewritten (an unrelated node leaves it) and the generation advances — but
+  // the anchoring assistant message is still on it, so the grant stands.
+  session.nodes = [1]
+  session.replaceGeneration += 1
+  assert.equal(service.grants.resolve(session, 'openai').code, 'ok')
   assert.equal(service.grants.valueFor(session, 'DSH_SECRET_OPENAI'), SECRET)
+  assert.equal(service.grants.size(), 1)
+})
+
+test('a compaction that folds the anchoring event away revokes the grant', async () => {
+  const { service, session } = harness()
+  const pending = service.request(
+    { name: 'openai', label: 'OpenAI', reason: 'run completions', scope: 'session' },
+    { agent: { id: session.id }, callId: 'call-1', signal: new AbortController().signal },
+  )
+  await answerNext(service, (id) => ({ id, decision: 'approved', scope: 'session', value: SECRET }))
+  await pending
+  assert.equal(service.grants.size(), 1)
+
+  // This time the summary swallowed the anchoring event itself: fail closed.
+  session.nodes = [0]
+  session.replaceGeneration += 1
+  assert.equal(service.grants.resolve(session, 'openai').code, 'revoked-anchor')
+  assert.equal(service.grants.valueFor(session, 'DSH_SECRET_OPENAI'), undefined)
+  assert.equal(service.grants.size(), 0)
 })
 
 test('a forked child cannot see the parent grant, and the parent keeps it', async () => {
@@ -599,4 +629,186 @@ test('pending store settles once, times out and rejects on abort', async () => {
     },
   })
   assert.equal(timed.kind, 'timeout')
+})
+
+/** One captured `shellEnv` declaration, as the registry hands it to the context. */
+interface ContributorLike {
+  readonly name: string
+  readonly variables: Record<string, unknown>
+  readonly resolve: (execution: { agent?: unknown }) => Record<string, string>
+}
+
+/** A fake context carrying only what `EnvContributorRegistry` reads. */
+function envHarness(): {
+  readonly ctx: unknown
+  readonly contributors: ContributorLike[]
+  readonly teardowns: (() => void)[]
+  readonly sessions: Map<string, FakeSession>
+  readonly undeclared: string[]
+} {
+  const contributors: ContributorLike[] = []
+  const teardowns: (() => void)[] = []
+  const sessions = new Map<string, FakeSession>()
+  const undeclared: string[] = []
+  const ctx = {
+    effect(fn: () => void | (() => void)) {
+      const teardown = fn()
+      if (typeof teardown === 'function') teardowns.push(teardown)
+      return () => undefined
+    },
+    sessions: {
+      get: (id: unknown) => sessions.get(String(id)),
+    },
+    shellEnv: {
+      register(contributor: ContributorLike) {
+        contributors.push(contributor)
+        return () => {
+          undeclared.push(contributor.name)
+          const index = contributors.indexOf(contributor)
+          if (index >= 0) contributors.splice(index, 1)
+        }
+      },
+    },
+  }
+  return { ctx, contributors, teardowns, sessions, undeclared }
+}
+
+function grantFor(session: FakeSession, overrides: Partial<Parameters<GrantStore['put']>[0]> = {}) {
+  return {
+    sessionId: session.id,
+    name: 'openai',
+    envVar: 'DSH_SECRET_OPENAI',
+    scope: 'session' as const,
+    value: SECRET,
+    source: 'entered' as const,
+    anchorSeq: 1,
+    callId: 'call-1',
+    replaceGenerationAtApproval: 0,
+    authorizedAt: 0,
+    ...overrides,
+  }
+}
+
+test('the env contributor injects a value only while the execution session still holds the grant', () => {
+  const session = sessionWithCall('call-1')
+  const { ctx, contributors, teardowns, sessions, undeclared } = envHarness()
+  sessions.set(session.id, session)
+  const grants = new GrantStore()
+  const registry = new EnvContributorRegistry(ctx as never, grants)
+
+  registry.ensure('DSH_SECRET_OPENAI')
+  registry.ensure('DSH_SECRET_OPENAI')
+  assert.equal(contributors.length, 1, 'one variable is declared once')
+  assert.equal(registry.declared('DSH_SECRET_OPENAI'), true)
+  assert.deepEqual(Object.keys(contributors[0]?.variables ?? {}), ['DSH_SECRET_OPENAI'])
+
+  grants.put(grantFor(session))
+  assert.deepEqual(contributors[0]?.resolve({ agent: { id: session.id } }), { DSH_SECRET_OPENAI: SECRET })
+
+  // An execution with no agent, an unknown session, and a forked child get nothing.
+  assert.deepEqual(contributors[0]?.resolve({}), {})
+  assert.deepEqual(contributors[0]?.resolve({ agent: { id: 'session-elsewhere' } }), {})
+  const child = sessionWithCall('call-1', { sessionId: 'session-child', inheritedFrom: 3 })
+  sessions.set(child.id, child)
+  assert.deepEqual(contributors[0]?.resolve({ agent: { id: child.id } }), {})
+
+  // A session-scope grant whose anchor leaves the surface stops being injected,
+  // and the value is not served twice.
+  session.nodes = []
+  assert.deepEqual(contributors[0]?.resolve({ agent: { id: session.id } }), {})
+  assert.deepEqual(contributors[0]?.resolve({ agent: { id: session.id } }), {})
+  assert.equal(grants.size(), 0)
+
+  // Disposal (plugin unload) withdraws the declaration rather than serving {}.
+  registry.disposeAll()
+  assert.equal(registry.declared('DSH_SECRET_OPENAI'), false)
+  assert.equal(contributors.length, 0)
+  assert.deepEqual(undeclared, ['cordis-plugin-secret:DSH_SECRET_OPENAI'])
+
+  // The registry also owns a teardown on the context that disposes everything.
+  registry.ensure('DSH_SECRET_OPENAI')
+  assert.equal(registry.declared('DSH_SECRET_OPENAI'), true)
+  const teardown = teardowns[0]
+  assert.notEqual(teardown, undefined)
+  if (teardown !== undefined) teardown()
+  assert.equal(registry.declared('DSH_SECRET_OPENAI'), false)
+  assert.equal(contributors.length, 0)
+})
+
+test('agentIdOf reads the session id an agent carries, and refuses anything else', () => {
+  assert.equal(agentIdOf({ id: 'session-a' }), 'session-a')
+  // A nested session header wins over a bare id.
+  assert.equal(agentIdOf({ session: { header: { id: 'session-b' } }, id: 'session-a' }), 'session-b')
+  assert.equal(agentIdOf({ session: { header: {} }, id: 'session-a' }), 'session-a')
+  assert.equal(agentIdOf({ session: { header: { id: '' } }, id: 'session-a' }), 'session-a')
+  assert.equal(agentIdOf({ id: '' }), undefined)
+  assert.equal(agentIdOf({}), undefined)
+  assert.equal(agentIdOf('session-a'), undefined)
+  assert.equal(agentIdOf(undefined), undefined)
+})
+
+test('classifyCaller separates the live root from a delegated child and a stale id', () => {
+  const root = { id: 'session-root' }
+  const child = { id: 'session-child' }
+  const ctx = {
+    agents: {
+      get: (id: unknown) => (id === root.id ? root : id === child.id ? child : undefined),
+      roots: () => [root],
+    },
+  }
+  assert.equal(classifyCaller(ctx as never, root), 'live-root')
+  assert.equal(classifyCaller(ctx as never, child), 'delegated')
+  assert.equal(classifyCaller(ctx as never, { id: 'session-gone' }), 'not-live')
+  assert.equal(classifyCaller(ctx as never, {}), 'not-live')
+  assert.equal(classifyCaller(ctx as never, undefined), 'not-live')
+})
+
+test('sessionOf and anchorSessionOf read the live session from the same registry, or nothing', () => {
+  const session = sessionWithCall('call-1')
+  const ctx = { sessions: { get: (id: unknown) => (String(id) === session.id ? session : undefined) } }
+  assert.equal(sessionOf(ctx as never, { id: session.id }), session)
+  assert.equal(anchorSessionOf(ctx as never, { id: session.id }), session)
+  assert.equal(sessionOf(ctx as never, {}), undefined)
+  assert.equal(anchorSessionOf(ctx as never, undefined), undefined)
+})
+
+test('credentialsPort maps the credential service and never returns a value it was not asked for', async () => {
+  const store = new Map<string, string>()
+  const written: string[] = []
+  const records: { key: string; record: unknown }[] = []
+  const ctx = {
+    credentials: {
+      describe: async (ref: string) =>
+        store.has(ref)
+          ? { configured: true, source: 'provider', writable: true }
+          : { configured: false, writable: true },
+      resolve: async (ref: string) => {
+        const value = store.get(ref)
+        return value === undefined ? undefined : { value, source: 'provider' }
+      },
+      set: async (ref: string, value: string) => {
+        written.push(ref)
+        store.set(ref, value)
+      },
+      modifyRecord: async (key: string, update: (previous: unknown) => Promise<unknown>) => {
+        records.push({ key, record: await update(undefined) })
+      },
+    },
+  }
+  const port = credentialsPort(ctx as never)
+  assert.deepEqual(await port.describe('DSH_SECRET_OPENAI'), { configured: false, writable: true })
+  assert.equal(await port.resolve('DSH_SECRET_OPENAI'), undefined)
+
+  await port.set('DSH_SECRET_OPENAI', SECRET)
+  assert.deepEqual(written, ['DSH_SECRET_OPENAI'])
+  assert.deepEqual(await port.describe('DSH_SECRET_OPENAI'), { configured: true, source: 'provider', writable: true })
+  assert.deepEqual(await port.resolve('DSH_SECRET_OPENAI'), { value: SECRET, source: 'provider' })
+
+  await port.commitRecord('cordis-plugin-secret/openai', { version: 1, envVar: 'DSH_SECRET_OPENAI' })
+  assert.deepEqual(records, [
+    {
+      key: 'cordis-plugin-secret/openai',
+      record: { kind: 'grant', payload: { version: 1, envVar: 'DSH_SECRET_OPENAI' } },
+    },
+  ])
 })

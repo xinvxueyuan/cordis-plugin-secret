@@ -32,7 +32,16 @@ export interface Grant {
   readonly anchorSeq: number
   /** Tool call identity that produced this grant. */
   readonly callId: string
-  /** `surface.replaceGeneration` observed at approval time. */
+  /**
+   * `surface.replaceGeneration` observed at approval time.
+   *
+   * Diagnostic only. Revocation is decided by whether the anchoring event is
+   * still on the live surface (`isOwnSeq`, `surface.nodes`), **never** by
+   * comparing this number: compaction rewrites the surface and bumps
+   * `replaceGeneration` while leaving the anchor in place, so treating a
+   * generation mismatch as revocation would revoke a grant that must survive.
+   * It is recorded so a reader can see what the generation was at approval time.
+   */
   readonly replaceGenerationAtApproval: number
   readonly authorizedAt: number
 }

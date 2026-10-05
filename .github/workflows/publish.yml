@@ -30,7 +30,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      # 集成冒烟需要本机 gh 认证，CI 中跳过；发布前在本地跑 npm run test:integration
+      # unit + register 两级测试就是本仓库全部可自动化的验证，没有需要本机凭据的集成冒烟。
       # 发布进入 stage 队列（npm stage publish），人工 2FA 批准后上线
 
   publish:
