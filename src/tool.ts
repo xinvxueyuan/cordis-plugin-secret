@@ -1,6 +1,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { SecretConfig } from './config.ts'
 import type { SecretService } from './service.ts'
+import type { SecretDecisionKind, SecretPresentationMeta } from './types.ts'
 
 /** Model-facing rendering of one result. Never contains a secret value. */
 function renderResult(value: unknown): string {
@@ -28,6 +29,46 @@ function renderResult(value: unknown): string {
       return `人工给出了其他指示：${String(result.text)}`
     default:
       return JSON.stringify(value)
+  }
+}
+
+/**
+ * The value-free settlement payload persisted on `tool/result.meta`.
+ *
+ * The in-stream card reads it back on the live and replay paths alike, so a
+ * refreshed page still renders the settled card without parsing prose. It
+ * carries exactly what the agent is told and never any secret material.
+ */
+function presentationMeta(value: unknown): SecretPresentationMeta {
+  const result = typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
+  const decision: SecretDecisionKind =
+    result.decision === 'approved' || result.decision === 'rejected' || result.decision === 'ignored' || result.decision === 'other'
+      ? result.decision
+      : 'other'
+  const meta: SecretPresentationMeta = { v: 1, kind: 'secret-request', decision }
+  if (decision === 'rejected') {
+    return {
+      ...meta,
+      ...(typeof result.reason === 'string' && result.reason.length > 0 ? { reason: result.reason } : {}),
+    }
+  }
+  if (decision === 'other') {
+    return {
+      ...meta,
+      ...(typeof result.text === 'string' && result.text.length > 0 ? { text: result.text } : {}),
+    }
+  }
+  if (decision !== 'approved') return meta
+  const scope = result.scope === 'persistent' ? 'persistent' : result.scope === 'session' ? 'session' : undefined
+  const source = result.source === 'store' ? 'store' : result.source === 'entered' ? 'entered' : undefined
+  return {
+    ...meta,
+    ...(typeof result.variable === 'string' && result.variable.length > 0 ? { variable: result.variable } : {}),
+    ...(scope === undefined ? {} : { scope }),
+    ...(source === undefined ? {} : { source }),
+    ...(typeof result.notice === 'string' && result.notice.length > 0 ? { notice: result.notice } : {}),
   }
 }
 
@@ -75,6 +116,9 @@ export function defineSecretRequestTool(service: SecretService, config: SecretCo
     output: {
       schema: { type: 'json' },
       render: (_args, value) => [{ type: 'text', text: renderResult(value) }],
+      // Persisted on tool/result.meta: the durable, model-invisible source of a
+      // settled card's state. The visible rendering above is unchanged.
+      presentationMeta: (_args, value) => presentationMeta(value),
     },
     // One human answers one dialog at a time: never join a parallel group.
     isConcurrencySafe: () => false,

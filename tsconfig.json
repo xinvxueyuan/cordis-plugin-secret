@@ -14,5 +14,5 @@
     "forceConsistentCasingInFileNames": true
   },
   "include": ["src", "test"],
-  "exclude": ["src/client"]
+  "exclude": ["src/client", "test/client-card.test.ts"]
 }

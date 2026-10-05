@@ -20,6 +20,7 @@ import {
   type SecretServiceDeps,
 } from '../src/service.ts'
 import type { ModalAnswer, SecretRequestResult } from '../src/types.ts'
+import { defineSecretRequestTool } from '../src/tool.ts'
 
 const SECRET = 'sk-live-DO-NOT-LEAK'
 
@@ -81,6 +82,8 @@ function harness(
     schedule?: SecretServiceDeps['schedule']
     authorization?: AuthorizationPort
     maxPendingRequests?: number
+    /** Overrides for the fake credential port, e.g. a throwing backend. */
+    credentials?: Partial<CredentialsPort>
   } = {},
 ): Harness {
   const calls: string[] = []
@@ -104,6 +107,7 @@ function harness(
     commitRecord: async (key) => {
       calls.push(`commitRecord:${key}`)
     },
+    ...options.credentials,
   }
   const authorization: AuthorizationPort =
     options.authorization ??
@@ -448,6 +452,200 @@ test('an unanswered dialog times out into a structured failure', async () => {
   assert.equal(service.grants.size(), 0)
 })
 
+test('O1: a recorded approval outlives a failed attempt, and never claims persistence', async () => {
+  const { service, session, store, calls } = harness({
+    authorization: {
+      attempt: async (input: AuthorizationAttemptInput): Promise<AuthorizationAttemptResult> => {
+        const answer = await input.answer()
+        assert.equal(answer.decision, 'approved')
+        assert.equal(input.valueNeeded, true)
+        // The seam reports a failed attempt. It may or may not have written the
+        // value before failing to commit — which is exactly why the plugin's
+        // notice must not assert either way.
+        return { status: 'failed', message: 'credential store write failed' }
+      },
+    },
+  })
+  const pending = service.request(
+    { name: 'openai', label: 'OpenAI', reason: 'run completions', scope: 'persistent' },
+    { agent: { id: session.id }, callId: 'call-1', signal: new AbortController().signal },
+  )
+  await answerNext(service, (id) => ({ id, decision: 'approved', scope: 'persistent', value: SECRET }))
+  const result = await pending
+
+  // The human's decision stands (it is not discarded as an authorization failure)...
+  assert.equal(result.decision, 'approved')
+  if (result.decision !== 'approved') return
+  // ...but the result must not pretend the durable write happened, and must not
+  // over-claim the opposite either.
+  assert.equal(result.scope, 'session')
+  assert.equal(result.ref.space, 'session-shell-env')
+  assert.equal(result.source, 'entered')
+  assert.match(String(result.notice), /未能完成持久化登记的确认/u)
+  assert.equal(/未做任何持久化|已写入凭据库/u.test(String(result.notice)), false)
+  // In this fake the plugin's own path never calls `set` — but that is a
+  // property of this fake, not a promise about the real seam (which persists
+  // before it commits).
+  assert.equal(store.has('DSH_SECRET_OPENAI'), false)
+  assert.equal(calls.some((entry) => entry.startsWith('set:')), false)
+  assert.equal(JSON.stringify(result).includes(SECRET), false)
+  // The value is still usable for this session only, as reported.
+  assert.equal(service.grants.valueFor(session, 'DSH_SECRET_OPENAI'), SECRET)
+})
+
+test('a credential-store read failure is collapsed into a value-free SecretFailure', async () => {
+  // A backend error the plugin cannot control, quoting something it must never
+  // forward into a tool result.
+  const sentinel = 'postgres://dsh:sk-store-DO-NOT-LEAK@127.0.0.1:5432/creds'
+
+  const readFailing = harness({
+    configured: true,
+    credentials: {
+      resolve: async () => {
+        throw new Error(`credential backend exploded: ${sentinel}`)
+      },
+    },
+  })
+  const pending = readFailing.service.request(
+    { name: 'openai', label: 'OpenAI', reason: 'run completions', scope: 'session' },
+    { agent: { id: readFailing.session.id }, callId: 'call-1', signal: new AbortController().signal },
+  )
+  await answerNext(readFailing.service, (id) => ({ id, decision: 'approved', scope: 'session' }))
+  await assert.rejects(pending, (error: unknown) => {
+    assert.equal(error instanceof SecretFailure, true)
+    const failure = error as SecretFailure
+    assert.equal(failure.code, 'STORE_READ_FAILED')
+    assert.equal(failure.message, '凭据库读取失败；细节已省略')
+    assert.equal(failure.message.includes(sentinel), false, 'the upstream error text must not be forwarded')
+    assert.equal(String(error).includes(sentinel), false)
+    return true
+  })
+
+  // The same convergence on the describe() path, which runs before any dialog.
+  const describeFailing = harness({
+    credentials: {
+      describe: async () => {
+        throw new Error(`credential backend exploded: ${sentinel}`)
+      },
+    },
+  })
+  await assert.rejects(
+    describeFailing.service.request(
+      { name: 'openai', label: 'OpenAI', reason: 'run completions', scope: 'session' },
+      { agent: { id: describeFailing.session.id }, callId: 'call-1', signal: new AbortController().signal },
+    ),
+    (error: unknown) => {
+      assert.equal(error instanceof SecretFailure, true)
+      assert.equal((error as SecretFailure).code, 'STORE_READ_FAILED')
+      assert.equal((error as SecretFailure).message.includes(sentinel), false)
+      return true
+    },
+  )
+  assert.equal(describeFailing.service.views().length, 0, 'no dialog may be registered for a failed read')
+
+  // The same rule on the seam's own failure text: it is never forwarded, even
+  // when no approval was recorded to redact against.
+  const seamFailing = harness({
+    authorization: {
+      attempt: async (): Promise<AuthorizationAttemptResult> => ({
+        status: 'failed',
+        message: `credential backend exploded: ${sentinel}`,
+      }),
+    },
+  })
+  await assert.rejects(
+    seamFailing.service.request(
+      { name: 'openai', label: 'OpenAI', reason: 'run completions', scope: 'persistent' },
+      { agent: { id: seamFailing.session.id }, callId: 'call-1', signal: new AbortController().signal },
+    ),
+    (error: unknown) => {
+      assert.equal(error instanceof SecretFailure, true)
+      assert.equal((error as SecretFailure).code, 'AUTHORIZATION_FAILED')
+      assert.equal((error as SecretFailure).message.includes(sentinel), false, 'the seam text must not be forwarded')
+      assert.equal(String(error).includes(sentinel), false)
+      return true
+    },
+  )
+})
+
+test('O2: a persistent wait that times out reports TIMEOUT, not a generic authorization failure', async () => {
+  const fired = { value: false }
+  const { service, session } = harness({
+    schedule: (_delayMs, callback) => {
+      if (!fired.value) {
+        fired.value = true
+        void Promise.resolve().then(callback)
+      }
+      return () => undefined
+    },
+    authorization: {
+      attempt: async (input: AuthorizationAttemptInput): Promise<AuthorizationAttemptResult> => {
+        try {
+          await input.answer()
+        } catch {
+          // The flow rethrows the plugin's own TIMEOUT; the seam turns that into
+          // a failed attempt, which must not mask the timeout.
+        }
+        return { status: 'failed', message: 'secret_request: 等待人工确认超时。' }
+      },
+    },
+  })
+  await assert.rejects(
+    service.request(
+      { name: 'openai', label: 'OpenAI', reason: 'run completions', scope: 'persistent' },
+      { agent: { id: session.id }, callId: 'call-1', signal: new AbortController().signal },
+    ),
+    (error: unknown) => {
+      assert.equal(error instanceof SecretFailure, true)
+      assert.equal((error as SecretFailure).code, 'TIMEOUT')
+      return true
+    },
+  )
+  assert.equal(service.grants.size(), 0)
+})
+
+test('the persisted presentation payload is value-free for every decision', () => {
+  const tool = defineSecretRequestTool(
+    { request: async () => ({ decision: 'ignored' }) } as never,
+    { requestTimeoutMs: 1000, maxPendingRequests: 1 } as never,
+  )
+  const present = (value: unknown): Record<string, unknown> =>
+    (tool.output as unknown as { presentationMeta: (args: unknown, value: unknown) => unknown }).presentationMeta(
+      {},
+      value,
+    ) as Record<string, unknown>
+
+  const approved = present({
+    decision: 'approved',
+    variable: 'DSH_SECRET_OPENAI',
+    scope: 'session',
+    ref: { space: 'session-shell-env', name: 'DSH_SECRET_OPENAI' },
+    source: 'entered',
+    notice: '降级说明',
+  })
+  assert.equal(approved.v, 1)
+  assert.equal(approved.kind, 'secret-request')
+  assert.equal(approved.decision, 'approved')
+  assert.equal(approved.variable, 'DSH_SECRET_OPENAI')
+  assert.equal(approved.scope, 'session')
+  assert.equal(approved.source, 'entered')
+  assert.equal(approved.notice, '降级说明')
+  assert.equal('value' in approved, false)
+
+  const rejected = present({ decision: 'rejected', reason: 'not this key' })
+  assert.deepEqual(rejected, { v: 1, kind: 'secret-request', decision: 'rejected', reason: 'not this key' })
+  const ignored = present({ decision: 'ignored' })
+  assert.deepEqual(ignored, { v: 1, kind: 'secret-request', decision: 'ignored' })
+  const other = present({ decision: 'other', text: 'use the sandbox key' })
+  assert.deepEqual(other, { v: 1, kind: 'secret-request', decision: 'other', text: 'use the sandbox key' })
+
+  // The invariant: no arm of the payload can carry the value the human typed.
+  for (const payload of [approved, rejected, ignored, other]) {
+    assert.equal(JSON.stringify(payload).includes(SECRET), false)
+    assert.equal('value' in payload, false)
+  }
+})
+
 test('a grant is revoked when its anchor leaves the session surface and the entry is dropped', async () => {
   const { service, session } = harness()
   const pending = service.request(
@@ -585,6 +783,8 @@ test('pending store settles once, times out and rejects on abort', async () => {
   const store = new PendingStore()
   const makeRequest = (id: string) => ({
     id,
+    callId: `call-${id}`,
+    sessionId: 'session-root',
     name: 'openai',
     envVar: 'DSH_SECRET_OPENAI',
     label: 'OpenAI',
@@ -596,6 +796,10 @@ test('pending store settles once, times out and rejects on abort', async () => {
   assert.notEqual(store.add(makeRequest('r1'), 1), undefined)
   assert.equal(store.add(makeRequest('r2'), 1), undefined)
   assert.equal(store.views()[0]?.id, 'r1')
+  // The card claims its request by the call that raised it, so the view must
+  // carry both identities.
+  assert.equal(store.views()[0]?.callId, 'call-r1')
+  assert.equal(store.views()[0]?.sessionId, 'session-root')
 
   const waiting = store.wait('r1', {
     signal: new AbortController().signal,

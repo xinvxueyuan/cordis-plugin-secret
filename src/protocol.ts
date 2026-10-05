@@ -83,9 +83,11 @@ export function answerId(raw: unknown): string | undefined {
   return trimmedString((raw as Record<string, unknown>).id)
 }
 
-/** The dialog-facing view of one pending request. Never carries secret material. */
+/** The card-facing view of one pending request. Never carries secret material. */
 export function pendingView(request: {
   readonly id: string
+  readonly callId: string
+  readonly sessionId: string
   readonly name: string
   readonly label: string
   readonly reason: string
@@ -97,6 +99,8 @@ export function pendingView(request: {
 }): PendingView {
   return {
     id: request.id,
+    callId: request.callId,
+    sessionId: request.sessionId,
     name: request.name,
     label: request.label,
     reason: request.reason,

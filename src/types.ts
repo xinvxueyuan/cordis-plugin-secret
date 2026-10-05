@@ -91,9 +91,17 @@ export type ModalAnswer =
   | { readonly decision: 'ignored' }
   | { readonly decision: 'other'; readonly text: string }
 
-/** What the dialog renders for one waiting request. Contains no secret material. */
+/** What the card renders for one waiting request. Contains no secret material. */
 export interface PendingView {
   readonly id: string
+  /**
+   * The `tool/call` identity that raised this request. The in-stream card is
+   * built from the durable call event, so this is how it claims its own waiting
+   * request instead of every reader racing for the first one.
+   */
+  readonly callId: string
+  /** Session that owns the call, so two sessions can never claim each other's card. */
+  readonly sessionId: string
   readonly name: string
   readonly label: string
   readonly reason: string
@@ -104,4 +112,33 @@ export interface PendingView {
   /** True when a value is already stored, so the dialog hides the value field. */
   readonly alreadyConfigured: boolean
   readonly createdAt: number
+}
+
+/**
+ * Value-free settlement payload the tool persists on `tool/result.meta`.
+ *
+ * This is the durable, replay-safe source of a card's settled state: it is
+ * never model-visible, and it deliberately carries no secret material — the
+ * approved arm reports exactly the variable/scope/provenance the agent gets.
+ *
+ * Declared as an object type alias (not an interface) for the same reason the
+ * results above are: structural assignability to the tool output contract's
+ * `JsonValue`.
+ */
+export type SecretPresentationMeta = {
+  readonly v: 1
+  readonly kind: 'secret-request'
+  readonly decision: SecretDecisionKind
+  /** Present only for `approved`. */
+  readonly variable?: string
+  /** Present only for `approved`. */
+  readonly scope?: SecretScope
+  /** Present only for `approved`. */
+  readonly source?: 'store' | 'entered'
+  /** Additive diagnostic (never secret material), e.g. a revocation or fallback notice. */
+  readonly notice?: string
+  /** Present only for `rejected`: the human's optional reason, as the agent receives it. */
+  readonly reason?: string
+  /** Present only for `other`: the human's free-text instruction, as the agent receives it. */
+  readonly text?: string
 }

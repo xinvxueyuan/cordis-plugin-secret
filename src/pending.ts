@@ -4,6 +4,10 @@ import type { ModalAnswer, PendingView, SecretScope } from './types.ts'
 /** One dialog interaction waiting for a human. Never carries a secret value. */
 export interface PendingRequest {
   readonly id: string
+  /** The `tool/call` that raised it: the in-stream card claims its request by this. */
+  readonly callId: string
+  /** Session owning the call. */
+  readonly sessionId: string
   readonly name: string
   readonly envVar: string
   readonly label: string

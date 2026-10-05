@@ -109,6 +109,38 @@ export type AnswerOutcome =
   | { readonly ok: false; readonly status: number; readonly error: string }
 
 /**
+ * How collecting one decision ended.
+ *
+ * `notice` is carried separately from the answer so the approved result can
+ * report truthfully (for example: the durable registration could not be
+ * confirmed, so the grant was degraded to this session only) without pretending
+ * the flow succeeded.
+ */
+export type ConverseResult =
+  | { readonly kind: 'answer'; readonly answer: ModalAnswer; readonly notice?: string }
+  | { readonly kind: 'timeout' }
+
+/** The fixed, value-free failure one credential-store read produces. */
+const STORE_READ_FAILED_MESSAGE = '凭据库读取失败；细节已省略'
+
+/**
+ * Run one credential-store read, collapsing every upstream failure into this
+ * plugin's own value-free failure.
+ *
+ * A credential backend's error text is outside this plugin's control: it may
+ * quote the reference, a path, or whatever the provider chose to print. None of
+ * that belongs in a tool result, so the message here is fixed and the upstream
+ * error is dropped rather than forwarded.
+ */
+async function readStore<T>(read: () => Promise<T>): Promise<T> {
+  try {
+    return await read()
+  } catch {
+    throw new SecretFailure('STORE_READ_FAILED', STORE_READ_FAILED_MESSAGE)
+  }
+}
+
+/**
  * The one operation behind both callers: the agent tool and the Web dialog.
  *
  * The service owns validation, caller authority, anchoring, the dialog
@@ -184,13 +216,15 @@ export class SecretService {
     }
 
     const envVar = effectiveEnvVar(input)
-    const described = await this.deps.credentials.describe(envVar)
+    const described = await readStore(() => this.deps.credentials.describe(envVar))
     const alreadyConfigured = described.configured
 
     const id = this.deps.newId()
     const pending = this.pending.add(
       {
         id,
+        callId: caller.callId,
+        sessionId: String(session.id),
         name: input.name,
         envVar,
         label: input.label,
@@ -217,13 +251,18 @@ export class SecretService {
           `secret_request: 等待人工确认超过 ${String(this.deps.config.requestTimeoutMs)}ms 未获答复（可能没有打开可交互的 Web 界面）。未获授权，本次不会注入任何变量。`,
         )
       }
-      return await this.complete(input, outcome.answer, {
-        envVar,
-        alreadyConfigured,
-        session,
-        anchorSeq,
-        callId: caller.callId,
-      })
+      return await this.complete(
+        input,
+        outcome.answer,
+        {
+          envVar,
+          alreadyConfigured,
+          session,
+          anchorSeq,
+          callId: caller.callId,
+        },
+        outcome.notice,
+      )
     } finally {
       this.pending.remove(id)
     }
@@ -245,21 +284,38 @@ export class SecretService {
     envVar: string,
     alreadyConfigured: boolean,
     caller: SecretCaller,
-  ): Promise<WaitOutcome> {
+  ): Promise<ConverseResult> {
     let answerPromise: Promise<WaitOutcome> | undefined
+    /**
+     * Set the moment this wait itself ends in a timeout, so a seam that later
+     * reports `failed` cannot turn our timeout into a generic failure (O2).
+     */
+    let timedOut = false
     const settleOnce = (): Promise<WaitOutcome> => {
-      answerPromise ??= this.pending.wait(pending.id, {
-        signal: caller.signal,
-        timeoutMs: this.deps.config.requestTimeoutMs,
-        schedule: this.deps.schedule,
-      })
+      answerPromise ??= this.pending
+        .wait(pending.id, {
+          signal: caller.signal,
+          timeoutMs: this.deps.config.requestTimeoutMs,
+          schedule: this.deps.schedule,
+        })
+        .then((outcome) => {
+          if (outcome.kind === 'timeout') timedOut = true
+          return outcome
+        })
       return answerPromise
     }
     const recorded = (): ModalAnswer | undefined => this.pending.get(pending.id)?.answer
-    /** Last decision handed to the flow, kept for value-free failure redaction. */
-    let lastAnswer: ModalAnswer | undefined
+    /** A wait that timed out is always a timeout, whatever the seam made of it. */
+    const timeoutFailure = (): SecretFailure =>
+      new SecretFailure(
+        'TIMEOUT',
+        `secret_request: 等待人工确认超过 ${String(this.deps.config.requestTimeoutMs)}ms 未获答复（可能没有打开可交互的 Web 界面）。未获授权，本次不会注入任何变量。`,
+      )
 
-    if (input.scope === 'session') return await settleOnce()
+    if (input.scope === 'session') {
+      const outcome = await settleOnce()
+      return outcome.kind === 'timeout' ? { kind: 'timeout' } : { kind: 'answer', answer: outcome.answer }
+    }
 
     const attempt = await this.deps.authorization.attempt({
       key: recordKey(input.name),
@@ -270,7 +326,6 @@ export class SecretService {
         if (outcome.kind === 'timeout') {
           throw new SecretFailure('TIMEOUT', 'secret_request: 等待人工确认超时。')
         }
-        lastAnswer = outcome.answer
         return outcome.answer
       },
       persist: async (value) => {
@@ -286,16 +341,45 @@ export class SecretService {
     })
 
     const answer = recorded()
-    if (answer !== undefined) return { kind: 'answer', answer }
     if (attempt.status === 'failed') {
+      if (timedOut) throw timeoutFailure()
+      // O1: the human's recorded approval stands, but the flow never confirmed
+      // the durable registration. Never report this as persisted: materialize it
+      // for this session only, and say what is actually known.
+      //
+      // The wording deliberately does not claim "nothing was written": the seam
+      // persists the value before it commits the authorization record, so a
+      // failed attempt can leave a value in the store that simply carries no
+      // grant record for this authorization.
+      if (answer?.decision === 'approved') {
+        return {
+          kind: 'answer',
+          answer:
+            answer.value === undefined
+              ? { decision: 'approved', scope: 'session' }
+              : { decision: 'approved', scope: 'session', value: answer.value },
+          notice:
+            '未能完成持久化登记的确认：已按「仅本次会话有效」降级生效；若刚才的值已进入凭据库，它将不带本次授权记录。如需持久保存，请重试或改用手工配置。',
+        }
+      }
+      // The same no-passthrough rule as a failing store read: the seam's error
+      // text comes from a credential backend this plugin does not control (a
+      // `persist` that fails before `commit` can quote the value it was handed),
+      // so the failure identity is reported and the text is dropped. The
+      // plugin's own redaction is still applied as a second layer, so wording
+      // alone can never be the only thing keeping a value out of the result.
+      const seen = recorded()
+      const recordedValue = seen?.decision === 'approved' ? seen.value : undefined
       throw new SecretFailure(
         'AUTHORIZATION_FAILED',
         redactSecrets(
-          `secret_request: 凭据授权流程失败：${attempt.message}`,
-          lastAnswer?.decision === 'approved' ? [lastAnswer.value] : [],
+          'secret_request: 凭据授权流程失败（上游细节已省略）。未获授权，本次不会注入任何变量。',
+          [recordedValue],
         ),
       )
     }
+    if (answer !== undefined) return { kind: 'answer', answer }
+    if (timedOut) throw timeoutFailure()
     throw new SecretFailure(
       'AUTHORIZATION_CANCELLED',
       'secret_request: 授权尝试在人工答复前被取消（可能同一凭据已有另一个授权尝试在进行中）。未获授权。',
@@ -313,6 +397,8 @@ export class SecretService {
       readonly anchorSeq: number
       readonly callId: string
     },
+    /** Additive, value-free notice the approved result must also carry verbatim. */
+    extraNotice?: string,
   ): Promise<SecretRequestResult> {
     if (answer.decision !== 'approved') return mapNonApproved(answer)
 
@@ -326,7 +412,7 @@ export class SecretService {
     if (plan.persistValue !== undefined) {
       value = plan.persistValue
     } else if (plan.resolveValue) {
-      const resolved = await this.deps.credentials.resolve(context.envVar)
+      const resolved = await readStore(() => this.deps.credentials.resolve(context.envVar))
       if (resolved === undefined) {
         throw new SecretFailure(
           'STORE_EMPTY',
@@ -360,7 +446,10 @@ export class SecretService {
       : revocation.code === 'revoked-anchor'
         ? '上一次授权所锚定的事件已不在当前会话表面上（会话回退/重写，或该事件被压缩覆盖），因此已失效并被本次重新授权覆盖。'
         : '上一次授权已不再属于本会话（会话分叉或结束），本次重新授权覆盖了它。'
-    return approvedResult(plan, context.envVar, notice)
+    const notices = [notice, extraNotice].filter(
+      (value): value is string => value !== undefined && value.length > 0,
+    )
+    return approvedResult(plan, context.envVar, notices.length === 0 ? undefined : notices.join('\n'))
   }
 }
 

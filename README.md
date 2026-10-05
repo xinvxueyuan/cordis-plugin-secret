@@ -5,7 +5,7 @@
 Cordis（DeepSeek Harness）插件：**让 Agent 向人类索取密钥（secret），批准后只拿到一个不透明的变量名（如 `DSH_SECRET_OPENAI`）。插件自身从不把值放进工具结果、错误消息、日志或会话记录；值只经 `ctx.shellEnv` 按会话注入到 shell 环境——由 Agent 自己避免回显。**
 
 - Host 半：注册 `secret_request` 工具；用 `ctx.authorization` 的凭据获取流程承载持久授权；用 `ctx.credentials` 落库；用 `ctx.shellEnv` 按会话注入 `DSH_SECRET_*`。
-- Client 半：在 Web UI 的 `shell.overlay` 槽里渲染一个遮罩式密钥输入对话框（`type="password"` + 显示/隐藏切换），把「同意 / 拒绝 / 忽略 / 其他」四个决定、申请理由、用途说明与**授权范围**摆在人类眼前，并允许人类**改写 Agent 请求的范围**。
+- Client 半：在 Agent 输出流里渲染**会话流内一级卡片**（`conversation.chat.node`，`key=secret-request`），**无 `shell.overlay` 遮罩**；卡片带 `type="password"` 输入与显示/隐藏切换，把「同意 / 拒绝 / 忽略 / 其他」四个决定、申请理由、用途说明与**授权范围**摆在人类眼前，并允许人类**改写 Agent 请求的范围**。
 - 传输：对话框经本插件自有的、位于 `ctx.connection` 信任栅栏内的两个 `/api` 路由与 Host 通信。密钥值只出现在 `POST /api/secret.answer` 的请求体里，从不进入 URL / 查询串 / 会话日志。
 
 ## 安全不变量（实现并测试）
@@ -42,7 +42,7 @@ profile 的组合树是「root 空清单 → `dsh.profile.bundles` 里每个 bun
 
 安装结果的 `application` 为 `applied` 表示本次变更已生效；`warnings` 会说明 Client 半是否需要刷新页面。
 
-注意：对**同一个 `link:` 依赖**重复按绝对路径安装是 no-op，此时安装器报 `changed: false` + `application: "failed"` + `error.code: "ambiguous-install"`——它按 profile 依赖的 diff 归属安装目标，而路径 spec 与已存在的同名依赖对不上。这不代表插件没生效（该次调用没有改动任何文件）；用 `cordis_inspect_query` 核对更可靠：host `Tool/listTools` 应出现 `secret_request`，host `Config/listConfigs` 应出现 `include:secret`，client `Slots/listSubTree {root:"shell.overlay"}` 的 occupants 应出现 `secret.request.dialog`。
+注意：对**同一个 `link:` 依赖**重复按绝对路径安装是 no-op，此时安装器报 `changed: false` + `application: "failed"` + `error.code: "ambiguous-install"`——它按 profile 依赖的 diff 归属安装目标，而路径 spec 与已存在的同名依赖对不上。这不代表插件没生效（该次调用没有改动任何文件）；用 `cordis_inspect_query` 核对更可靠：host `Tool/listTools` 应出现 `secret_request`，host `Config/listConfigs` 应出现 `include:secret`，client `Slots/listSubTree {root:"conversation.chat.node"}` 的 occupants 应出现 `secret-request`（若同时看 `{root:"shell.overlay"}`，判据是那里**不应再有** `secret.request.dialog`）。
 
 来源构建：`npm install && npm run build`（`lib/` 是 loader 与浏览器实际加载的产物；`src/` 为 TypeScript 源码）。
 
@@ -69,25 +69,40 @@ profile 的组合树是「root 空清单 → `dsh.profile.bundles` 里每个 bun
 `ref.space` 说明该名字在哪儿可用：`credential-ref` = 可用 `ctx.credentials.resolve(<变量名>)` 解析（`persistent`）；`session-shell-env` = 仅通过 `DSH_*` 注入（`session`）。
 `source` = `store`（凭据库里已有的值）或 `entered`（本次人工输入）。`notice` 是附加诊断（例如"上一次授权所锚定的事件已不在当前会话表面上"），永不含密钥。
 
-失败（抛错，作为工具错误结果返回，同样不含密钥）：`BAD_REQUEST`、`CALLER_NOT_LIVE`、`DELEGATED_CALLER`、`NO_SESSION`、`NO_ANCHOR`、`TOO_MANY_PENDING`、`TIMEOUT`、`AUTHORIZATION_FAILED`、`AUTHORIZATION_CANCELLED`、`STORE_EMPTY`。
+失败（抛错，作为工具错误结果返回，同样不含密钥）：`BAD_REQUEST`、`CALLER_NOT_LIVE`、`DELEGATED_CALLER`、`NO_SESSION`、`NO_ANCHOR`、`TOO_MANY_PENDING`、`TIMEOUT`、`AUTHORIZATION_FAILED`、`AUTHORIZATION_CANCELLED`、`STORE_READ_FAILED`、`STORE_EMPTY`。
 
-## 授权对话框（Client 半）
+其中两条会把上游细节**收敛掉**、只报固定的本插件文案（凭据后端不是本插件能控制的组件，它的错误文本可能引用路径、引用名或其他敏感材料，因此一律不透传）：`STORE_READ_FAILED`（凭据库读取 `describe`/`resolve` 失败 →「凭据库读取失败；细节已省略」）与 `AUTHORIZATION_FAILED`（授权流程失败 →「凭据授权流程失败（上游细节已省略）」）。`AUTHORIZATION_FAILED` 仍会带上本插件自己的二次脱敏层（把该次对话已收集到的值替换掉），措辞本身从不被当作防泄漏的唯一手段。
 
-插槽：`shell.overlay`（root 作用域的 list 槽，可叠加、默认点击穿透，本条目自行开启 pointer events），`id = secret.request.dialog`。
+## 授权卡片（Client 半）
 
-对话框内容，自上而下：
+一次 `secret_request` 调用在会话流里只呈现**一个**交互面：它自己的会话流内卡片，渲染在 Agent 的输出流中（`conversation.chat.node`，`key = secret-request`，由本插件的 `ConversationNodeDefinition` 在 `tool/call` 事件上生成节点）。**不再有全视口遮罩**：卡片是普通文档流里的带边框卡片，不 `position: fixed`、不 `inset: 0`、不铺满视口、不劫持整屏 pointer events，也不占用输入区。
 
-1. 标题 + `label`；
-2. **对外暴露的变量名**；
-3. **申请理由**（原样展示，带"申请理由（原样展示给你）"标注）；
-4. `description`（如有）；
-5. **授权范围**：先用加粗文字写明"仅本次会话有效"或"持久保存到凭据库"及各自含义，再显示"Agent 请求的范围：…"，若人类改动则追加一行"你已把范围改为：…"，然后是 `session` / `persistent` 单选；
-6. 密钥值输入（`type="password"`、`autoComplete="new-password"`、`spellCheck=false`、自动聚焦）+「显示 / 隐藏」切换；**若该凭据已存在于凭据库则不显示输入框**，只显示"已配置，本次仅需决定是否授权本次使用"；
-7. 四个决定：**同意 / 拒绝 / 忽略 / 其他**（`其他` 切换出自由文本域 + 提交按钮 + 返回）；`Esc` = 忽略；按钮带 title 说明拒绝与忽略的后果；
-8. 提交失败（如凭据存储只读、参数非法）就地红字显示并保持对话框打开；**若该请求已不再等待**（HTTP 409：超时、被取消、插件重载，或已在另一个窗口处理）则**自动关闭对话框**并显示一条一次性提示。
-9. 等待中的对话框仍在轮询 pending 列表：请求一旦从 Host 侧消失（超时后工具已失败返回、别的窗口已应答、插件重载），对话框在 1.2s 内自行关闭并提示，因此覆盖全视口、开启 pointer events 的遮罩**不会滞留**——只有仍在等待的请求才占用界面。
+卡片在每个"工作步骤展示"档位（简洁 / 标准 / 详细 / 完全展开）都可见：节点**不带 Turn/Step 坐标**（`location = { kind: 'session' }`），因此 Harness 会把它作为流的根条目输出，既不会落进「已调用工具」步骤进程分组，也不会被该分组在任何档位下折叠或隐藏。同一 key 上注册的 `tool.call.toolview` 占位组件返回 `null`，用来替换该工具的泛型工具行，避免同一次调用出现两个面。
+（附带说明：步骤进程分组的**标题**仍会把这次调用计入工具计数，并可能显示参数里的 `description`/`name` 文本——这是 Harness 对所有工具共有的既有行为，不是第二个交互面，也不含明文值。）
 
-样式只用主题 token（`--dsw-alias-*`、`--dsw-radius-*`、`--dsw-shadow-*`、`--dsw-font-*`），不 import 任何 Harness Client 包，浅色/深色主题都跟随 Host。
+卡片内容，自上而下（与请求态一致；结算后折叠为摘要，可展开只读回看）：
+
+1. 标题（`label`）+ 右侧状态：「准备中… / 等待你的决定 / 连接宿主失败，重试中… / 已提交… / 已授权 · 变量名 · 范围 / 已拒绝 / 已忽略 / 其他指示 / 出错 · 错误码」，以及「展开 / 收起」；
+2. **用途**（`reason`，原样展示，左侧竖线引用块）+ `description`（如有）；
+3. **保存方式**：`持久保存到凭据库` / `仅本次会话有效` 两个单选（各带一句含义说明），并用加粗文字写明"Agent 请求的范围："与"当前选择："；若人类改动范围，追加一行"你已把范围改为：…"；
+4. 密钥值输入（`type="password"`、可切「显示 / 隐藏」）；**若该凭据已存在于凭据库则不显示输入框**，只显示"已配置，本次仅需决定是否授权本次使用"；
+5. 四个决定：**同意 / 拒绝 / 忽略 / 其他**（`其他` 切换出自由文本域 + 提交指示 + 返回）；按钮带 title 说明拒绝与忽略的后果；
+6. 页脚说明：密钥明文不会交给模型，代理只会拿到变量名（并列出变量名）。
+
+**假过期缺陷已修复（客户端）**：卡片只把**成功且可解析**的 pending 响应当作事实来源。网络失败、非 2xx、响应体无法解析一律记为"暂时无法连接宿主，正在重试"——表单保持可见，按 1.2s→8s 退避重试，**绝不判定为已失效、绝不关窗**。只有"HTTP 成功且本次调用的 `callId` 确实不在等待列表中"才收束，且**已提交后永不判过期**（转入"已提交，等待 Agent 继续…"，等待工具结果）。未提交时也只降级为卡片内的只读提示，卡片本身保留到这次调用结束。提交得到 HTTP 409 表示宿主已不再等待这份请求，同样只在卡片内说明，不再重复提交。
+
+**兜底**（卡片构建失败 / 状态缺失时请求仍可见且可回答）：
+
+- 调用参数无法解析：仍然生成节点，卡片用 Host 的权威视图渲染完整表单；
+- Host 暂不可达：表单可见，按钮禁用并就地提示，连接恢复即可提交；
+- 结算载荷缺失（例如旧日志、嵌套调用）：显示"已结束（未记录结算细节）"，保留用途与范围，不回退为空白；
+- `tool.call.toolview` 占位未生效：泛型工具行会重新出现（多一个面），卡片仍在且可答。
+
+结算状态来自 `tool/result.meta` 里的值无关载荷（由工具的 `output.presentationMeta` 持久化，模型不可见），因此刷新页面/重放会话后同一张卡片可以从日志重建，不解析任何散文。
+
+样式只用主题 token（`--dsw-alias-*`、`--dsw-radius-*`、`--dsw-font-*`），不 import 任何 Harness Client 包，浅色/深色主题都跟随 Host。
+
+诊断面：Client 半在 `globalThis.__cordisSecretClient` 暴露一个**只读**、`Object.freeze` 的测试缝（纯函数、定义与占位组件；不含交互态、不含任何值），供测试与诊断使用。
 
 ## 存储与传播
 
@@ -107,7 +122,7 @@ profile 的组合树是「root 空清单 → `dsh.profile.bundles` 里每个 bun
 | **会话结束 / 进程退出** | `session/disposed` 时清空该会话的全部授权；插件卸载时中止所有等待中的对话框并撤下全部 `shellEnv` contributor；会话级值只存在于内存，进程退出即消失。 |
 | **超时 / 调用被取消** | 超过 `requestTimeoutMs` 未获答复 → `TIMEOUT` 失败，不注入任何变量；调用方的 `AbortSignal` 中止 → 该次等待以中止失败结束。 |
 | **同键并发** | 同一凭据键同时只允许一个授权尝试（凭据流程键 = `cordis-plugin-secret/<name>`）；第二个请求得到结构化失败而不是两个对话框。 |
-| **凭据库只读 / 写失败** | 对话框收到 4xx/5xx 并就地显示原因、保持打开，人类可改用 `session` 范围或取消。（唯一例外：`409` 表示该请求已不再等待，此时对话框关闭并提示，见「授权对话框」。） |
+| **凭据库只读 / 写失败** | 卡片内就地显示原因、保持打开，人类可改用 `session` 范围或取消。读取（`describe`/`resolve`）失败一律收敛为本插件自有的 `STORE_READ_FAILED`（固定消息，不透传上游文本）。唯一例外：`409` 表示该请求已不再等待——**卡片保留**，只在卡片内提示"已由别处处理"，不再重复提交（见「授权卡片（Client 半）」）。 |
 
 ### 授权何时失效（必须重新调用 `secret_request`）
 
@@ -129,24 +144,32 @@ profile 的组合树是「root 空清单 → `dsh.profile.bundles` 里每个 bun
 ## 实现细节与已知限制（如实记录）
 
 - **`ctx.authorization` 只承载 `persistent`**：该 seam 的契约要求"本次尝试期间提交并观察到一条凭据记录"（否则 `NOT_COMMITTED`），而 `session` 授权按定义不得落盘。因此 `session` 请求走同一套对话框、但不进该 seam；`persistent` 请求完整走 `registerFlow` + `begin`。这是 seam 契约决定的取舍，不是省事。
+- **O1 / O2（第二轮修复，两条都如实回报）**：
+  - **O1**：`persistent` 请求里人类已点"同意"，但 seam 的授权尝试最终 `failed` 时，**不再**声称"已持久化"：人类的选择被保留，但按「仅本次会话有效」降级生效，`notice` 写明的是**"未能完成持久化登记的确认"**——本插件自己的代码路径不会写凭据库，但 seam 可能在提交授权记录**之前**就已把值写入凭据库（`persist` 先于 `commit`），因此这里不做"值一定没进库"的绝对断言；若值已进库，它只是缺少本次授权记录。
+  - **O2**：`persistent` 等待本身超时（`requestTimeoutMs`）时，错误码一律是 `TIMEOUT`，不会被 seam 的 `failed` 包装成 `AUTHORIZATION_FAILED`。
 - **Harness 不自带 `AuthorizationPrompt` 的 Web 渲染器**（已核验：安装包中没有任何 client 包渲染 `AuthorizationPrompt`），所以本插件自己的对话框就是该 prompt 的界面；流程内 `session.prompt({kind:'secret'})` 的值直接来自对话框已收集的答案。
 - **`shellEnv` 的 resolver 是同步的**，而 `ctx.credentials.resolve` 是异步的：无法在每次 shell 执行时回源凭据库。因此授权通过时把值读入该会话的授权表（并在每次注入前做锚点/会话校验），凭据库仍是持久层的真相。轮换凭据后请重新调用 `secret_request` 刷新会话内副本。
 - **`Grant.replaceGenerationAtApproval` 只用于诊断**：授权记录里保留批准时的 `surface.replaceGeneration`，但撤销判定**只**看锚点事件是否仍在 `surface.nodes` 上（且 `isOwnSeq` 成立），**从不**比较该数值。压缩会重写表面并推进 `replaceGeneration` 而保留锚点，用"数值不等即撤销"会把压缩误判成回退——两条要求互斥，锚点在场性判定同时满足两者。该字段因此是记录性的，不参与任何判定（`src/grants.ts` 的字段注释与「压缩」一行相互印证）。
 - **客户端文案未接入 Client locale 服务**：本插件的可视文案集中在 `src/client/entry.ts` 的 `TEXT` 表里（本 profile 的 UI 语言为中文），未使用 `ctx.locale` 的命名空间注册；接入 locale 需要声明 `LocaleNamespaceMap` 并为所有内置语言提供完整词典，作为后续工作。
 - **Client 半是"经典脚本"**：client module system 以 `<script>` 加载包的浏览器产物，产物唯一副作用是 `window.__ModuleLoader__.load` 注册工厂，因此 `src/client/entry.ts` 没有 import/export，单独用 `tsconfig.client.json` 编译（DOM lib），Host 半用 `tsconfig.json`（Node types）。
-- **验证限制**：本插件的安装与注册由 `cordis_inspect_query` 的 Tool/Slots 证据覆盖；对话框的**视觉**（浅色/深色、布局、点击行为）只有在浏览器里有页面时才可能确认，无浏览器控制时不做渲染器/截图等替代验证。单测覆盖 Host 侧全部纯逻辑与 register 级装配（不依赖 UI）；**Client 半的自愈行为（请求消失即关闭、409 关窗）没有 DOM 测试**，只有类型检查与代码审查覆盖，真机点击路径需要人工确认。
+- **验证限制**：本插件的安装与注册由 `cordis_inspect_query` 的 Tool/Slots 证据覆盖；卡片的**视觉**（浅色/深色、布局、四档"工作步骤展示"下的实际渲染位置）只有在浏览器里有页面时才可能确认，无浏览器控制时不做渲染器/截图等替代验证。"卡片在四个档位下都位于步骤进程分组之外"由结构证明（节点无 Turn/Step 坐标 ⇒ 根条目、非 process member）加单测（`buildViewNode` 的 `location.kind === 'session'`）覆盖，**未经真人点击/切档验证**。单测覆盖 Host 侧全部纯逻辑、register 级装配与 Client 半的纯逻辑（节点状态机、四态判定、表单控件、明文不越界）；真机点击路径需要人工确认。
 
 ## 开发
 
 ```sh
 npm run typecheck   # tsc：Host 半（Node）+ Client 半（DOM），erasableSyntaxOnly，兼容 Node 原生类型剥离
-npm test            # node --test 两级：
+npm test            # node --test 三级：
                     #   test/unit.test.ts    参数校验、变量名推导、decision 映射、session/persistent 路由、
                     #                        四类返回都不含值、锚点撤销、fork 不继承、压缩不误撤销（含真实表面折叠）、
-                    #                        子代理失败关闭、超时、env contributor 注入与撤销、adapters 端口映射
+                    #                        子代理失败关闭、超时、O1（已答复但落库失败 ⇒ 降级 session 并如实回报）、
+                    #                        O2（persistent 超时 ⇒ TIMEOUT）、presentationMeta 四种决策都不含值、
+                    #                        env contributor 注入与撤销、adapters 端口映射
                     #   test/register.test.ts 用真实 apply + 假 Context 走完整链路：工具/路由/session-disposed 注册、
-                    #                        Config 校验、tool→对话框→shellEnv 的值交付、回退与会话结束后的取回消失、
+                    #                        Config 校验、tool→卡片→shellEnv 的值交付、回退与会话结束后的取回消失、
                     #                        persistent 经 authorization seam 落库且标记不含值、409 冲突
+                    #   test/client-card.test.ts 以 __ModuleLoader__ + 假 React 加载浏览器产物：节点在 tool/call 即存在且
+                    #                        无 Turn 坐标、结算态来自 meta、注册面恰好两处（无 shell.overlay/composer）、
+                    #                        假过期四态（不可达/未列出/已提交）、表单控件齐备、明文不越出掩码输入
 npm run build       # 产出 lib/（Host 半 + 浏览器产物 ./client）
 ```
 
