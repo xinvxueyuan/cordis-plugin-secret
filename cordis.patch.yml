@@ -1,0 +1,11 @@
+# Bundle patch for @xinvxueyuan/cordis-plugin-secret.
+# Applied by `plugin_manager install_bundle` (or any bundle layer that selects
+# this bundle); the id below is the Loader entry id and the name is this package.
+- insert:
+    - id: secret
+      name: '@xinvxueyuan/cordis-plugin-secret'
+      config:
+        # One secret_request waits this long for the human before failing closed.
+        requestTimeoutMs: 300000
+        # Concurrent requests allowed to wait for a human at the same time.
+        maxPendingRequests: 4
