@@ -208,7 +208,7 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
 
 ### 自己复测（活体，约 3 分钟）
 
-> **先重启。** dsh 在进程启动时加载插件的 `lib/` 构建，所以**发布 0.2.1 之后必须重启 `dsh web`** 才会加载修复后的产物；重启前的活体复测仍会复现 0.2.0 的现象（`staged` 不变 `bound`、shell 里没有变量），那是预期，不是修复失败。
+> **先重启。** dsh 在进程启动时加载插件的 `lib/` 构建，所以**发布 0.2.1 之后必须重启 `dsh web`** 才会加载修复后的产物；重启前的活体复测仍会复现 0.2.0 的现象（`staged` 不变 `bound`、shell 里没有变量），那是预期，不是修复失败。同理，**发布 0.3.0 之后也必须重启 `dsh web`** 才会加载四项增强的产物——重启前看不到消息旁的旁挂胶囊、信息框里的「历史记录」区、草稿移除后的自动撤销，`@` 菜单也不会有新分组，这些都属预期（下面是这四项各自的复测方式）。
 
 1. 在输入区点「附加密钥」按钮 → 胶囊里填名称（如 `openai`）与值，作用域保持默认「仅本次会话」→ 插入 → 输入框出现 `@DSH_SECRET_OPENAI` 胶囊。
 2. **发送前**：在同一浏览器（同源、带签名 cookie）打开 `GET /api/secret.attached?sessionId=$DSH_SESSION_ID` → 该条的 `state` 必须是 `"staged"`，且此刻 shell 里没有这个变量（未发送永不注入）。
@@ -301,6 +301,27 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
 | `凭据库（持久）` | 本插件在凭据库里留过持久记录的变量，且本会话当前没有 | `凭据库 · 持久保存到凭据库 · 尚未用于本会话` | **不直接插入**：先弹一步确认（变量名 + 来源 + 作用域），确认后调 `POST /api/secret.adopt`，由宿主自己 `credentials.resolve` 取值并登记到本会话，**成功之后**才插入标记；失败则不插入任何东西，只显示固定文案 |
 
 条目形态用足菜单的呈现能力：**`label` 是主显示文本，但不总是变量名**——「凭据库（持久）」一类是**变量名**（`src/service.ts:664-668`，记录里没有人类标题，变量名是唯一诚实的标签），「本会话可用」一类是**人类标题**（在胶囊里填的标题；留空即回退为凭据键，`src/client/entry.ts:2808`，attach 请求缺省 `label ?? name`）⇒ **带标题的本会话条目上不会显示变量名**（变量名出现在插入后的草稿标记与胶囊详情里，那两处都按变量名显示；菜单条目的 `description` 只写来源/作用域/状态）。`name` = 凭据键（灰色别名 + 搜索键）、`description` = 来源·作用域·状态、`section` = 来源分组（**不把来源塞进名字里**）。菜单**不渲染** `hint` 字段，所以来源/作用域不放在 `hint`。「凭据库」一类只列**本插件提交过记录**的密钥：凭据服务的 reference 半边**没有枚举面**，别处写进去的环境变量/`.env` 条目无法被发现，这一点如实说明而不是猜。
+
+#### 怎么复测这四项（先重启 `dsh web`）
+
+下表左列是**已在代码与 0.3.0 产物层面机器验证过的机制**（`lib/` 里可机械复核），右列是**仍未验证、必须真人在浏览器/真实凭据库里确认**的部分。两者不要混读。
+
+| 增强 | 机制（机器已验证的判据） | 仍需真人现场确认 |
+|---|---|---|
+| 历史胶囊点击 | 旁挂节点 `sr-chip`：`uiConversation.events.register` + `conversation.chat.node` 座位（键 `sr-chip`）都在 `lib/client/entry.js` 里；点击 → `setAttachMode({kind:'detail'})`，与草稿胶囊共用同一个信息框。右栏 `secret-attach-detail` 类型以 `priority: 'extension'` + `dsh-resource://file/**/DSH_SECRET_*` 注册，`canOpen` 只收末段形如 `DSH_SECRET_*` 的地址 | 旁挂行在气泡**之后**的视觉位置与四档展示；点旁挂行是否真在输入框上方开出信息框；点转录里的原胶囊是否真开出右栏详情页（而不是「文件不存在」），以及有没有被别的插件抢走这次打开 |
+| 信息框历史聚合 | 信息框头部「历史记录」链接 → `history` 面；行有 `data-secret-history-count` / `data-secret-history-row[data-status]`；Host 侧 `GET /api/secret.history?sessionId=$DSH_SESSION_ID` → `{ok:true, entries}`，逐字段重建、**无 value** | 视觉排版与长流水是否截断；四种诚实状态（未读/读失败/本进程无记录/该变量无记录）在现场是否可读 |
+| 移除即撤销 | 插入标记 → 从草稿删掉标记 → 约 0.6s 后 `POST /api/secret.release`（`reason:"withdrawn"`）⇒ `GET /api/secret.attached` 不再报 `staged`，`/api/secret.history` 多一条 `withdrawn`；重新插入**不会**把值找回来 | 真实编辑器里的时序（删掉→插回是否在 600ms 内、Enter 发送是否**不**触发撤销、发送失败恢复草稿是否仍为 `staged`） |
+| `@` 菜单 | 输入 `@` → `GET /api/secret.available?sessionId=…`；两类条目用 `section` 分组（`本会话可用` / `凭据库（持久）`）、`description` 写作用域与状态；凭据库条目选中后先确认，确认才 `POST /api/secret.adopt`（body 只有 `{sessionId, variable}`），成功之后才插入 `@VAR` | 菜单宽度是否截断条目；带自定义标题时条目显示标题（不是变量名）在现场是否可接受 |
+
+Shell 侧的可执行判据（只报存在性与长度，绝不回显值）：
+
+```powershell
+# 先重启 dsh web，再重跑一遍「自己复测」五步；下面是四项增强各自的检查点：
+Invoke-RestMethod "http://127.0.0.1:<port>/api/secret.history?sessionId=$env:DSH_SESSION_ID"   # 历史聚合
+Invoke-RestMethod "http://127.0.0.1:<port>/api/secret.attached?sessionId=$env:DSH_SESSION_ID"  # 移除标记后不再有 staged
+Invoke-RestMethod "http://127.0.0.1:<port>/api/secret.available?sessionId=$env:DSH_SESSION_ID" # @ 菜单的两类来源
+if ($env:DSH_SECRET_OPENAI) { "present length=$($env:DSH_SECRET_OPENAI.Length)" } else { "absent" }
+```
 
 ### 已知限制（如实记录）
 
@@ -445,19 +466,19 @@ npm stage approve <stage-id>                       # 需要 2FA
 判断该版本是否已存在于目标 registry，已存在就跳过发布（并在 Step Summary 写明"该版本已存在，跳过发布"），
 因此对已发布版本重推 tag 不会产生必然失败的公开红叉。其它检查错误（网络、鉴权、registry 故障）仍会让 job 失败。
 
-**registry 现状（截至本文）**：npmjs 上有 `0.0.0-stage`、`0.1.0`、`0.2.0`；`0.2.1` 已由 CI 放入 stage 队列，等维护者用 2FA 批准（`npm stage approve`）后才上线。GitHub Packages 上 `0.1.0`/`0.2.0`/`0.2.1` 都在（那里由 CI 直接发布，不经人工批准）。
+**registry 现状（截至本文）**：npmjs 上已上线 `0.0.0-stage`、`0.1.0`、`0.2.0`、`0.2.1`（`dist-tags.latest = 0.2.1`）；`0.3.0` 已由 CI 放入 stage 队列（stage id `38507d88-1558-4a17-afd2-6b14ed1f720f`，shasum `ceec688a12cadf260fb1b5e05dbaee99f6ff2c1d`），等维护者用 2FA 批准（`npm stage approve`）后才上线。GitHub Packages 上 `0.1.0`/`0.2.0`/`0.2.1`/`0.3.0` 都在（那里由 CI 直接发布，不经人工批准；`0.3.0` 的包版本 id `1346087280`）。
 
 同一份包也会发布到 **GitHub Packages**（`npm.pkg.github.com`，`github-packages` job，用内置 `GITHUB_TOKEN`），
 使包在仓库页面上可见、可被 `@xinvxueyuan:registry=https://npm.pkg.github.com` 的消费者安装。
 
 ### GitHub Release 与签名
 
-> **已发生的事实**：`v0.2.1` 的 Release 是 https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.2.1
-> （2026-10-06 发布，`draft: false`），附件三件：`xinvxueyuan-cordis-plugin-secret-0.2.1.tgz`（sha256 `55076023121254ba1a12c3718d4d2f6c3d03c64eb2667920fc19036e270b7edd`）、`SHA256SUMS`、`SHA256SUMS.asc`；
-> tgz 与 SHA256SUMS 各有一份 `gh attestation verify` 可验的构建来源证明，且**证明绑定在 tag 上**（签名证书 SAN = `.../release.yml@refs/tags/v0.2.1`，`resolvedDependencies` = `git+https://github.com/xinvxueyuan/cordis-plugin-secret@refs/tags/v0.2.1@a01dee656eb0d9ec654a79842b9a7064378d02f1`）——即 tag→commit 是证明的一部分，而不是只绑定到 `refs/heads/main`。tag 对象为 annotated + GPG 签名
-> （`git cat-file -t v0.2.1` → `tag`；GitHub API 的 `verification.verified` → `true`，`reason` → `valid`）。
-> 上一个版本 `v0.2.0` 的 Release（https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.2.0 ）同样是同形三附件；
-> 它的功能缺陷与 0.2.1 的修复见「人类主动附加密钥（反方向）→ 0.2.0 的缺陷与本版修复（0.2.1）」。
+> **已发生的事实**：`v0.3.0` 的 Release 是 https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.3.0
+> （2026-10-06 发布，`draft: false`），附件三件：`xinvxueyuan-cordis-plugin-secret-0.3.0.tgz`（196451 B，sha256 `1dc16de16dfd9e75cacc90330b78c4ba9f56973a970fb5cef9f4695f0cbb844e`）、`SHA256SUMS`、`SHA256SUMS.asc`；
+> tgz 与 SHA256SUMS 都由 `gh attestation verify` 可验（一份 attestation，subject 同时列出两者），且**证明绑定在 tag 上**（builder id / 签名证书 SAN = `.../release.yml@refs/tags/v0.3.0`，`externalParameters.workflow.ref` = `refs/tags/v0.3.0`，`resolvedDependencies` = `git+https://github.com/xinvxueyuan/cordis-plugin-secret@refs/tags/v0.3.0` @ commit `7df8c048f678d163a26ee44c52133f8b458c0f7b`）——即 tag→commit 是证明的一部分，而不是只绑定到 `refs/heads/main`（`--format json` 全文对 `refs/heads/` **零命中**）。tag 对象为 annotated + GPG 签名
+> （`git cat-file -t v0.3.0` → `tag`，tag 对象 sha `fc7bf1b89b21caca70a8be514203e9f3bb5fe50e`；GitHub API 的 `verification.verified` → `true`，`reason` → `valid`）。
+> 上一个版本 `v0.2.1` 的 Release（https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.2.1 ）同样是同形三附件（tgz sha256 `55076023121254ba1a12c3718d4d2f6c3d03c64eb2667920fc19036e270b7edd`，tag 对象 `bf43e3f76e905f9adfaa904383b8c24ca2d589a0`），再上一个 `v0.2.0`（https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.2.0 ）亦然；
+> `v0.2.0` 的功能缺陷与 `v0.2.1` 的修复见「人类主动附加密钥（反方向）→ 0.2.0 的缺陷与本版修复（0.2.1）」，`v0.3.0` 的四项增强见「0.3.0 的四项增强」。
 > 下表是**这些版本确实按之执行**的机制，不是"将来会做"的计划。
 
 | 环节 | 机制 |
@@ -469,21 +490,21 @@ npm stage approve <stage-id>                       # 需要 2FA
 | 构建来源证明 | `release.yml` 调用 `actions/attest-build-provenance`（pin 到 commit SHA），为 **tgz 与 SHA256SUMS 两者**生成 Sigstore 签名的 SLSA 构建来源证明，可用 `gh attestation verify` 校验。 |
 | npm 侧 | `release.yml` **完全不执行任何 npm publish**；npm 发布只由上面的 `publish.yml` staged publishing 负责。 |
 
-维护者操作顺序（`v0.2.0` 与 `v0.2.1` 都已按此执行）：
+维护者操作顺序（`v0.2.0`、`v0.2.1` 与 `v0.3.0` 都已按此执行）：
 
 ```sh
 # 1) 本机确认工作区干净、package.json 的 version 已就位（版本号由发布者手工提升）
 git status --porcelain
 
 # 2) 创建 annotated + GPG 签名 tag（私钥仅在本机使用；本机需能完成 GPG 签名）
-git tag -s v0.2.1 -m "v0.2.1"
+git tag -s v0.3.0 -m "v0.3.0"
 
 # 3) 只推 tag —— release.yml 会构建产物、生成来源证明并创建 Release
-git push origin v0.2.1
+git push origin v0.3.0
 
 # 4) 对本机生成的 SHA256SUMS 做分离签名并附到 Release（私钥不进 CI）
 gpg --armor --detach-sign SHA256SUMS
-gh release upload v0.2.1 SHA256SUMS.asc --clobber
+gh release upload v0.3.0 SHA256SUMS.asc --clobber
 ```
 
 校验方式：
@@ -496,7 +517,7 @@ sha256sum -c SHA256SUMS
 gpg --verify SHA256SUMS.asc SHA256SUMS
 
 # 校验构建来源证明（需要 gh CLI）
-gh attestation verify xinvxueyuan-cordis-plugin-secret-0.2.0.tgz --repo xinvxueyuan/cordis-plugin-secret
+gh attestation verify xinvxueyuan-cordis-plugin-secret-0.3.0.tgz --repo xinvxueyuan/cordis-plugin-secret
 gh attestation verify SHA256SUMS --repo xinvxueyuan/cordis-plugin-secret
 ```
 
