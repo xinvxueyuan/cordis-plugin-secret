@@ -10,11 +10,22 @@
 > **实施落地（t3，已合并回本文件）** —— 与本文原稿有 5 处经核实后的偏差，均已在对应小节就地改写：
 > 1. **座位**改为 `conversation.input.left`（captain 裁定 1），实际落点 `[访问模式][计划][新按钮]`（§3.1）。
 > 2. **不变量 7** 按 captain 裁定 2 确认，README 已按穷举口径重写（§1.3）。
-> 3. **绑定钩子**由「扫日志找锚点」改为 **`session/event`**（`type==='user/message'`），**captain 已独立复核并采纳为最终做法**：锚点 seq 只在消息 durable 之后才可知，而该服务的契约原文是 *"Seed events never publish on `session/event`"*（`dsh-session/lib/index.js:1271-1275`，captain 复核引用），因此重放/恢复历史**不可能**重新绑定。两步（改写 + 追加注记）仍由 `agent/pre-step` 承担，且**与绑定次序无关**（注记取"暂存或已绑定"，两者都算）。
+> 3. **绑定钩子**由「扫日志找锚点」改为 **`session/event`**（`type==='user/message'`），**captain 已独立复核并采纳为最终做法**：锚点 seq 只在消息 durable 之后才可知，而该服务的契约原文是 *"Seed events never publish on `session/event`"*（`dsh-session/lib/index.js:1271-1275`，captain 复核引用），因此重放/恢复历史**不可能**重新绑定。`agent/pre-step` 只负责**追加值无关注记（按 source 去重）**，**不再改写正文**（t11 更正，见文首修正块），且**与绑定次序无关**（注记取"暂存或已绑定"，两者都算）。
 > 4. **L2 移除**为冗余（§7.1）。
 > 5. **R3 定案为接受缺陷**，并给出"为什么 (a) 做不到"的契约依据（§9）。
 >
 > 另：注入的那条 message 不再运行时 import `@deepseek-ai/dsh-llm`（见 §1.4 的实施修正）。
+>
+> **实施落地修正（t11，2026-10-06，发布阻塞缺陷修复）——本文原稿第 2 节的 D4/§3.2b/§4.2/§4.3 有一处**事实错误**，已在此更正，并在对应小节就地改写：**
+>
+> 原稿断言「`agent/pre-step` 的改写**不落盘**」。**这是错的**，真实接线是：
+> - `agent/pre-step` 返回的消息**就是落盘的那条**：loop 原样 append 成 `user/message`（`dsh-agent-loop/lib/index.js:1061`，`surfaceOp:'append'`），同一步的模型请求由**同一份 surface** 派生（`:1262`）⇒ 「只改模型请求、不改日志」不可能；
+> - 模型输入按契约是**会话日志的纯函数**，`llm/stream` 的监听者「read it, never rewrite it」（`dsh-llm/lib/types/index.d.ts:37-45`）；
+> - 唯一能保留"仅模型可见副本"的 surface replacement / message projection 必须 append 在目标**之后**，而 `:1061`→`:1262` 之间没有插入点；自定义事件类型还需 `ignorable` 才不被持久化读取拒绝（`dsh-session-persistence/lib/index.js:184`）。
+>
+> **后果**（这正是 t11 的缺陷）：改写真的落进了持久日志 ⇒ `session/event` 读到的 `user/message` 里已无 `@` 标记 ⇒ `bindStaged` 永不执行（无 Grant、无 `shellEnv` contributor）⇒ 附加的变量在 shell 里取不到；同一根因还使对话框那条消息渲染不出变量名胶囊。
+>
+> **更正后的机制**：日志与用户气泡**保留** `@DSH_SECRET_*` 原形（胶囊成立、`session/event` 绑定成立），模型侧的改写改由**值无关的注记**承担——注记**逐变量逐字**写明「正文里的 `@DSH_SECRET_VAR` 即该变量，模型侧写作 `[secret DSH_SECRET_VAR]`；它不是文件路径。」注记是 durable 的 `user/message`（`source.kind='secret-attach'`），并**按自身 source 去重**（模型可见 surface 上已有同一条就不再追加）。另：`bindStaged` 的次序改为「先 `envs.ensure` → 再 `grants.put` → 最后消费暂存项」。
 
 ---
 
@@ -23,7 +34,7 @@
 1. **首要待证问题（真 chip）的结论：可以。** 插件能在草稿里生成**真正的原子 chip 节点**（`ReferenceChipNode`），路径是：注册一个 `InputTriggerSource`（必须，`codec` 是序列化路由键）→ 用 **`slash/input-insert-reference` 这个已公开的 bail 事件**把 `ReferenceInsert` 应用到捕获的 `TokenSpan`。这正是 shipped 触发管线自己执行插入的那条路径（同一事件、同一 `InputTarget.insertReference` 实现）。
 2. 模型侧文本**完全由我们的 `codec.serialize(ref)` 决定**：发送前 shell 把每个 chip 的 occurrence 替换成 `serialize` 的返回值再交给 sink（`sinkSerialized`）。因此「模型看到什么」是**我们逐字指定**的，而不是推断的。
 3. **日志/草稿里放 chip 形态的标记 `@<VARIABLE>`**（如 `@DSH_SECRET_OPENAI`）：它在对话框里由 shipped 的 `projectUserText` 渲染成**只显示变量名的胶囊**（`data-ref-chip="file"`），在草稿里是真 chip 或 lexicon 装饰引用。
-4. **模型请求侧做一次纯函数改写**：`@DSH_SECRET_OPENAI` → `[secret DSH_SECRET_OPENAI]`，并紧随该条用户消息追加一条**值无关**的说明性 context 消息（变量名 + 作用域 + shell 取用方式 + 「不要当文件路径读」）。改写发生在 `agent/pre-step` 的 waterfall 里，**不落盘**，所以刷新/重放看到的日志与模型文本都稳定。
+4. **模型请求侧的改写由值无关注记承担**（原稿写的「纯函数改写正文且不落盘」**已被 t11 更正**，见文首修正块）：正文保持 `@DSH_SECRET_OPENAI` 原形，紧随该条用户消息追加一条**值无关**的 context 消息，其中**逐变量逐字**写明「正文里的 `@DSH_SECRET_OPENAI` 即该变量，模型侧写作 `[secret DSH_SECRET_OPENAI]`；它不是文件路径。」，并给出变量名/作用域/shell 取用方式。注记由 `agent/pre-step` 追加、按自身 source 去重，所以刷新/重放看到的日志与模型文本都稳定。
 5. 值的三段式生命周期：**客户端胶囊本地 state → 一次 `POST /api/secret.attach` 请求体 → Host 内存 staged 记录**；**只有**当携带标记的用户消息真正进入某一步（`agent/pre-step`）时，staged 记录才被提升为 `Grant`（`anchorSeq` = 该 `user/message` 事件 seq），此后 `shellEnv` 才会注入。没发送 → 永不注入，TTL/会话结束即丢弃。
 6. 锚定复用现有 `GrantStore` 语义：消息被回退/重写离开 live surface 时，`resolve()` 自动判 `revoked-anchor`，密钥随之失效——「绑定这条消息」不是口号，是可验证的行为。
 7. 不变量 7 需要一处**诚实的收紧措辞**（第 1.3 节，需 captain 确认）：Host 必须持有值（round 2 的 `GrantStore` 已如此），所以「明文只存在于胶囊本地 state 与提交请求体」在任何能让 Agent 后续取用的设计里都不可能字面成立。
@@ -35,7 +46,7 @@
 ### 1.1 本轮只做
 
 - Client 半新增：工具栏按钮（`conversation.input.left`，captain 裁定后落位）、一个 `conversation.input.overlay` 条目（填值胶囊 + 详情胶囊两态）、一个 `InputTriggerSource`（name `secret`：codec + lexicon + openReference）。
-- Host 半新增：staged attach 存储与 3 条 `/api/secret.*` 路由、`agent/pre-step` 绑定/改写/注入、`attach` 相关 config、`Grant.callId` 变可选。
+- Host 半新增：staged attach 存储与 3 条 `/api/secret.*` 路由、`session/event` 绑定 + `agent/pre-step` 追加值无关注记（按 source 去重）、`attach` 相关 config、`Grant.callId` 变可选。
 - 既有「Agent 索要」方向（`secret_request` + 流内卡片）**语义与行为一律不变**；只做加法。
 
 ### 1.2 不做（明确排除）
@@ -121,14 +132,14 @@
 | D4 | 所以：日志文本里放 `@<VARIABLE>` ⇒ 用户气泡出现「只显示变量名的胶囊」。代价：它是 `data-ref-chip="file"`，点击会尝试 `openFile('DSH_SECRET_OPENAI')`（`projectUserText` 对 file 形必定挂 onClick） | 同上 `:6760-6781`；已知缺陷，见 R3 |
 | D5 | 系统提示把 `@` 前缀定义为**文件路径**：*Tokens prefixed with @ are paths the user explicitly referenced…* | `dsh-file-reference/lib/index.js:54`（`FILE_REFERENCE_PROMPT`）|
 
-⇒ D4 + D5 冲突必须解决：**日志保留 `@` 形态（为了 D4 的胶囊），模型请求侧改写掉 `@`（为了 D5）**。见 3.2。
+⇒ D4 + D5 的**原稿解法**（日志保留 `@` 形态、模型请求侧改写掉 `@`）**在真实接线下不可实现**：`agent/pre-step` 的返回值就是落盘的那条（t11 更正，见文首修正块）。正确解法见 3.2：日志与正文保留 `@`，模型侧的 `[secret VAR]` 由**注记逐变量逐字**承担。
 
 ### 2.5 结论 E：Host 侧的绑定/改写/注入钩子
 
 | # | 事实 | 证据 |
 |---|---|---|
 | E1 | `'agent/pre-step'` 是 **waterfall**，payload `{agent, messages: UserMessage[], turn, step, signal}`，`next: () => Promise<PreStepDecision>`；`PreStepDecision = {kind:'enter'; messages} \| {kind:'reject'}` ⇒ **可以替换进入本步的消息** | `dsh-agent/lib/types/runtime-types.d.ts:293-310`、`:92-99` |
-| E2 | shipped 包正是这么做「改写用户消息 + 追加值无关 context」：`ctx.on('agent/pre-step', …, {prepend:true})` → `next()` → 替换 `messages`；对每个 `source.kind === 'user'` 的消息改写 `content` 并追加 `additionalContext` | `dsh-session-reference/lib/index.js:468-475`、`:485-508` |
+| E2 | shipped 包正是这么做「在 `agent/pre-step` 改写用户消息 + 追加值无关 context」：`ctx.on('agent/pre-step', …, {prepend:true})` → `next()` → 替换 `messages`；对每个 `source.kind === 'user'` 的消息改写 `content` 并追加 `additionalContext`。**t11 的关键补充（当时漏掉的事实）**：它的改写**同样落盘**——所以它把 `@[label](uri)` 归一成**仍然可被 `projectUserText` 解析的 `@label`**（`lib/index.js:321-337`），而不是改成非 chip 形态。这正是"日志形态必须保持可解析"的先例 | `dsh-session-reference/lib/index.js:468-475`、`:485-508`、`:321-337` |
 | E3 | 追加的 context 消息由 `createUserMessage({source:{kind,form,version,…}, content:[{type:'text',text}]})` 构造；`freezeMessage` 用于改写后的冻结 | 同上 `:629-650`；`dsh-llm/lib/types/message.d.ts:190-216` |
 | E4 | `MessageSourceMap` 是**合并可扩展**的源类型表，各生产者声明自己的 `kind` | `dsh-llm/lib/types/message.d.ts:95-108`；合并写法先例（裸包名）：`dsh-skill/lib/types/index.d.ts:128-133`、`dsh-session-reference/lib/types/types.d.ts:32` |
 | E5 | 用户消息事件的数据就是 `UserMessage`（`'user/message': UserMessage`，且 `'user/message'` ∈ `SurfaceEventType`）⇒ 扫描 `session.snapshotEvents()` 能取到锚点 seq | `dsh-session/lib/types/types.d.ts:294`、`:442`；扫描先例 `src/anchor.ts:27-42` |
@@ -199,12 +210,13 @@ MODEL_FORM = "[secret " + $2 + "]"            // 例：[secret DSH_SECRET_OPENAI
 user/message (seq=42)  content=[{type:'text', text:'请用 @DSH_SECRET_OPENAI 跑测试'}]
 ```
 
-本步模型请求（`agent/pre-step` 改写 + 追加，**不落盘**）：
+本步模型请求（`agent/pre-step` **追加注记**；正文与日志逐字相同 —— 原稿的「改写正文且不落盘」已被 t11 更正）：
 
 ```
-user      : 请用 [secret DSH_SECRET_OPENAI] 跑测试
+user      : 请用 @DSH_SECRET_OPENAI 跑测试          ← 与 seq=42 的 durable 正文逐字相同
 user(注入) : 本条消息附带 1 个由人类主动提供的密钥；明文不进入对话，只能按变量名取用。
-            - DSH_SECRET_OPENAI · 仅本次会话有效（在 shell 执行时按会话注入）
+            - DSH_SECRET_OPENAI · 仅本次会话有效
+            正文里的 @DSH_SECRET_OPENAI 即该变量，模型侧写作 [secret DSH_SECRET_OPENAI]；它不是文件路径。
 
             取用方式：PowerShell 用 $env:DSH_SECRET_OPENAI，POSIX shell 用 "$DSH_SECRET_OPENAI"。
             不要把该标记当作文件路径读取。
@@ -277,15 +289,18 @@ agent/pre-step({agent, messages, signal}, next)
   → 对每个 source.kind === 'user' 的消息：
        markers = MARKER_RE 匹配其 text 块（去重、保序）
        for each marker：
-         attach = AttachStore.get(sessionId, variable)        // 会话级
-         if (!attach) continue                                // 人手打的 @ 记号：不动
-         seq = findUserMessageSeq(session.snapshotEvents(), marker, alreadyBoundSeqs)
-         if (seq === undefined) → 记一条值无关的“未能绑定”context（第 7 节 F4），并仍做文本改写
-         else → grants.put({...attach, anchorSeq: seq, source:'entered'|'store'})
-                envs.ensure(envVar)
-                AttachStore.remove(...)
-                bound.push({variable, scope})
-  → 返回值：改写后的 messages（`@VAR` → `[secret VAR]`）+ 每条被绑定变量对应的一条注入 context（3.2b）
+         known = describeVariable(...)   // 暂存项或已绑定的 grant，都算
+         if (known) → 收进 notes（按变量去重）
+  → 若 notes 为空 → 原样返回 decision（连一条消息都不动）
+  → source = attachSource(notes)；若 noteVisible(source) → 原样返回（**按自身 source 去重**）
+  → 返回值：decision.messages **原样**（正文不做任何替换）+ 一条注记消息（3.2b 的逐字映射行）
+
+绑定不在这里发生：它由 `session/event` 在消息 durable 之后执行（下节）：
+  session/event(session, event) 且 event.type === 'user/message'
+    → seq = event.seq（锚点）
+    → for each marker in messageMarkers(event.data)：
+         staged = AttachStore.get(sessionId, variable); if (!staged) continue
+         envs.ensure(variable) → grants.put({...staged, anchorSeq: seq}) → AttachStore.remove(...)
 ```
 
 | 事件 | 判定 |
@@ -295,16 +310,16 @@ agent/pre-step({agent, messages, signal}, next)
 | 同一消息里两次同一标记 | 只绑定一次（按变量去重） |
 | 消息被回退/重写（edit-and-retry） | `resolve()` 现算 `surface.nodes.includes(anchorSeq)` 失败 ⇒ `revoked-anchor` ⇒ 不再注入（E6） |
 | 会话分叉 | 子会话 id 不同 ⇒ 父会话的 grant/staged 一律不可见（`grants.ts:77-85` 注释与实现） |
-| 已绑定变量出现在**后续**消息里 | 只是文本；grant 早已有效，无需再次绑定；改写按 4.3 无条件生效（纯函数），但因为不再有 staged 记录可消费，**不生成注入行** |
+| 已绑定变量出现在**后续**消息里 | 只是文本；grant 早已有效，无需再次绑定；注记按 source 去重（模型可见 surface 上已有同一条就不再追加），且因为不再有 staged 记录可消费，**不产生新的绑定事件** |
 | Host 重启 | staged 与 grants 都丢（内存态）；日志里的标记仍在，模型可能提到一个不再注入的变量名（第 5.4 节，已定案为 fail-closed） |
 
-### 4.3 改写的确定性（为什么刷新/重放稳定）
+### 4.3 注记的确定性（为什么刷新/重放稳定；原稿的"改写正文"已被 t11 更正）
 
-改写是**文本的纯函数**：同一段文本 + 同一份「该会话当前有 staged/bound attach 的变量集合」⇒ 同一结果。为了让重放更稳，本定案进一步收紧：**只要文本里出现合法 `@DSH_SECRET_*` 标记，就无条件改写为 `[secret …]`**（不依赖“是否刚好在本步绑定”），注入 context 则**只对被绑定/已绑定的变量生成**。这样：
+注记是**文本的纯函数**：同一段文本 + 同一份「该会话当前有 staged/bound attach 的变量集合」⇒ 同一条注记。为了重放更稳，本定案收紧为：**只要出现了合法 `@DSH_SECRET_*` 标记，就把它逐变量写进注记的映射行**（不依赖“是否刚好在本步绑定”），而**绑定/授权**只对真的有暂存记录的变量发生（`session/event` 只消费暂存项）。这样：
 
-- 刷新、重放、fork 后重新组请求，模型文本与日志文本的对应关系恒定；
-- 不存在「同一条日志消息在不同重放里得到不同模型文本」的危险；
-- 代价：人手打的 `@DSH_SECRET_X` 也会被改写成 `[secret DSH_SECRET_X]`（无害，且比让模型去 read 一个文件更接近真相）。
+- 刷新、重放、fork 后重新组请求，日志文本恒定、注记文本恒定（按 source 去重），两者的对应关系也恒定；
+- 不存在「同一条日志消息在不同重放里得到不同模型文本」的危险（正文从不被改写）；
+- 代价：人手打的 `@DSH_SECRET_X` 也会在注记里被写明 `[secret DSH_SECRET_X]`（无害：它不会被绑定，因为没有暂存记录），且比让模型去 read 一个文件更接近真相。
 
 ---
 
@@ -314,23 +329,19 @@ agent/pre-step({agent, messages, signal}, next)
 
 | 来源 | 内容 | 稳定性 |
 |---|---|---|
-| 用户消息正文 | 改写后的 `[secret VAR]` 记号（3.2b） | 纯函数改写 ⇒ 稳定 |
-| 追加 context 消息 | 变量名/作用域/取用方式/「不要当文件路径」 | 绑定后立即落盘成 `context` 事件（E2/E3 的既有行为），重放时从日志复现同一行 |
+| 用户消息正文 | **与日志逐字相同**（`@DSH_SECRET_VAR`），不做替换 | 无改写 ⇒ 天然稳定 |
+| 追加注记消息 | 变量名/作用域/**逐变量的 `[secret VAR]` 映射行**/取用方式/「不要当文件路径」 | durable（`user/message`，`source.kind='secret-attach'`），按 source 去重 ⇒ 重放时从日志复现同一行 |
 | `shellEnv` 注入 | 变量本身 | **不**durable：Host 重启后丢失（5.4） |
 
-### 5.2 锚点定位算法（可单测的纯函数）
+### 5.2 ~~锚点定位算法（可单测的纯函数）~~ **已作废（t11）**
+
+原稿打算在 `agent/pre-step` 里"回头扫日志找锚点"：
 
 ```
-findUserMessageSeq(events, variable, exclude) →
-  从 events 末尾往前扫；
-  只看 type === 'user/message' 且 seq ∉ exclude；
-  拼接 data.content 中的 text 块（仅 {type:'text'}）；
-  若 MARKER_RE 命中 "@"+variable → 返回 event.seq
-  否则继续；都没有 → undefined
+findUserMessageSeq(events, variable, exclude) → …            ← 不再存在
 ```
 
-- 依据：`'user/message': UserMessage`（E5）⇒ `event.data` 就是消息对象，`content` 里是 `{type:'text',text}`。
-- 找不到时（极端：日志被并发改写、或消息来自不经日志的注入路径）→ **不绑定**（fail-closed），并注入一条值无关的失败说明（第 7 节 F4）。绝不使用「假 seq」——那会被 `resolve()` 立刻判为 `revoked-anchor`（E6），属于静默失效。
+**作废理由（t3 采纳、t11 再次确认）**：`agent/pre-step` 里的消息**还没有 seq**（seq 只在 append 之后才可知），而锚点必须是真实 seq。现在锚点直接来自 `session/event` 的 `event.seq`（该事件只在 durable 之后发布，且 seed 事件不发布 ⇒ 重放不可能重绑）：见 4.2 的绑定伪码。`src/anchor.ts` 的 `findAnchorSeq` 只服务 round 2 的「Agent 索要」方向（它锚定的是 assistant 消息），与本方向无关。
 
 ### 5.3 注入 context 的形状
 
@@ -352,10 +363,10 @@ createUserMessage({
 
 | 场景 | 结果 |
 |---|---|
-| 页面刷新（Host 未重启） | 草稿：chip 变纯文本 `@VAR`，由 lexicon 装饰回胶囊观感；对话框：气泡胶囊与注入说明行由日志复现；模型侧：同一改写结果；值仍可注入 |
+| 页面刷新（Host 未重启） | 草稿：chip 变纯文本 `@VAR`，由 lexicon 装饰回胶囊观感；对话框：气泡胶囊与注入说明行由日志复现；模型侧：正文逐字不变、注记按 source 去重后仍是同一行；值仍可注入 |
 | 会话重放（回看历史） | 与刷新相同；已结算/已绑定的历史不再产生任何新绑定（staged 记录已被消费） |
 | Host 重启 | staged 与 grants 丢失 ⇒ 变量不再注入；日志与对话框不变（标记/说明行仍在）；模型若仍引用该变量，shell 里取不到值（工具会如实报错）。**定案：不做自动重新武装**（见下） |
-| 会话 fork | 子会话不可见父的 staged/grant（E6）；日志前缀里的标记照旧被改写为 `[secret VAR]`，但不生成注入行（子会话没有该变量）——**t3 需按此断言**（可机器证明：纯函数 + AttachStore 会话隔离） |
+| 会话 fork | 子会话不可见父的 staged/grant（E6）；日志前缀里的标记照旧保留 `@` 形态，但子会话没有该变量 ⇒ 其 `agent/pre-step` 不生成注记行、也不绑定——**t3 需按此断言**（可机器证明：注记只对暂存/已绑定变量生成 + AttachStore 会话隔离） |
 
 **为什么不做自动重新武装（`persistent` 也一样）：** 重启后凭据库里确实还有值，但把它静默地重新变成“本会话可用的环境变量”，等于在**没有人类在场的新进程里重新武装一次授权**；同时锚点需要重扫日志（可能面对被压缩/改写过的历史）。本定案选择 fail-closed，把这条列为 P2/未决（第 9 节 R6）。
 
@@ -391,7 +402,7 @@ createUserMessage({
 | `src/protocol.ts` | 新增 `parseAttach(raw)`、`parseRelease(raw)`、`parseSessionId(raw)`、`attachedView(...)`；`MAX_VALUE` 复用 |
 | `src/routes.ts` | 新增 3 条路由（6.3），沿用 `jsonResponse` 与 `requestBody:'buffered'` |
 | `src/service.ts` | 新增 `attach(raw)`、`release(raw)`、`attached(sessionId)`、`bindFromMessages(session, messages, signal)`（返回 `{rewritten, bound, unbound}`，只做绑定与值无关载荷；不动既有 `request/answer/converse/complete`） |
-| `src/inject.ts`（**新**） | `installAttachBinding(ctx, deps)`：注册 `agent/pre-step`（`{prepend:true}`，E2 同法），改文本 + 追加注入了 context 的消息；内含纯函数 `findUserMessageSeq`（5.2）与 `renderAttachNote(bound)` |
+| `src/inject.ts`（**新**） | `installAttachBinding(ctx, deps)`：注册 `session/event`（`type==='user/message'` 时绑定，锚点 = 该事件 seq）+ `agent/pre-step`（追加值无关注记，**不改正文**；按自身 source 去重，见文首 t11 修正块）；导出 `noteSourcesOn(session)` 供去重读取 |
 | `src/grants.ts` | `Grant.callId` 改 `readonly callId?: string`（可选，加法；现有调用方传值照旧） |
 | `src/config.ts` | 新增 `attachTtlMs: 1800000`、`maxAttachmentsPerSession: 8`；`assertConfig` 增加对应正整数校验 |
 | `src/index.ts` | 组装 `AttachStore`；`registerSecretRoutes` 传 service；`installAttachBinding`；`session/disposed` 同时 `attachments.forget(sessionId)` |
@@ -435,9 +446,9 @@ createUserMessage({
 |---|---|---|
 | F1 | `POST attach` 时凭据库写入失败（persistent） | 400/500 固定文案；**不**产生 staged 记录、**不**插 chip、值不保留 |
 | F2 | attach 成功后用户从不发送 | 永不提升为 Grant ⇒ 永不注入；TTL / 会话结束丢弃 |
-| F3 | 标记出现在消息里但无 staged attach（人手打 / 别的客户端） | **不绑定**；按 4.3 仍把 `@…` 改写成 `[secret …]`（纯函数，避免模型去 read 一个文件）；**不生成注入行**，因此模型侧不会宣称该变量可用 |
-| F4 | 有 attach 但找不到锚点 seq（5.2） | 不绑定；注入一条值无关说明：「本次未能把密钥绑定到该消息，未注入任何变量」；文本仍改写 |
-| F5 | `agent/pre-step` 监听缺席（插件未加载/被禁） | 无改写、无绑定、无注入 ⇒ 日志里的 `@VAR` 只是文本；Agent 拿不到变量（fail-closed），人类可从胶囊看到 staged 状态 |
+| F3 | 标记出现在消息里但无 staged attach（人手打 / 别的客户端） | **不绑定**；注记里仍按 4.3 逐变量写明 `正文里的 @… 即该变量，模型侧写作 [secret …]`（纯函数，避免模型去 read 一个文件）；因为它从未绑定，`describeVariable` 只对**暂存或已绑定**的变量生成注记行 ⇒ 人手标记**不会**生成注记行，模型侧不会宣称该变量可用 |
+| F4 | 暂存项存在但注记无法生成（会话不可读等边界） | 不绑定；正文与日志原样（fail-closed）；变量不可用，人类可从胶囊看到 staged 状态 |
+| F5 | `agent/pre-step` 监听缺席（插件未加载/被禁） | 无注记、无绑定、无注入 ⇒ 日志里的 `@VAR` 只是文本；Agent 拿不到变量（fail-closed），人类可从胶囊看到 staged 状态 |
 | F6 | 客户端 `sessions` 或 `inputTriggers`（或 `locale`）缺失 | **不抛、不阻断启动**（t7 定案）：按钮/胶囊照常注册并渲染（它们只依赖已声明的 `slots`/`uiConversation`）；缺 `sessions` 时插入阶梯从 L3 起步，缺 `inputTriggers` 时不注册引用源（无 `@` 菜单集成、刷新后无 lexicon 装饰），缺 `locale` 时只用字面量文案；既有「Agent 索要」卡片不受影响 |
 | F7 | `bail` 事件未来被收窄（R1） | 自动降级到 L3（纯文本 + `lexicon` 装饰引用），再不行 L4（手动提示）——同一 `insertChip` 函数内的顺序尝试 |
 | F8 | `GET attached` 不可达 | `detail` 只显示本地已知信息 + 「状态未知」，不阻塞任何操作 |
@@ -475,7 +486,7 @@ createUserMessage({
 3. `bindFromMessages`：给定含 `@DSH_SECRET_X` 的 `user/message` 事件日志 + staged 记录 → 返回 `bound:[{variable:'DSH_SECRET_X',scope:'session',anchorSeq:<seq>}]`，且 `grants.resolve(session,'x').code === 'ok'`；staged 记录被消费（再调一次 → `bound: []`，不重复绑定）。**关键：调用前 `grants.valueFor(session,'DSH_SECRET_X') === undefined`**（证明 attach 阶段不注入）。
 4. 锚点缺失：日志里没有该标记 → `bound: []`、`unbound:[variable]`、`grants.size()` 不变。
 5. 撤销：绑定后把该 seq 从 `surface.nodes` 移除（或让 `isOwnSeq` 为 false）→ `grants.resolve` 返回 `revoked-anchor`/`revoked-not-own`，`valueFor` → undefined。
-6. 改写纯函数：`rewriteModelText('请用 @DSH_SECRET_X 跑')` → `'请用 [secret DSH_SECRET_X] 跑'`；同一输入重复调用结果相同；无标记文本原样返回（对象同一性不必相同，内容必须相同）。
+6. 注记映射行与去重：`renderAttachNote([{variable:'DSH_SECRET_X',…}])` 逐字含 `正文里的 @DSH_SECRET_X 即该变量，模型侧写作 [secret DSH_SECRET_X]；它不是文件路径。`；`rewriteMarkers('请用 @DSH_SECRET_X 跑')` → `'请用 [secret DSH_SECRET_X] 跑'`（纯函数，重复调用同结果）；**正文不被替换**（`agent/pre-step` 返回的 `decision.messages` 与入参同一对象/同一文本）。
 7. `renderAttachNote(bound)` 逐字等于模板（含变量名、作用域中文、shell 取用提示、「不要把该标记当作文件路径读取」），且**不含**任何值。
 8. `Grant.callId` 可选后：既有 `service.request`/`complete` 路径的单测全绿（回归）。
 
@@ -522,7 +533,7 @@ npm --prefix projects/cordis-plugin-secret run build       # exit 0；lib/client
 | 项 | 说明 | 处置 |
 |---|---|---|
 | R1 | 我们依赖 `slash/input-insert-reference` 这一 scoped bail 事件（虽在冻结契约里，但 `InputActions` 面被刻意排除） | 已定 **L3（纯文本 + lexicon 装饰引用）一级自动降级**；L2 已判冗余并移除（§7.1，captain 采纳偏差 4）。A1 的第 2/3 条是看门狗；若未来 rc 收窄，重审定案 |
-| R2 | 「允许改写原消息」的边界 | 本定案只改**模型请求侧**（`agent/pre-step` 的 decision），**不改日志**；4.3 保证改写是纯函数。如果 captain 希望连日志也改写（❌ 不建议，会破坏对话框胶囊与重放一致性），需重新定案 |
+| R2 | 「允许改写原消息」的边界 | 用户定案确实允许改写原消息，但**真实接线不允许只改模型请求侧**（t11 实证：`agent/pre-step` 的返回值就是落盘的那条）。因此本定案**不改写任何正文**：日志与用户气泡保留 `@DSH_SECRET_*`，模型侧的 `[secret …]` 形态由**注记逐变量逐字**给出。这样两者都成立，且不存在"日志与模型文本不一致"的重放风险 |
 | R3 | 对话框胶囊是 `data-ref-chip="file"`，点击会尝试 `openFile('DSH_SECRET_X')` | **captain 定案并采纳 (b)：接受该缺陷，写成「已知限制」并说明点击行为**（README 与本节均已写明：点转录里的胶囊会尝试打开同名文件；无害、不泄露，但行为不正确，需真人现场确认）。**「为什么 (a) 做不到」的完整证明（captain 补齐）**：`projectUserText` 只认三种 token（primitives `lib/index.js:6724` 的正则：`/名称`、`@"…"`、`@非空白`）；`:6753` 的判定是 `@` 开头**必然**映射为 `'file'`（或 `'folder'`），只有 `/` token 才可能是 `void 0`；而 `/` token 又必须在 caller 传入的 `slashNames` 名单里（`:6731`）。因此**不存在"是 chip 又不可点"的 `@` 形态**。定案原稿的 (a) 写法（"让其 `openReference` 返回 false/惰性"）也一并证伪：`openReference` 只在**草稿编辑器**被调用（conversation `lib/client.js:13166`/`:13518`），转录气泡的胶囊点击分支在 primitives 里**硬编码** `references.openFile(...)`（`:6760-6781`），**完全不经过 input-trigger 注册面**，没有任何插件钩子。另两条路均否决：wire session 形态 `@[label](dsh-session:…)` 虽无 onClick（`:6753-6764`），但会被 `dsh-session-reference` 当跨会话引用解析（`lib/index.js:485-508`）、可能让整步失败；整体接管 `conversation.chat.node` 的 `user` key 需重写附件/图片/markdown/动作行，脆弱度过高。 |
 | R4 | 输入框上方几何是复用 `@` 菜单的既有位置 | B1/B2 人工确认；若不满意，`fill` 态可改为 `top:0` 覆盖输入框（一行 CSS），代价是遮挡首行文本 |
 | R5 | 不变量措辞收紧（1.3） | **需 captain 确认**并同步 README |

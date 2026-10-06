@@ -115,13 +115,19 @@ export function parseMarkers(text: string): readonly string[] {
 }
 
 /**
- * Replace every marker with its model-facing form.
+ * Render every marker in one text in its model-facing form.
  *
  * A pure function of the text alone: it never consults whether this session
- * still holds the variable. That is what keeps the model-side form stable across
- * a reload, a replay and a fork — the same logged message always yields the same
- * model text, and no `@`-prefixed token survives into the request to be mistaken
- * for a file path.
+ * still holds the variable, so the same text always yields the same model-side
+ * words, and no `@`-prefixed token survives into the rendered result to be
+ * mistaken for a file path.
+ *
+ * Note on where this runs: the durable `user/message` keeps the marker form
+ * (`@DSH_SECRET_*`) because the harness derives every model request from that
+ * log, so `src/inject.ts` does not rewrite the message body at admission — the
+ * value-free note states the mapping per variable instead
+ * ({@link renderAttachNote}). This function is the single owner of that
+ * notation and is what a transcript consumer (or the note) renders with.
  */
 export function rewriteMarkers(text: string): string {
   return text.replace(MARKER_PATTERN, (_whole, lead: string, envVar: string) => `${lead}${modelFormFor(envVar)}`)

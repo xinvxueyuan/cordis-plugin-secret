@@ -11,7 +11,7 @@ import { AttachStore } from './attach.ts'
 import { assertConfig, Config, type SecretConfig } from './config.ts'
 import { EnvContributorRegistry } from './envs.ts'
 import { GrantStore } from './grants.ts'
-import { installAttachBinding } from './inject.ts'
+import { installAttachBinding, noteSourcesOn, type AttachNoteReader } from './inject.ts'
 import { registerSecretRoutes } from './routes.ts'
 import { SecretService } from './service.ts'
 import { defineSecretRequestTool } from './tool.ts'
@@ -91,6 +91,9 @@ export function apply(ctx: Context, config: SecretConfig): void {
     envs,
     now: () => Date.now(),
     sessionOf: (agent) => sessionOf(ctx, agent),
+    // One note per attachment: the note itself is durable, so a step that
+    // re-admits the same markers must not stack another copy.
+    visibleNotes: (session) => noteSourcesOn(session as unknown as AttachNoteReader),
     onBound: (attach) => {
       service.noteBound(attach)
     },

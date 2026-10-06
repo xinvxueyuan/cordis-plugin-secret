@@ -1,5 +1,5 @@
 import type { GrantStore, GrantSessionLike } from './grants.ts'
-import { parseMarkers } from './naming.ts'
+import { markerFor, modelFormFor, parseMarkers } from './naming.ts'
 import type { SecretScope } from './types.ts'
 
 /**
@@ -184,6 +184,16 @@ export function scopeLabel(scope: SecretScope): string {
  * an edit-and-retry that rewrites the message away revokes the exposure without
  * any bookkeeping here.
  *
+ * Order matters. The `shellEnv` contributor is declared **before** the grant is
+ * recorded and the staged entry is consumed, so a registry failure leaves the
+ * session exactly as it was (no grant, nothing consumed, the staged entry still
+ * armed for a later attempt). The reverse order would leave a grant with no
+ * contributor and an unconsumed staged entry — an exposure that silently never
+ * injects. In the other direction a recorded grant whose contributor
+ * registration failed for an unrelated reason is harmless: the resolver asks
+ * `valueFor`, so a missing contributor injects nothing (fail-closed) while the
+ * staged entry stays consumed.
+ *
  * @returns the bound variable, or undefined when nothing was staged for it.
  */
 export function bindStaged(
@@ -195,6 +205,7 @@ export function bindStaged(
   const sessionId = String(session.id)
   const staged = deps.store.get(sessionId, envVar)
   if (staged === undefined) return undefined
+  deps.envs.ensure(staged.envVar)
   deps.grants.put({
     sessionId,
     name: staged.name,
@@ -206,7 +217,6 @@ export function bindStaged(
     replaceGenerationAtApproval: session.surface.replaceGeneration,
     authorizedAt: deps.now(),
   })
-  deps.envs.ensure(staged.envVar)
   // Consuming the staged entry is what makes binding idempotent: whichever hook
   // gets there first wins, and the other finds nothing to do.
   deps.store.remove(sessionId, staged.envVar)
@@ -296,17 +306,28 @@ export function seqOf(event: SessionEventLike): number | undefined {
 /**
  * The value-free note injected beside a message that carried attachments.
  *
- * It names the variables and how to read them, and it says out loud what the
- * system prompt would otherwise get wrong: the marker is not a file path.
+ * It names the variables and how to read them, and it says out loud the two
+ * things the surrounding prompt would otherwise get wrong: what the marker in
+ * the message body *is*, and that it is not a file path.
+ *
+ * The mapping line is the model-facing rewrite. The harness derives every model
+ * request from the durable log, so the message body keeps the marker form the
+ * human's client sent (which is also the form the conversation view projects to
+ * a variable-name capsule); the rewrite therefore rides this note, which states
+ * the correspondence per variable, literally.
  */
 export function renderAttachNote(notes: readonly BoundVariable[]): string {
   if (notes.length === 0) return ''
   const heading = `本条消息附带 ${String(notes.length)} 个由人类主动提供的密钥；明文不进入对话，只能按变量名取用。`
   const bullets = notes.map((note) => `- ${note.variable} · ${scopeLabel(note.scope)}`)
+  const mappings = notes.map(
+    (note) => `正文里的 ${markerFor(note.variable)} 即该变量，模型侧写作 ${modelFormFor(note.variable)}；它不是文件路径。`,
+  )
   const reads = notes.map((note) => `PowerShell 用 $env:${note.variable}，POSIX shell 用 "$${note.variable}"`).join('；')
   return [
     heading,
     ...bullets,
+    ...mappings,
     '',
     `取用方式：${reads}。`,
     '不要把该标记当作文件路径读取。',

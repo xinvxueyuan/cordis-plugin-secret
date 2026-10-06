@@ -7,7 +7,7 @@
 > Cordis（DeepSeek Harness）插件：**密钥在人与 Agent 之间双向流动——Agent 可以开口索取，人类也可以把一枚密钥主动附加到自己的消息上——而 Agent 永远只拿到一个不透明的变量名（如 `DSH_SECRET_OPENAI`）。插件自身从不把值放进工具结果、错误消息、日志、DOM 或会话记录；值只经 `ctx.shellEnv` 按会话注入到 shell 环境——由 Agent 自己避免回显。**
 
 - Host 半（索取方向）：注册 `secret_request` 工具；用 `ctx.authorization` 的凭据获取流程承载持久授权；用 `ctx.credentials` 落库；用 `ctx.shellEnv` 按会话注入 `DSH_SECRET_*`。
-- Host 半（附加方向）：`POST /api/secret.attach` 把人类填的值**暂存**在进程内存（暂存不等于授权：此时不注入任何变量）；携带标记 `@DSH_SECRET_*` 的用户消息一旦落进会话日志，`session/event` 就把它**提升为按该条消息锚定的授权**；`agent/pre-step` 再把该标记改写成模型形态并追加一条**只有变量名**的说明消息。
+- Host 半（附加方向）：`POST /api/secret.attach` 把人类填的值**暂存**在进程内存（暂存不等于授权：此时不注入任何变量）；携带标记 `@DSH_SECRET_*` 的用户消息一旦落进会话日志，`session/event` 就把它**提升为按该条消息锚定的授权**；`agent/pre-step` 追加一条**只有变量名**的说明消息，其中逐变量写明这枚标记在模型侧写作 `[secret DSH_SECRET_*]`（正文本身不改写——harness 会让改写落盘，见下文）。
 - Client 半（索取方向）：在 Agent 输出流里渲染**会话流内一级卡片**（`conversation.chat.node`，`key=secret-request`），**无 `shell.overlay` 遮罩**；卡片带 `type="password"` 输入与显示/隐藏切换，把「同意 / 拒绝 / 忽略 / 其他」四个决定、申请理由、用途说明与**授权范围**摆在人类眼前，并允许人类**改写 Agent 请求的范围**。
 - Client 半（附加方向）：在输入区 `conversation.input.left`（紧随「访问模式 / 计划」控件组右侧）加一个**切换式按钮**；按下后在输入框上方（`conversation.input.overlay`）浮起**填值胶囊**；填完点「插入到光标处」，草稿光标处得到**真正的内联 chip**（`data-composer-chip="secret"`，只显示变量名），可在后续 shell 取用；点击该 chip（或刷新后由 lexicon 装饰出的同名引用）会在同一浮层展开**只读详情胶囊**。
 - 传输：两个方向的对话框都经本插件自有的、位于 `ctx.connection` 信任栅栏内的 `/api` 路由与 Host 通信。密钥值只出现在 `POST /api/secret.answer` 与 `POST /api/secret.attach` 的请求体里，从不进入 URL / 查询串 / 会话日志 / 响应体。
@@ -39,7 +39,7 @@
 - **会按会话把明文注入子进程环境**：`ctx.shellEnv.register` 为每个变量名声明一个 contributor，每次 shell 执行都**重新校验该执行的会话是否仍持有有效授权**，有效才注入。这是插件功能本身，也是明文唯一离开本进程的出口——注入给子进程意味着该子进程写下的任何输出都可能带上它，是否回显由 Agent 负责。
 - **会在 Host 进程内存里持有明文**：人类填的值先落在暂存表（`attachTtlMs` 到期即丢、每会话 `maxAttachmentsPerSession` 条上限），随消息绑定后进会话授权表；两者都在内存。进程退出即消失。
 - **可能写凭据库（仅当人类显式选「持久」）**：经 `ctx.credentials.set(<变量名>, value)` 写入凭据引用空间，并追加一条不含密钥材料的标记记录；`session` 范围不落盘。
-- **会改写发给模型的用户文本（不落盘）**：`agent/pre-step` 把 `@DSH_SECRET_*` 纯函数改写成 `[secret DSH_SECRET_*]`，并追加一条只含变量名 / 范围 / 取用写法的注记消息。改写只作用于这一次模型请求，会话日志里保留人类原本写下的文本。
+- **模型侧的改写由注记承担，且注记会落盘（按 source 去重）**：`agent/pre-step` **不改**用户消息正文（harness 会让改写落盘，见「人类主动附加密钥（反方向）→ 模型侧到底看到什么」），而是追加一条只含变量名的注记，其中**逐变量逐字**写出「正文里的 `@DSH_SECRET_*` 即该变量，模型侧写作 `[secret DSH_SECRET_*]`；它不是文件路径」。注记是 durable 的 `user/message`（因此在对话流里是一行注入说明），且**按自身 source 去重**：模型可见 surface 上已有同一条就不再追加，重复引入同一标记不会堆叠。
 - **会在会话日志里留下变量名标记**：人类发送的消息本身（含 `@DSH_SECRET_OPENAI` 这种**变量名**）作为普通 `user/message` 事件持久化。变量名不是密钥材料，但它会长期留在日志里。
 - **会挂 5 条 `/api` 路由**：`/api/secret.pending`(GET)、`/api/secret.attached`(GET)、`/api/secret.attach`(POST)、`/api/secret.release`(POST)、`/api/secret.answer`(POST)，全部位于 `ctx.connection` 的信任栅栏内（本机 / 可信 Host、同源标记、签名浏览器 Cookie）。值只出现在后两者的请求体里。
 - **会注册客户端座位与一个引用源**：`conversation.chat.node`（key `secret-request`）、`tool.call.toolview`（key `secret_request` 的 `null` 占位）、`conversation.input.left`（id `secret-attach-toggle`）、`conversation.input.overlay`（id `secret-attach-capsule`），外加一个名为 `secret` 的 `InputTriggerSource` 与 locale 命名空间 `secretAttach`。`tool.call.toolview` 只替换本插件自己那次调用的泛型工具行，不触碰别的工具；其余都是增量座位。
@@ -149,6 +149,17 @@ profile 的组合树是「root 空清单 → `dsh.profile.bundles` 里每个 bun
 
 ## 人类主动附加密钥（反方向）
 
+### 0.2.0 的缺陷与本版修复（0.2.1）
+
+**0.2.0 已发布，但这条链路当时不可用。**缺陷有两条，0.2.1 一并修复：
+
+1. **附加秘密后，后续 shell 取不到变量**：标记从未被提升为 grant，`shellEnv` 里因此没有这个变量（`GET /api/secret.attached` 会一直停在 `staged`，不会变成 `bound`）。
+2. **对话流里那条消息没有变量名胶囊**：用户气泡显示原始文本，而不是"只显示变量名"的 chip。
+
+**根因一句话**：0.2.0 让 `agent/pre-step` 去改写用户消息**正文**（`@DSH_SECRET_*` → `[secret DSH_SECRET_*]`），并假定"改写只作用于本次模型请求、不落盘"；但这条链路里 `agent/pre-step` 的返回值**就是被原样 append 落盘的那一条**（`dsh-agent-loop/lib/index.js:1061` 直接 append 成 `user/message`，同一步的模型请求由**同一份 surface** 派生，`:1262`），正文被换掉之后 `session/event` 的绑定再也看不到 `@DSH_SECRET_*` 标记（绑定永不发生），气泡也因为正文里没有 `@` 标记而不再渲染胶囊。
+
+**0.2.1 的修复**：不再改写正文——日志、对话流与模型请求里的正文都是人类客户端发出的原始形态 `@DSH_SECRET_*`（`session/event` 因此重新看得见标记：绑定、`anchorSeq`、`shellEnv` contributor 全部成立；`projectUserText` 也重新把它投影成"只显示变量名"的胶囊）。模型侧的对应关系改由一条**值无关**的注记**逐变量逐字**承担（见下「模型侧到底看到什么」）。同时把提升次序固定为「先声明 contributor → 再落 grant → 最后消费暂存项」（见「绑定与失效」第 5 条）。
+
 ### 形态
 
 | 部件 | 座位 | 说明 |
@@ -181,9 +192,25 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
 |---|---|
 | 会话日志（durable） | `user/message` · `请用 @DSH_SECRET_OPENAI 跑测试` |
 | 用户气泡 | `请用` + **胶囊（只显示 `DSH_SECRET_OPENAI`）** + `跑测试`，其后一行注入说明（header 标注 producer `secret-attach`） |
-| 模型请求（`agent/pre-step`，**不落盘**） | `请用 [secret DSH_SECRET_OPENAI] 跑测试`，其后追加一条值无关说明：变量名 · 作用域 · `PowerShell 用 $env:DSH_SECRET_OPENAI，POSIX shell 用 "$DSH_SECRET_OPENAI"` · 「不要把该标记当作文件路径读取。」 |
+| 模型请求（`agent/pre-step`） | `请用 @DSH_SECRET_OPENAI 跑测试`（**与日志逐字相同**），其后追加一条值无关说明：`- DSH_SECRET_OPENAI · 仅本次会话有效`、`正文里的 @DSH_SECRET_OPENAI 即该变量，模型侧写作 [secret DSH_SECRET_OPENAI]；它不是文件路径。`、`取用方式：PowerShell 用 $env:DSH_SECRET_OPENAI，POSIX shell 用 "$DSH_SECRET_OPENAI"`、「不要把该标记当作文件路径读取。」 |
 
-改写是**文本的纯函数**（只认 `@DSH_SECRET_*` 的形状，不看本会话当时是否还持有它），所以刷新、重放与 fork 后拿到的是同一个模型文本；也正因为如此，**经改写的用户消息**里的标记不会去误导系统提示中"`@` 前缀是文件路径"的既有约定。**限定（不要读成全局结论）**：改写只作用于 `source.kind === 'user'` 的消息（`src/inject.ts:137`），因此同一形状的标记出现在**工具结果**里时**不**在本改写范围内，模型仍可能按 `@` = 文件路径的语义去解读它——见「已知限制（如实记录）」。
+**为什么模型侧不是改写正文，而是由注记逐变量写明对应关系**（这是与早期设计稿不同的一点，原因在 harness 契约，不在取舍）：
+
+- `agent/pre-step` 返回的消息就是**落盘的那条**：loop 把它**原样** append 成 `user/message`（`dsh-agent-loop/lib/index.js:1061`，`surfaceOp: 'append'`），而同一步的模型请求由**同一份 surface** 派生（`:1262`）。所以"改写只作用于本次模型请求、不落盘"在这个接线下不可能成立：改写必然落盘，落盘就必然改变用户气泡。
+- 模型输入按契约是**会话日志的纯函数**：loop 构造的请求被 deep-freeze，`llm/stream` 的监听者「read it, never rewrite it」（`dsh-llm/lib/types/index.d.ts:37-45`）。
+- 唯一能保留"仅模型可见副本"的机制是 surface replacement / message projection，但它必须 append 在**目标事件之后**，而 loop 的 append（`:1061`）与请求构造（`:1262`）之间没有任何可插入点；由插件自己先 append 目标再替换，会把用户消息挪到本步 `system/message` 提交之前（模型会先读用户消息再读系统提示），代价大于收益。自定义事件类型还需要 `ignorable` 才不被持久化读取拒绝（`dsh-session-persistence/lib/index.js:184`），树外插件拿不到。
+
+因此**日志与用户气泡保留人类客户端发出的原始形态** `@DSH_SECRET_*`（这样 `projectUserText` 才能把它投影成"只显示变量名"的胶囊），模型侧的改写改由注记承担：注记**逐变量逐字**写出「正文里的 `@VAR` 即该变量，模型侧写作 `[secret VAR]`；它不是文件路径。」——`[secret VAR]` 形态因此**逐字**出现在模型可见文本里，且与正文的对应关系是确定的、不依赖启发式。注记是**文本的纯函数**（只认 `@DSH_SECRET_*` 的形状），刷新、重放与 fork 拿到的模型文本一致。
+
+**注记的落盘与去重**：注记本身是一条 durable 的 `user/message`（`source.kind = 'secret-attach'`），所以它在对话流里显示为一行注入说明；同一条注记**按自身 source 去重**（`src/inject.ts` 的 `noteVisible`：模型可见 surface 上已有完全相同的 source 就不再追加），同一步/后续步重复引入同一标记不会堆叠第二份。
+
+### 自己复测（活体，约 3 分钟）
+
+1. 在输入区点「附加密钥」按钮 → 胶囊里填名称（如 `openai`）与值，作用域保持默认「仅本次会话」→ 插入 → 输入框出现 `@DSH_SECRET_OPENAI` 胶囊。
+2. **发送前**：在同一浏览器（同源、带签名 cookie）打开 `GET /api/secret.attached?sessionId=$DSH_SESSION_ID` → 该条的 `state` 必须是 `"staged"`，且此刻 shell 里没有这个变量（未发送永不注入）。
+3. **发送后立刻**再查同一路由 → 该条的 `state` 变成 `"bound"`（不再停留在 `staged`）。**这是判别"绑定是否真的发生"的最快手段**，也就是这一轮修复的核心判据。
+4. 让 Agent 在**后续**执行里只报存在性与长度（绝不回显值），例如 PowerShell：`if ($env:DSH_SECRET_OPENAI) { "present length=$($env:DSH_SECRET_OPENAI.Length)" } else { "absent" }`。看到 `present` 即「附加 → 绑定 → 注入」端到端可用。
+5. 回退/编辑重写那条消息后再查：锚点离开 live surface ⇒ 授权撤销、变量重新不可用（`revoked-anchor`）。
 
 ### 绑定与失效
 
@@ -191,7 +218,8 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
 2. 携带标记的用户消息一旦成为 durable 事件，`session/event` 钩子把它提升为授权，`anchorSeq` = **该条 `user/message` 事件的 seq**。该服务的契约原文是 *"Seed events never publish on `session/event`"*（`dsh-session/lib/index.js:1271-1275`），所以重放或恢复一份历史日志**不可能**重新绑定——这比"回头扫日志找锚点"更稳，因为锚点 seq 本来也只有消息落盘之后才可知。
 3. 之后 `shellEnv` 才在每次执行时按会话注入。回退/编辑重写掉那条消息 ⇒ 锚点离开 live surface ⇒ 自动 `revoked-anchor`，无需额外记账。
 4. `POST /api/secret.release` 只能丢弃**尚未绑定**的暂存项；已绑定项会如实回答 `state:"bound"`（唯一诚实的解除方式是回退那条消息）。
-5. Host 重启后暂存与授权都消失（都在内存里），日志里的标记仍在但不会自动重新武装——**故意 fail-closed**：没有人类在场的新进程里静默恢复一次授权，不是本插件愿意做的事。
+5. 提升的次序是**先向 `shellEnv` 声明 contributor → 再落 grant → 最后消费暂存项**（`src/attach.ts` 的 `bindStaged`）。声明失败时会话原样不变（无 grant、暂存项仍 armed，可在下一次标记到达时重试）；反向顺序会留下「有 grant、无 contributor、暂存未消费」的静默不注入状态。另一方向无害：grant 已落但 contributor 因无关原因缺失时，`resolve` 查不到值 ⇒ 不注入（fail-closed）。
+6. Host 重启后暂存与授权都消失（都在内存里），日志里的标记仍在但不会自动重新武装——**故意 fail-closed**：没有人类在场的新进程里静默恢复一次授权，不是本插件愿意做的事。
 
 ### 已知限制（如实记录）
 
@@ -199,8 +227,9 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
   - **为什么不存在"既是 chip 又不可点"的 `@` 形态**（已逐行证明）：该函数只认三种 token（`primitives lib/index.js:6724` 的正则：`/名称`、`@"…"`、`@非空白`）；`:6753` 的判定是 `@` 开头**必然**映射为 `'file'`（或 `'folder'`），只有 `/` token 才可能是 `void 0`；而 `/` token 又必须在 caller 传入的 `slashNames` 名单里（`:6731`）。所以 `@DSH_SECRET_*` 一定拿到 `referenceKind:'file'` 并因此挂上 `openFile`，没有任何插件钩子能改变它。
   - 另外两条路都已评估并否决：wire session 形态 `@[label](dsh-session:…)` 虽是**不可点**的 session chip，但会被 `dsh-session-reference` 服务在 `agent/pre-step` 里当作跨会话引用解析（可能让整步失败），风险大于收益；整体接管 `conversation.chat.node` 的 `user` key 并自己重绘用户气泡需要重写附件、图片、markdown 与动作行，脆弱度过高。
   - **交付给下一环节的验证项**：这条点击行为需真人在浏览器里确认（预期现象：点转录里的胶囊会尝试打开同名文件）。
+  - **`agent/pre-step` 追加的那条注记行本身也会被投影成 file chip**：注记是一条 durable 的 `user/message`，正文里逐字含 `@DSH_SECRET_*`，所以在转录里它同样由 `projectUserText` 渲染为 `data-ref-chip="file"` 并挂上同一个 `openFile` 行为。**与上面第一条同源**：观感问题、不泄露任何东西（注记里只有变量名与作用域，没有值），也不是未做完的功能——任何出现在消息正文里的 `@` 标记都逃不过这条 shipped 规则。
 - 刷新后草稿里的 chip 会变回纯文本 `@DSH_SECRET_OPENAI`（草稿镜像只存文本），由 lexicon 装饰回"引用"观感，点击仍能打开详情胶囊；这与 chip 的原子性不同，是草稿投影的既有语义，不是本插件的取舍。
-- **工具结果里的 `@DSH_SECRET_*` 不在改写范围内**（**值无关，不是泄漏**）：`agent/pre-step` 的改写只针对 `source.kind === 'user'` 的消息（`src/inject.ts:137`），所以当同一形状的标记出现在**工具结果**（例如某条命令的回显）里时，它会**原样**进入模型上下文，不会被改写成 `[secret VAR]`。影响**仅限于语义**：模型可能按系统提示里"`@` 前缀是文件路径"的约定去解读它，例如尝试读取一个同名文件（会失败）。**它不会因此获得任何值**——这条缺口只涉及"变量名标记的改写范围"，与明文无关；变量名本来就在会话日志、用户气泡与注入说明里可见。**准确定性**：这是改写范围的一个已知缺口（不是未做完的功能），既没有把值带进上下文，也没有影响绑定、授权或 shell 注入。
+- **工具结果里的 `@DSH_SECRET_*` 没有注记解释**（**值无关，不是泄漏**）：注记只为**本步引入的、载有标记的用户消息**追加，所以当同一形状的标记出现在**工具结果**（例如某条命令的回显）里时，它会**原样**进入模型上下文，且那一步的注记不会覆盖它——模型可能按系统提示里"`@` 前缀是文件路径"的约定去解读它，例如尝试读取一个同名文件（会失败）。**它不会因此获得任何值**：这条缺口只涉及"标记的解释范围"，与明文无关；变量名本来就在会话日志、用户气泡与注入说明里可见。**准确定性**：这是解释范围的一个已知缺口（不是未做完的功能），既没有把值带进上下文，也没有影响绑定、授权或 shell 注入。
 - 视觉与真机点击路径需要人工确认（见「边界与已知限制」）。
 
 ## 存储与传播
@@ -237,8 +266,8 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
 
 ### 已知限制（如实记录）
 
-- **转录气泡里的胶囊由 shipped 代码渲染，插件接不了钩子**：`@DSH_SECRET_*` 在用户消息气泡里被 `dsh-client-ui-primitives` 的 `projectUserText` 渲染成 `data-ref-chip="file"`，点击走它硬编码的 `openFile('DSH_SECRET_OPENAI')`（尝试打开一个同名文件，无害、不泄露任何东西，但行为不正确）。**编辑器内（草稿）的胶囊不受影响**：那里是插件自己注册的 `secret` 引用源，点击打开只读详情胶囊。逐行证据与"为什么不存在既是 chip 又不可点的 `@` 形态"见「人类主动附加密钥（反方向）→ 已知限制」。
-- **工具结果里的 `@DSH_SECRET_*` 不在改写范围内**（值无关，不是泄漏）：`agent/pre-step` 的改写只针对 `source.kind === 'user'` 的消息（`src/inject.ts:137`），因此同一形状的标记出现在工具结果里时原样进入模型上下文，模型可能按"`@` = 文件路径"去解读它（会失败）。它不会因此获得任何值，也不影响绑定、授权或 shell 注入。详见「人类主动附加密钥（反方向）→ 已知限制」。
+- **转录气泡里的胶囊由 shipped 代码渲染，插件接不了钩子**：`@DSH_SECRET_*` 在用户消息气泡里被 `dsh-client-ui-primitives` 的 `projectUserText` 渲染成 `data-ref-chip="file"`，点击走它硬编码的 `openFile('DSH_SECRET_OPENAI')`（尝试打开一个同名文件，无害、不泄露任何东西，但行为不正确）。**编辑器内（草稿）的胶囊不受影响**：那里是插件自己注册的 `secret` 引用源，点击打开只读详情胶囊。同一条 shipped 规则也适用于 `agent/pre-step` 追加的那行注记（它正文里同样含 `@DSH_SECRET_*`，因此也会显示为 file chip）。逐行证据与"为什么不存在既是 chip 又不可点的 `@` 形态"见「人类主动附加密钥（反方向）→ 已知限制」。
+- **工具结果里的 `@DSH_SECRET_*` 没有注记解释**（值无关，不是泄漏）：注记只为**本步引入的、载有标记的用户消息**追加，因此同一形状的标记出现在工具结果里时原样进入模型上下文且无注记覆盖，模型可能按"`@` = 文件路径"去解读它（会失败）。它不会因此获得任何值，也不影响绑定、授权或 shell 注入。详见「人类主动附加密钥（反方向）→ 已知限制」。
 - **`ctx.authorization` 只承载 `persistent`**：该 seam 的契约要求"本次尝试期间提交并观察到一条凭据记录"（否则 `NOT_COMMITTED`），而 `session` 授权按定义不得落盘。因此 `session` 请求走同一套对话框、但不进该 seam；`persistent` 请求完整走 `registerFlow` + `begin`。这是 seam 契约决定的取舍，不是省事。
 - **O1 / O2（第二轮修复，两条都如实回报）**：
   - **O1**：`persistent` 请求里人类已点"同意"，但 seam 的授权尝试最终 `failed` 时，**不再**声称"已持久化"：人类的选择被保留，但按「仅本次会话有效」降级生效，`notice` 写明的是**"未能完成持久化登记的确认"**——本插件自己的代码路径不会写凭据库，但 seam 可能在提交授权记录**之前**就已把值写入凭据库（`persist` 先于 `commit`），因此这里不做"值一定没进库"的绝对断言；若值已进库，它只是缺少本次授权记录。
@@ -250,7 +279,7 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
 
 ```sh
 npm run typecheck   # tsc：Host 半（Node）+ Client 半（DOM），erasableSyntaxOnly，兼容 Node 原生类型剥离
-npm test            # node --test 五个文件：
+npm test            # node --test 六个文件：
                     #   test/unit.test.ts         参数校验、变量名推导、decision 映射、session/persistent 路由、
                     #                             四类返回都不含值、锚点撤销、fork 不继承、压缩不误撤销（含真实表面折叠）、
                     #                             子代理失败关闭、超时、O1（已答复但落库失败 ⇒ 降级 session 并如实回报）、
@@ -264,6 +293,11 @@ npm test            # node --test 五个文件：
                     #                             假过期四态（不可达/未列出/已提交）、表单控件齐备、明文不越出掩码输入
                     #   test/attach.test.ts        附加方向的 Host 侧：暂存 ≠ 授权（未发送不注入）、TTL 丢弃、
                     #                             容量上限、绑定锚点、release 只丢未绑定项、值不出现在任何视图里
+                    #   test/attach-wiring.test.ts 接线级回归（0.2.0 缺陷的门）：用真实 dsh-session Session 扮演 loop 的
+                    #                             三步（pre-step waterfall → 原样 append decision.messages → 发布
+                    #                             session/event），断言 durable 正文逐字保留 `@DSH_SECRET_*`、
+                    #                             anchorSeq = 该事件 seq、contributor 已声明、暂存项已消费、
+                    #                             真 shellEnv.collect() 能取到值；注记逐字写明模型侧记法
                     #   test/client-attach.test.ts 用真 cordis Context + sibling provide 装载浏览器产物：apply 在
                     #                             **缺少三个可选服务**时也不抛（boot 回归门）、注册面、插入阶梯
                     #                             （L1 chip / L3 文本 / 无 sessions 时降级）、明文不越出掩码输入
@@ -273,7 +307,7 @@ npm run build       # 产出 lib/（Host 半 + 浏览器产物 ./client）
 ## 设计要点
 
 - **附加方向的两段式生命周期**：值先在客户端本地 state，再经一次 POST 进 Host 内存的暂存表；只有携带标记的用户消息成为 durable 事件时才提升为 grant，`anchorSeq` 取该事件的 seq。这样"未发送就永不注入"，且锚点不依赖任何"回头扫日志"的启发式。
-- **模型侧的改写是纯函数且不落盘**：`agent/pre-step` 只认 `@DSH_SECRET_*` 的形状做文本替换（且只作用于 `source.kind === 'user'` 的消息），再追加一条值无关注记。因此刷新、重放与 fork 拿到的模型文本一致。
+- **模型侧：不改写正文，改写与解释都由一条按 source 去重的值无关注记承担**：`agent/pre-step` 不再替换用户消息正文（它在真实接线下必然落盘，见上一条），而是追加一条只含变量名 / 作用域 / 取用写法 / **逐变量逐字的模型侧记法 `[secret DSH_SECRET_*]`** 的注记；同一注记在模型可见 surface 上只出现一次。因此刷新、重放与 fork 拿到的模型文本一致，且用户气泡始终渲染为变量名胶囊。
 - **可选服务一律走 cordis 的可选座位**：`inject` 只声明真正的硬依赖 `['slots', 'uiConversation']`；`locale` / `inputTriggers` / `sessions` 经 `ctx.inject([...], cb)` 取得。cordis 的 ctx Proxy 对未声明服务取属性即抛，直接在 `apply()` 里读会让整条 client entry failed、整页 web boot 报 `Failed to load plugins`——这正是第三轮修复的发布阻塞缺陷（`lib/client/entry.js` 现在不再出现对这三个服务的直接 `ctx.<name>` 读取）。
 - **`ctx.authorization` 只承载持久授权**：见「边界与已知限制」的同名条目——`session` 范围按定义不落盘，不可能满足该 seam 的提交契约，因此走同一套对话框而不进 seam。
 - **Harness 不自带 `AuthorizationPrompt` 的 Web 渲染器**（已核验：安装包中没有任何 client 包渲染 `AuthorizationPrompt`），所以本插件自己的对话框就是该 prompt 的界面；流程内 `session.prompt({kind:'secret'})` 的值直接来自对话框已收集的答案。
