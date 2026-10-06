@@ -9,7 +9,7 @@
 - Host 半（索取方向）：注册 `secret_request` 工具；用 `ctx.authorization` 的凭据获取流程承载持久授权；用 `ctx.credentials` 落库；用 `ctx.shellEnv` 按会话注入 `DSH_SECRET_*`。
 - Host 半（附加方向）：`POST /api/secret.attach` 把人类填的值**暂存**在进程内存（暂存不等于授权：此时不注入任何变量）；携带标记 `@DSH_SECRET_*` 的用户消息一旦落进会话日志，`session/event` 就把它**提升为按该条消息锚定的授权**；`agent/pre-step` 追加一条**只有变量名**的说明消息，其中逐变量写明这枚标记在模型侧写作 `[secret DSH_SECRET_*]`（正文本身不改写——harness 会让改写落盘，见下文）。
 - Client 半（索取方向）：在 Agent 输出流里渲染**会话流内一级卡片**（`conversation.chat.node`，`key=secret-request`），**无 `shell.overlay` 遮罩**；卡片带 `type="password"` 输入与显示/隐藏切换，把「同意 / 拒绝 / 忽略 / 其他」四个决定、申请理由、用途说明与**授权范围**摆在人类眼前，并允许人类**改写 Agent 请求的范围**。
-- Client 半（附加方向）：在输入区 `conversation.input.left`（紧随「访问模式 / 计划」控件组右侧）加一个**切换式按钮**；按下后在输入框上方（`conversation.input.overlay`）浮起**填值胶囊**；填完点「插入到光标处」，草稿光标处得到**真正的内联 chip**（`data-composer-chip="secret"`，只显示变量名），可在后续 shell 取用；点击该 chip（或刷新后由 lexicon 装饰出的同名引用）会在同一浮层展开**只读详情胶囊**。
+- Client 半（附加方向）：在输入区 `conversation.input.left`（紧随「访问模式 / 计划」控件组右侧）加一个**切换式按钮**；按下后在输入框上方（`conversation.input.overlay`）浮起**填值胶囊**；填完点「插入到光标处」，草稿光标处得到**真正的内联 chip**（`data-composer-chip="secret"`，只显示变量名），可在后续 shell 取用；点击该 chip（或刷新后由 lexicon 装饰出的同名引用）会在同一浮层展开**只读详情胶囊**。0.3.0 起，消息旁的**旁挂胶囊**与（被接管后的）**原胶囊**都能打开详情——前者开输入框上方的信息框、后者开右侧栏详情页；信息框内另有**历史记录**区，`@` 菜单会列出可用密钥（详见「人类主动附加密钥（反方向）→ 0.3.0 的四项增强」）。
 - 传输：两个方向的对话框都经本插件自有的、位于 `ctx.connection` 信任栅栏内的 `/api` 路由与 Host 通信。密钥值只出现在 `POST /api/secret.answer` 与 `POST /api/secret.attach` 的请求体里，从不进入 URL / 查询串 / 会话日志 / 响应体。
 
 ## 安全不变量与副作用披露
@@ -18,7 +18,7 @@
 
 1. **插件自身的输出永不携带明文**：工具结果、错误消息、日志、事件、渲染文本、HTTP 响应体与 DOM 属性中都不含密钥值；`render()` 只输出变量名与元数据。单测对四种 decision 的所有字段做全量字符串扫描，断言值不出现；Client 半另有断言证明填值胶囊的值不越出那个掩码输入框。**边界**：值确实会按会话注入到 shell 环境（这是本插件的功能），因此"明文不进上下文"取决于 Agent 不回显 `$env:DSH_SECRET_*`，而不是插件的输出通道。
 2. **Agent 只拿到变量名**：`approved` 返回 `{ decision, variable, scope, ref, source }`，`variable` 形如 `DSH_SECRET_OPENAI`。
-3. **值只发给本机 Host**：客户端只向 `/api/secret.answer`（索取方向）与 `/api/secret.attach`（附加方向）发起同源 POST（签名 HttpOnly Cookie + Host/Origin 栅栏），不写 URL、不写 localStorage、不打印 console。附加方向的 `GET /api/secret.attached` 只回传变量名/名称/范围/状态，永不回传值。
+3. **值只发给本机 Host**：客户端只向 `/api/secret.answer`（索取方向）与 `/api/secret.attach`（附加方向）发起同源 POST（签名 HttpOnly Cookie + Host/Origin 栅栏），不写 URL、不写 localStorage、不打印 console。附加方向的 `GET /api/secret.attached` 只回传变量名/名称/范围/状态，永不回传值；0.3.0 的 `POST /api/secret.adopt` 同样**不携带值**（由宿主自己从凭据库解析），`GET /api/secret.history` 与 `GET /api/secret.available` 也只回传值无关字段。
 4. **会话级密钥不落盘**：`scope: "session"` 的值只存在于进程内存（Host 的暂存表与会话授权表）。落盘只走凭据服务，且只发生在 `persistent`。
 5. **持久化只经凭据服务**：`persistent` 经 `ctx.credentials.set(<变量名>, value)` 写入凭据引用空间（provider 管理的可写源）；同时向记录空间提交一条**不含密钥材料**的标记记录（索取方向 `kind: "grant"`，附加方向 `kind: "attachment"`，payload 只有 `envVar/name/scope/authorizedAt`）。绝不写自建文件，绝不在仓库里存明文。
 6. **会话边界失败关闭**（见「边界处理」）：锚点离开会话表面即撤销并不再注入。
@@ -41,8 +41,8 @@
 - **可能写凭据库（仅当人类显式选「持久」）**：经 `ctx.credentials.set(<变量名>, value)` 写入凭据引用空间，并追加一条不含密钥材料的标记记录；`session` 范围不落盘。
 - **模型侧的改写由注记承担，且注记会落盘（按 source 去重）**：`agent/pre-step` **不改**用户消息正文（harness 会让改写落盘，见「人类主动附加密钥（反方向）→ 模型侧到底看到什么」），而是追加一条只含变量名的注记，其中**逐变量逐字**写出「正文里的 `@DSH_SECRET_*` 即该变量，模型侧写作 `[secret DSH_SECRET_*]`；它不是文件路径」。注记是 durable 的 `user/message`（因此在对话流里是一行注入说明），且**按自身 source 去重**：模型可见 surface 上已有同一条就不再追加，重复引入同一标记不会堆叠。
 - **会在会话日志里留下变量名标记**：人类发送的消息本身（含 `@DSH_SECRET_OPENAI` 这种**变量名**）作为普通 `user/message` 事件持久化。变量名不是密钥材料，但它会长期留在日志里。
-- **会挂 5 条 `/api` 路由**：`/api/secret.pending`(GET)、`/api/secret.attached`(GET)、`/api/secret.attach`(POST)、`/api/secret.release`(POST)、`/api/secret.answer`(POST)，全部位于 `ctx.connection` 的信任栅栏内（本机 / 可信 Host、同源标记、签名浏览器 Cookie）。值只出现在后两者的请求体里。
-- **会注册客户端座位与一个引用源**：`conversation.chat.node`（key `secret-request`）、`tool.call.toolview`（key `secret_request` 的 `null` 占位）、`conversation.input.left`（id `secret-attach-toggle`）、`conversation.input.overlay`（id `secret-attach-capsule`），外加一个名为 `secret` 的 `InputTriggerSource` 与 locale 命名空间 `secretAttach`。`tool.call.toolview` 只替换本插件自己那次调用的泛型工具行，不触碰别的工具；其余都是增量座位。
+- **会挂 8 条 `/api` 路由**：`/api/secret.pending`(GET)、`/api/secret.attached`(GET)、`/api/secret.attach`(POST)、`/api/secret.release`(POST)、`/api/secret.answer`(POST)，以及 0.3.0 新增的三条——`/api/secret.history`(GET，本会话历史流水)、`/api/secret.available`(GET，`@` 菜单的可用密钥)、`/api/secret.adopt`(POST，把凭据库里的持久记录登记到本会话)。全部位于 `ctx.connection` 的信任栅栏内（本机 / 可信 Host、同源标记、签名浏览器 Cookie）。值只出现在 `attach` 与 `answer` 的请求体里；三条新路由都**不回传值**，`adopt` 的取值也由宿主自己经 `credentials.resolve` 完成，值不跨线。
+- **会注册客户端座位与一个引用源**：`conversation.chat.node`（key `secret-request`）、`tool.call.toolview`（key `secret_request` 的 `null` 占位）、`conversation.input.left`（id `secret-attach-toggle`）、`conversation.input.overlay`（id `secret-attach-capsule`），外加一个名为 `secret` 的 `InputTriggerSource` 与 locale 命名空间 `secretAttach`。0.3.0 起再增加三处**增量**注册：`conversation.chat.node`（key `sr-chip`，消息旁的旁挂胶囊）、`sidebarRightTabs` 的 `secret-attach-detail` 类型，以及它的**正文座位** `sidebar.right.pane.tab`（key `@xinvxueyuan/cordis-plugin-secret/secret-attach-detail`）。该页签的**标题不另注册座位**：注册表走 fallback 取类型自己声明的 `title(address)`，即**变量名**（`src/client/entry.ts:3555`），所以用户看到的结果是对的。`tool.call.toolview` 只替换本插件自己那次调用的泛型工具行，不触碰别的工具；其余都是增量座位。
 - **不做的事**：插件自身不 spawn 子进程、不读写仓库文件、不发起网络请求（除被 Harness 自己的 API 通道承载的那 5 条同源路由外），也没有任何遥测。
 
 ## 安装
@@ -68,7 +68,7 @@ profile 的组合树是「root 空清单 → `dsh.profile.bundles` 里每个 bun
         maxPendingRequests: 4
 ```
 
-（`attachTtlMs` 与 `maxAttachmentsPerSession` 未在这里显式写出，取下面配置表的默认值。）
+（`attachTtlMs`、`maxAttachmentsPerSession`、`maxHistoryPerSession`、`maxAvailableEntries` 未在这里显式写出，取下面配置表的默认值。）
 
 安装结果的 `application` 为 `applied` 表示本次变更已生效；`warnings` 会说明 Client 半是否需要刷新页面。
 
@@ -84,8 +84,10 @@ profile 的组合树是「root 空清单 → `dsh.profile.bundles` 里每个 bun
 | `maxPendingRequests` | `4` | 同时等待人工确认的授权请求数上限，超出返回 `TOO_MANY_PENDING`。 |
 | `attachTtlMs` | `1800000` | 人类已填入、但**从未随消息发送**的附加项在内存里保留多久（30 分钟）后被丢弃。暂存从不等于授权：等待期间不注入任何变量，这个上界正是"值不会在长命进程里无限期滞留"的保证。 |
 | `maxAttachmentsPerSession` | `8` | 单个会话同时可持有的已登记附加项上限。 |
+| `maxHistoryPerSession` | `32` | 单个会话保留的历史记录条数上限（**内存态**，超出丢最旧）。 |
+| `maxAvailableEntries` | `32` | `@` 菜单里「凭据库（持久）」一类最多列出的条目数（每项都要回读一次记录，因此有上限）。 |
 
-四个键都必须是正整数：schema 的 `.default()` 之外，`assertConfig` 再手工兜一层（非正整数直接抛错）。
+六个键都必须是正整数：schema 的 `.default()` 之外，`assertConfig` 再手工兜一层（非正整数直接抛错）。
 
 ## 工具
 
@@ -223,13 +225,90 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
 5. 提升的次序是**先向 `shellEnv` 声明 contributor → 再落 grant → 最后消费暂存项**（`src/attach.ts` 的 `bindStaged`）。声明失败时会话原样不变（无 grant、暂存项仍 armed，可在下一次标记到达时重试）；反向顺序会留下「有 grant、无 contributor、暂存未消费」的静默不注入状态。另一方向无害：grant 已落但 contributor 因无关原因缺失时，`resolve` 查不到值 ⇒ 不注入（fail-closed）。
 6. Host 重启后暂存与授权都消失（都在内存里），日志里的标记仍在但不会自动重新武装——**故意 fail-closed**：没有人类在场的新进程里静默恢复一次授权，不是本插件愿意做的事。
 
+### 0.3.0 的四项增强（历史胶囊点击 / 历史聚合 / 移除即撤销 / `@` 菜单）
+
+四项增强各一句：
+
+| 增强 | 一句话 |
+|---|---|
+| **历史胶囊点击** | 插件在**每条带标记的消息旁**新增一行胶囊（旁挂节点），点击打开**输入框上方**的信息框；同时注册一个右侧栏文档查看器，**接管 harness 渲染的原胶囊**，点它时在**右侧栏**打开详情页。 |
+| **信息框历史聚合** | 信息框内新增「历史记录」区，集中列出本会话的附加/授权流水（变量名、来源、作用域、状态、时间、锚点），**默认全部展示**（含已失效/已回退），用状态文案区分。 |
+| **移除标记即撤销** | 草稿里的标记消失约 0.6s 后，对应的**暂存**记录被撤销：`GET /api/secret.attached` 不再把它报为 `staged`，**会话级的值随即不可找回**（重插须重填）。已绑定的记录不受本机制影响。 |
+| **`@` 引用菜单** | 输入 `@` 列出**本会话当前可用**与**凭据库已持久化**的密钥，条目上用 `section` 标来源、`description` 标作用域；本会话可用的条目直接插入，凭据库条目**先确认再登记**（值由宿主自己从凭据库读取，不经过对话）。 |
+
+#### 两个入口的区别（同一份信息，两处入口）
+
+| 你点的东西 | 它是什么 | 打开哪里 |
+|---|---|---|
+| **旁挂胶囊**（插件在你的消息旁新增的那一行） | 本插件自己的 `ConversationNodeDefinition` 节点（`conversation.chat.node`，`key = sr-chip`），锚在**同一条消息的 seq** 上、`location = { kind: 'session' }`，因此排在用户气泡**之后**、且永不折进「已调用工具」分组 | **输入框上方**的信息框（与草稿 chip 的点击是同一个面） |
+| **原胶囊**（harness 渲染在你消息正文里的那个） | `dsh-client-ui-primitives` 的 `projectUserText` 产物，`data-ref-chip="file"`，点击被硬编码为 `openFile('DSH_SECRET_X')` | **右侧栏**的详情页（由本插件注册的 `secret-attach-detail` 类型接管），内容与信息框同源 |
+
+旁挂胶囊的落位不是"大概齐"：节点 key 形如 `${kind.length}:${kind}${id}`，同锚点、同 rank 时由 `key.localeCompare` 定序（`dsh-client-ui-chat/lib/client.js:8273-8281`）。人类消息的 definition kind 是 `input-message`（13 字符 ⇒ 键前缀 `13:`；`chat:9264`），而 `sr-chip` 是 7 字符（⇒ `7:`）；字典序下 `7:` 排在 `13:` **之后**。实测（`node -e`，与 `localeCompare` 同语义）：长度 10/11/12 的 kind 会排到 `13:input-message…` **之前**；而该键是**整体字典序**比较，**长度前缀与 kind 文本共同决定顺序**，因此「某几个长度区间一律排在后面」并不成立（实测反例：长度 1 的 kind、以及长度 13 且文本排在 `input-message` 之前的 kind，都排到气泡**之前**）——kind 的位置**必须逐个实测**。本插件实际采用的 `sr-chip`（7 字符）已机器证明排在气泡**之后**。（早前版本里"长度 4 到 9 与 13 及以上一律排在之后"的说法不成立，特此更正。）
+
+#### 原胶囊的接管是「长度竞争」，不是契约（如实披露）
+
+原胶囊的点击最终走到右栏的 tab 注册表：`openFile` → `fileAddressFor` → `ctx.sidebarRight.openResource('dsh-resource://file/session/<id>/DSH_SECRET_X')` → `claim(address)`。该注册表按 **priority 档 → 命中的 pattern 长度 → 注册顺序** 排序（`dsh-client-ui-sidebar-right/lib/client.js:8782-8798`）。
+
+- 本插件声明 `priority: 'extension'`、`patterns: ['dsh-resource://file/**/DSH_SECRET_*']`（**实测长度 35**），并用 `canOpen` 只接受最后一段形如 `DSH_SECRET_*` 的地址（不是我们的地址一律让给对方）；
+- 本机已装的 `dsh-better-sidebar` 0.24.1 在**同一档**声明兜底 `dsh-resource://file/**`（**实测长度 22**）：同档时更长的 pattern 胜出，因此这次打开归我们。
+
+**可争用性（机制固有，不是缺陷）**：任何**后来者**只要在同一 `extension` 档声明**更长**的 pattern（例如 `dsh-resource://file/**/DSH_SECRET_*/**`），就会**静默抢走**这次打开——用户会落到那个查看器，而不是我们的详情页，且我们收不到任何通知。这一点无法用契约保证，只能靠"我们当前最长"这一事实。**若某天发现点原胶囊又开出别的东西（甚至退回"文件不存在"），原因就在这里。**
+
+#### 历史记录的保留语义（如实）
+
+| 维度 | 事实 |
+|---|---|
+| 存储 | Host 侧 `HistoryStore` 是**纯进程内存**，按会话隔离，有容量上限（`maxHistoryPerSession`，默认 32），读出时**最新在前** |
+| 刷新页面 | **仍在**（Host 进程没变） |
+| 宿主重启 / 插件重载 | **清空**（历史不在磁盘上） |
+| 重放 / 分叉会话 | **不重建**：Host **不读** session log 还原历史；fork 出来的子会话从空历史开始 |
+| 条目来源 | `staged`（附加登记，可含"取代了同变量的上一条"）/ `bound`（提升为授权，带锚点 seq）/ `discarded` / `withdrawn`（草稿移除撤销）/ `revoked`（锚点消失，**读取时懒观测**）/ `expired`（TTL 到期）/ `authorized`（`secret_request` 索取方向的授权），并同时标 `attach` / `request` |
+| 锚点 | 已绑定的条目带 `anchorSeq`（即那条 `user/message` 的 seq）；未绑定或未落盘的条目没有锚点，UI 不编造 |
+
+客户端的四种诚实状态（都出现过，都不编造）：**未读**（「正在读取本会话的记录…」）／**读失败**（「历史暂不可用」，并**保留上一次的答案**，不清空）／**本进程无记录**（「本进程内暂无记录。」）／**该变量无记录**（「该变量在本进程内没有记录。」）。
+
+「默认全部展示」的落地：已失效/已回退/已丢弃/已过期都列出，并用状态文案区分——`已登记` / `已绑定到消息` / `已丢弃` / `已随草稿移除撤销` / `已随消息回退失效` / `已过期` / `经授权生效`。其中 `revoked`（已随消息回退失效）只在**有人读过该变量状态之后**才出现（懒观测）：没观测到就不写进流水，宁缺勿假。
+
+#### 从草稿移除标记即撤销（含边界）
+
+只看"草稿里没有标记"是不够的，因为**发送也会清空草稿**（乐观清空）：普通发送的提交相位**全程是 `plain`**（不走 `submitting`），但 `pendingSubmission` 回显会**同步先行**出现，且它的文本就是将要发送的文本。因此撤销要在**全部**条件成立时才触发：
+
+1. 草稿里没有该标记（`InputState.draft` + `MARKER_RE`）；
+2. **没有任何** `pendingSubmission` 的文本携带该标记（⇒ 发送中不撤销）；
+3. 提交相位是 `plain`；
+4. 该变量**曾在草稿里出现过**（否则刚 attach 完还没插进去就会被立刻误撤销）；
+5. 本地状态是 `staged`。
+
+满足后**去抖 600ms**，再做一次同样的判定，然后调 `POST /api/secret.release`（带 `reason: "withdrawn"`，与人类手点「丢弃」的 `discarded` 在历史里区分开）。
+
+| 边界 | 行为 |
+|---|---|
+| 删掉后 600ms 内又插回（含剪切/粘贴） | **不撤销**，记录保留 |
+| 删掉后隔一会儿再插回 | 记录**已撤销**，`@` 菜单不再列出该变量；重新附加**必须重新填值**（会话级的值不可找回；`persistent` 作用域的可以从凭据库条目重新登记） |
+| 发送（Enter / 发送按钮） | **不撤销**：回显携带标记 ⇒ 判定中止；消息落盘后该记录提升为 `bound` |
+| 发送失败（草稿被恢复） | 标记回到草稿 ⇒ 不撤销，记录保持 `staged` |
+| 发送中又手动删掉标记 | 同样不撤销（人类删的是草稿，不是那条已经发出的消息） |
+| 已 `bound` / 已 Grant 的记录 | **本机制不碰**：只有回退/改写那条消息才会让它失效（`revoked-anchor`，与既有一致） |
+| 宿主未提供草稿观测能力 | 胶囊里显示「宿主未提供草稿观测能力，自动撤销不可用（可手动丢弃或等 TTL 过期）。」——**宁可不撤销，也不误撤销** |
+| 刷新页面 | 草稿恢复为纯文本 `@VAR`，`MARKER_RE` 仍命中 ⇒ 不撤销 |
+| 撤销后重新附加同一凭据键 | 新记录带新的代次；任何在途的旧计时器因代次不匹配而作废，不会杀掉新记录 |
+
+#### `@` 菜单的两类来源
+
+| 来源（`section`） | 含义 | 条目 `description` | 选中后的行为 |
+|---|---|---|---|
+| `本会话可用` | 本会话已登记（`staged`）或已绑定（`bound`）的变量 | `本会话 · <作用域> · <状态>` | **直接插入**引用标记：与既有 `codec` / `serializeReference` 完全一致（插入的就是 `@DSH_SECRET_X`），发送后照常绑定与注入 |
+| `凭据库（持久）` | 本插件在凭据库里留过持久记录的变量，且本会话当前没有 | `凭据库 · 持久保存到凭据库 · 尚未用于本会话` | **不直接插入**：先弹一步确认（变量名 + 来源 + 作用域），确认后调 `POST /api/secret.adopt`，由宿主自己 `credentials.resolve` 取值并登记到本会话，**成功之后**才插入标记；失败则不插入任何东西，只显示固定文案 |
+
+条目形态用足菜单的呈现能力：**`label` 是主显示文本，但不总是变量名**——「凭据库（持久）」一类是**变量名**（`src/service.ts:664-668`，记录里没有人类标题，变量名是唯一诚实的标签），「本会话可用」一类是**人类标题**（在胶囊里填的标题；留空即回退为凭据键，`src/client/entry.ts:2808`，attach 请求缺省 `label ?? name`）⇒ **带标题的本会话条目上不会显示变量名**（变量名出现在插入后的草稿标记与胶囊详情里，那两处都按变量名显示；菜单条目的 `description` 只写来源/作用域/状态）。`name` = 凭据键（灰色别名 + 搜索键）、`description` = 来源·作用域·状态、`section` = 来源分组（**不把来源塞进名字里**）。菜单**不渲染** `hint` 字段，所以来源/作用域不放在 `hint`。「凭据库」一类只列**本插件提交过记录**的密钥：凭据服务的 reference 半边**没有枚举面**，别处写进去的环境变量/`.env` 条目无法被发现，这一点如实说明而不是猜。
+
 ### 已知限制（如实记录）
 
-- **对话框那条消息上的胶囊是 `data-ref-chip="file"`，点击会尝试 `openFile('DSH_SECRET_OPENAI')`**（打开一个不存在的文件，无害但不正确；不泄露任何东西——变量名本来就在那里可见）。**这是已知限制，不是未做完的功能。**原因：用户气泡的正文由 `dsh-client-ui-primitives` 的 `projectUserText` 独家渲染，它对 `@token` 形状**硬编码**为文件引用并挂 `openFile`；ui-chat 的消息管线没有可注册的引用种类（能接住点击的 `openReference` 只作用于**草稿编辑器**，不作用于转录气泡）。
+- **对话框那条消息上的胶囊是 `data-ref-chip="file"`**，`openFile('DSH_SECRET_OPENAI')` 仍是它唯一的点击路径。**0.3.0 起的现状**：插件已注册 `sidebarRightTabs` 的 `secret-attach-detail` 类型**接管这次打开**，所以点它会开出**右侧栏的详情页**（见「0.3.0 的四项增强 → 原胶囊的接管是长度竞争」）；0.2.x 的行为是打开一个不存在的文件（无害但不正确；不泄露任何东西——变量名本来就在那里可见），该行为作为历史如实保留。**注意这条接管是"当前 pattern 最长"的长度竞争结果，不是契约。**原因（点击目标为何无法从插件侧直接改写）：用户气泡的正文由 `dsh-client-ui-primitives` 的 `projectUserText` 独家渲染，它对 `@token` 形状**硬编码**为文件引用并挂 `openFile`；ui-chat 的消息管线没有可注册的引用种类（能接住点击的 `openReference` 只作用于**草稿编辑器**，不作用于转录气泡）。
   - **为什么不存在"既是 chip 又不可点"的 `@` 形态**（已逐行证明）：该函数只认三种 token（`primitives lib/index.js:6724` 的正则：`/名称`、`@"…"`、`@非空白`）；`:6753` 的判定是 `@` 开头**必然**映射为 `'file'`（或 `'folder'`），只有 `/` token 才可能是 `void 0`；而 `/` token 又必须在 caller 传入的 `slashNames` 名单里（`:6731`）。所以 `@DSH_SECRET_*` 一定拿到 `referenceKind:'file'` 并因此挂上 `openFile`，没有任何插件钩子能改变它。
   - 另外两条路都已评估并否决：wire session 形态 `@[label](dsh-session:…)` 虽是**不可点**的 session chip，但会被 `dsh-session-reference` 服务在 `agent/pre-step` 里当作跨会话引用解析（可能让整步失败），风险大于收益；整体接管 `conversation.chat.node` 的 `user` key 并自己重绘用户气泡需要重写附件、图片、markdown 与动作行，脆弱度过高。
-  - **交付给下一环节的验证项**：这条点击行为需真人在浏览器里确认（预期现象：点转录里的胶囊会尝试打开同名文件）。
-  - **`agent/pre-step` 追加的那条注记行本身也会被投影成 file chip**：注记是一条 durable 的 `user/message`，正文里逐字含 `@DSH_SECRET_*`，所以在转录里它同样由 `projectUserText` 渲染为 `data-ref-chip="file"` 并挂上同一个 `openFile` 行为。**与上面第一条同源**：观感问题、不泄露任何东西（注记里只有变量名与作用域，没有值），也不是未做完的功能——任何出现在消息正文里的 `@` 标记都逃不过这条 shipped 规则。
+  - **交付给下一环节的验证项**：这条点击行为需真人在浏览器里确认。**预期现象已随 0.3.0 改变**：点转录里的胶囊应打开**右侧栏的详情页**（0.2.x 的预期现象才是"尝试打开同名文件"）；该打开归谁，取决于「0.3.0 的四项增强 → 原胶囊的接管是长度竞争」里那条长度竞争，因此现场还需确认没有被别的插件抢走。
+  - **`agent/pre-step` 追加的那条注记行本身也会被投影成 file chip**：注记是一条 durable 的 `user/message`，正文里逐字含 `@DSH_SECRET_*`，所以在转录里它同样由 `projectUserText` 渲染为 `data-ref-chip="file"` 并挂上同一个 `openFile` 行为（0.3.0 起这个 `openFile` 也被我们的右栏查看器接管，因此点它同样打开我们的详情页）。**与上面第一条同源**：观感问题、不泄露任何东西（注记里只有变量名与作用域，没有值），也不是未做完的功能——任何出现在消息正文里的 `@` 标记都逃不过这条 shipped 规则。
 - 刷新后草稿里的 chip 会变回纯文本 `@DSH_SECRET_OPENAI`（草稿镜像只存文本），由 lexicon 装饰回"引用"观感，点击仍能打开详情胶囊；这与 chip 的原子性不同，是草稿投影的既有语义，不是本插件的取舍。
 - **工具结果里的 `@DSH_SECRET_*` 没有注记解释**（**值无关，不是泄漏**）：注记只为**本步引入的、载有标记的用户消息**追加，所以当同一形状的标记出现在**工具结果**（例如某条命令的回显）里时，它会**原样**进入模型上下文，且那一步的注记不会覆盖它——模型可能按系统提示里"`@` 前缀是文件路径"的约定去解读它，例如尝试读取一个同名文件（会失败）。**它不会因此获得任何值**：这条缺口只涉及"标记的解释范围"，与明文无关；变量名本来就在会话日志、用户气泡与注入说明里可见。**准确定性**：这是解释范围的一个已知缺口（不是未做完的功能），既没有把值带进上下文，也没有影响绑定、授权或 shell 注入。
 - 视觉与真机点击路径需要人工确认（见「边界与已知限制」）。
@@ -268,7 +347,7 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
 
 ### 已知限制（如实记录）
 
-- **转录气泡里的胶囊由 shipped 代码渲染，插件接不了钩子**：`@DSH_SECRET_*` 在用户消息气泡里被 `dsh-client-ui-primitives` 的 `projectUserText` 渲染成 `data-ref-chip="file"`，点击走它硬编码的 `openFile('DSH_SECRET_OPENAI')`（尝试打开一个同名文件，无害、不泄露任何东西，但行为不正确）。**编辑器内（草稿）的胶囊不受影响**：那里是插件自己注册的 `secret` 引用源，点击打开只读详情胶囊。同一条 shipped 规则也适用于 `agent/pre-step` 追加的那行注记（它正文里同样含 `@DSH_SECRET_*`，因此也会显示为 file chip）。逐行证据与"为什么不存在既是 chip 又不可点的 `@` 形态"见「人类主动附加密钥（反方向）→ 已知限制」。
+- **转录气泡里的胶囊由 shipped 代码渲染，插件改不了那次点击的目标**：`@DSH_SECRET_*` 在用户消息气泡里被 `dsh-client-ui-primitives` 的 `projectUserText` 渲染成 `data-ref-chip="file"`，点击走它硬编码的 `openFile('DSH_SECRET_OPENAI')`。**0.3.0 起**：该 `openFile` 解析出的地址（`dsh-resource://file/session/<id>/DSH_SECRET_X`）已被本插件的右栏查看器接管，因此点击打开的是**我们的详情页**；0.2.x 的行为（打开一个同名文件）作为历史如实保留，且**接管随时可能被同档更长的 pattern 抢走**（见「0.3.0 的四项增强 → 原胶囊的接管是长度竞争」）。**编辑器内（草稿）的胶囊不受影响**：那里是插件自己注册的 `secret` 引用源，点击打开只读详情胶囊。同一条 shipped 规则也适用于 `agent/pre-step` 追加的那行注记（它正文里同样含 `@DSH_SECRET_*`，因此也会显示为 file chip）。逐行证据与"为什么不存在既是 chip 又不可点的 `@` 形态"见「人类主动附加密钥（反方向）→ 已知限制」。
 - **工具结果里的 `@DSH_SECRET_*` 没有注记解释**（值无关，不是泄漏）：注记只为**本步引入的、载有标记的用户消息**追加，因此同一形状的标记出现在工具结果里时原样进入模型上下文且无注记覆盖，模型可能按"`@` = 文件路径"去解读它（会失败）。它不会因此获得任何值，也不影响绑定、授权或 shell 注入。详见「人类主动附加密钥（反方向）→ 已知限制」。
 - **`ctx.authorization` 只承载 `persistent`**：该 seam 的契约要求"本次尝试期间提交并观察到一条凭据记录"（否则 `NOT_COMMITTED`），而 `session` 授权按定义不得落盘。因此 `session` 请求走同一套对话框、但不进该 seam；`persistent` 请求完整走 `registerFlow` + `begin`。这是 seam 契约决定的取舍，不是省事。
 - **O1 / O2（第二轮修复，两条都如实回报）**：
@@ -276,6 +355,7 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
   - **O2**：`persistent` 等待本身超时（`requestTimeoutMs`）时，错误码一律是 `TIMEOUT`，不会被 seam 的 `failed` 包装成 `AUTHORIZATION_FAILED`。
 - **`shellEnv` 的 resolver 是同步的**，而 `ctx.credentials.resolve` 是异步的：无法在每次 shell 执行时回源凭据库。因此授权通过时把值读入该会话的授权表（并在每次注入前做锚点/会话校验），凭据库仍是持久层的真相。**轮换凭据后请重新调用 `secret_request` 刷新会话内副本。**
 - **验证限制**：本插件的安装与注册由 `cordis_inspect_query` 的 Tool/Slots 证据覆盖；卡片的**视觉**（浅色/深色、布局、四档"工作步骤展示"下的实际渲染位置）与附加方向胶囊的**视觉 / 真机点击路径**只有在浏览器里有页面时才可能确认，无浏览器控制时不做渲染器/截图等替代验证。"卡片在四个档位下都位于步骤进程分组之外"由结构证明（节点无 Turn/Step 坐标 ⇒ 根条目、非 process member）加单测（`buildViewNode` 的 `location.kind === 'session'`）覆盖，**未经真人点击/切档验证**。单测覆盖 Host 侧全部纯逻辑、register 级装配与 Client 半的纯逻辑（节点状态机、四态判定、表单控件、明文不越界、以及浏览器产物在真 cordis 上下文里的 boot）；真机点击路径需要人工确认。
+- **0.3.0 新增的"需真人确认"清单（如实标注，未验证即写"未验证"）**：① **旁挂胶囊确实渲染在用户气泡之后**（含四档"工作步骤展示"下的实际位置与视觉贴合）；② **点旁挂胶囊**打开的是输入框上方的信息框；③ **点原胶囊**打开的是右侧栏详情页（且**不再是**"文件不存在"），以及页面顶栏右栏行为符合预期；④ **原胶囊接管的可争用性**在现场的表现（装/卸 `dsh-better-sidebar`，或临时注册一个更长的同档 pattern，观察是否被静默抢走）；⑤ **移除即撤销**的真实时序（删掉 → 约 0.6s 后 `GET /api/secret.attached` 不再是 `staged`；删掉后 600ms 内插回 ⇒ 记录仍在；**发送不得触发撤销**）；⑥ **历史区**在刷新后仍在、宿主重启/插件重载后清空、重放/分叉会话不重建；⑦ **`@` 菜单**两类来源的 `section`/`description` 文案在实际宽度下不被截断，且凭据库条目的确认→登记→插入链路真的能取到值。以上 7 项在无浏览器控制时均为**需真人确认**，本 README 不把它们写成已验证。
 
 ## 开发
 
@@ -302,7 +382,11 @@ npm test            # node --test 六个文件：
                     #                             真 shellEnv.collect() 能取到值；注记逐字写明模型侧记法
                     #   test/client-attach.test.ts 用真 cordis Context + sibling provide 装载浏览器产物：apply 在
                     #                             **缺少三个可选服务**时也不抛（boot 回归门）、注册面、插入阶梯
-                    #                             （L1 chip / L3 文本 / 无 sessions 时降级）、明文不越出掩码输入
+                    #                             （L1 chip / L3 文本 / 无 sessions 时降级）、明文不越出掩码输入；
+                    #                             0.3.0 起还覆盖：旁挂节点定义的 match/buildViewNode 与其 key 的
+                    #                             排序性质、`@` 菜单候选的两类来源与描述、凭据库条目的确认分支、
+                    #                             历史读取器的防御式校验、撤销判定 `decideWithdraw` 的真值表；
+                    #                             Host 侧的历史存储/三条新路由/release 的 reason 由上述 Host 用例覆盖
 npm run build       # 产出 lib/（Host 半 + 浏览器产物 ./client）
 ```
 

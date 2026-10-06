@@ -185,3 +185,79 @@ export interface SecretAttachOutcome {
   /** True when this replaced an earlier attach for the same exposed variable. */
   readonly replaced: boolean
 }
+
+/**
+ * One lifecycle transition of one secret in one session, as the history area
+ * reports it. Every arm is a fact the Host observed, never an inference.
+ */
+export type SecretHistoryEvent =
+  /** A human attached a secret (whether or not it replaced an earlier entry). */
+  | 'staged'
+  /** The staged entry reached a durable message and became a grant. */
+  | 'bound'
+  /** The human discarded the staged entry from the capsule. */
+  | 'discarded'
+  /** The marker left the draft and the staged entry was withdrawn. */
+  | 'withdrawn'
+  /** A bound entry was observed to have lost its anchored message. */
+  | 'revoked'
+  /** A staged entry reached its TTL. */
+  | 'expired'
+  /** An agent-asked authorization produced a grant. */
+  | 'authorized'
+
+/** Which direction produced one history entry. */
+export type SecretHistorySource = 'attach' | 'request'
+
+/**
+ * One record of the session's attachment/authorization history.
+ *
+ * Value-free by construction: there is no field a secret value could ride in,
+ * and the client's reader rebuilds it field by field.
+ */
+export interface SecretHistoryEntry {
+  readonly at: number
+  readonly event: SecretHistoryEvent
+  readonly variable: string
+  readonly name: string
+  readonly label: string
+  readonly scope: SecretScope
+  /** The anchoring message sequence, once the entry reached a durable message. */
+  readonly anchorSeq?: number
+  readonly source: SecretHistorySource
+  /** True when this attach replaced an earlier entry for the same variable. */
+  readonly replaced?: boolean
+}
+
+/**
+ * The history one session reports, newest first.
+ *
+ * The wrapper exists so the wire shape is frozen independently of the store's
+ * own list type: a reader of this contract sees one named container, not a bare
+ * array that could sprout fields later.
+ */
+export interface SecretHistoryView {
+  readonly entries: readonly SecretHistoryEntry[]
+}
+
+/** Lifecycle of one row the `@` menu may list. */
+export type SecretAvailableState =
+  /** Registered for this session and waiting for the message that carries it. */
+  | 'staged'
+  /** Bound to a durable message of this session. */
+  | 'bound'
+  /** Durable in the credential store but not registered for this session yet. */
+  | 'stored'
+
+/** Where one available secret comes from, as the menu labels it. */
+export type SecretAvailableSource = 'session' | 'store'
+
+/** One row of the `@` menu's available-secret list. Never carries a value. */
+export interface SecretAvailableEntry {
+  readonly variable: string
+  readonly name: string
+  readonly label: string
+  readonly scope: SecretScope
+  readonly state: SecretAvailableState
+  readonly source: SecretAvailableSource
+}

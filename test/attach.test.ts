@@ -176,7 +176,12 @@ test('parseAttach rebuilds the request field by field and refuses malformed inpu
 
 test('parseRelease and the attached-list query accept only shaped input', () => {
   const ok = parseRelease({ sessionId: SESSION_ID, variable: ENV_VAR })
-  assert.deepEqual(ok, { ok: true, value: { sessionId: SESSION_ID, envVar: ENV_VAR } })
+  // Round 4: a release may name why it happened, and a caller that names nothing
+  // means "the human discarded it" — the only reading every caller had before.
+  // Original assertion: { ok: true, value: { sessionId, envVar } }.
+  assert.deepEqual(ok, { ok: true, value: { sessionId: SESSION_ID, envVar: ENV_VAR, reason: 'discarded' } })
+  assert.equal(parseRelease({ sessionId: SESSION_ID, variable: ENV_VAR, reason: 'withdrawn' }).ok, true)
+  assert.equal(parseRelease({ sessionId: SESSION_ID, variable: ENV_VAR, reason: 'nonsense' }).ok, false)
   assert.equal(parseRelease({ sessionId: SESSION_ID, variable: 'OPENAI' }).ok, false)
   assert.equal(parseRelease({ variable: ENV_VAR }).ok, false)
   assert.equal(parseRelease(null).ok, false)
@@ -487,7 +492,16 @@ function makeService(options: { ttlMs?: number; capacity?: number; session?: Fak
   const failures = { set: false }
   const session = 'session' in options ? options.session : sessionWithMarker()
   const service = new SecretService({
-    config: { requestTimeoutMs: 60000, maxPendingRequests: 4, attachTtlMs: options.ttlMs ?? 1800000, maxAttachmentsPerSession: options.capacity ?? 8 },
+    config: {
+      requestTimeoutMs: 60000,
+      maxPendingRequests: 4,
+      attachTtlMs: options.ttlMs ?? 1800000,
+      maxAttachmentsPerSession: options.capacity ?? 8,
+      // Round 4 added these two required keys to `SecretConfig`. Supplied here
+      // with the schema's own defaults; no assertion in this file changed.
+      maxHistoryPerSession: 32,
+      maxAvailableEntries: 32,
+    },
     credentials: {
       async describe() {
         return { configured: false, writable: true }

@@ -29,6 +29,13 @@ export interface StagedAttach {
 /** Timer seam so tests never depend on the wall clock (mirrors `Scheduler`). */
 export type AttachScheduler = (delayMs: number, callback: () => void) => () => void
 
+/** Why one staged attach left the store. */
+export type AttachDropReason =
+  /** The TTL elapsed before the entry was sent. */
+  | 'expired'
+  /** A caller removed it explicitly (the capsule's discard, or the draft watcher's withdrawal). */
+  | 'removed'
+
 /** Everything the staged store needs from its host. */
 export interface AttachStoreDeps {
   /** How long a staged attach waits before it is dropped. */
@@ -36,6 +43,13 @@ export interface AttachStoreDeps {
   /** How many staged attaches one session may hold. */
   readonly capacity: number
   readonly schedule: AttachScheduler
+  /**
+   * Reported once per entry that leaves the store by TTL or by an explicit
+   * removal. Session teardown and plugin unload do not report (their history is
+   * dropped with them), and a replacement never reports: the new entry under the
+   * same key keeps the slot alive.
+   */
+  readonly onDrop?: (sessionId: string, envVar: string, reason: AttachDropReason) => void
 }
 
 /** The result of staging one attach. */
@@ -91,7 +105,7 @@ export class AttachStore {
       this.deps.schedule(this.deps.ttlMs, () => {
         // A replacement installed a new entry under the same key: only the
         // entry this timer was armed for may be dropped.
-        if (this.items.get(key) === stored) this.drop(key)
+        if (this.items.get(key) === stored) this.drop(key, 'expired')
       }),
     )
     return { attach: stored, replaced }
@@ -113,7 +127,7 @@ export class AttachStore {
   remove(sessionId: string, envVar: string): boolean {
     const key = pairKey(sessionId, envVar)
     if (!this.items.has(key)) return false
-    this.drop(key)
+    this.drop(key, 'removed')
     return true
   }
 
@@ -122,7 +136,10 @@ export class AttachStore {
     let dropped = 0
     for (const [key, item] of [...this.items]) {
       if (item.sessionId !== sessionId) continue
-      this.drop(key)
+      // Session teardown drops the history with the entries, so it reports
+      // nothing: an `expired`/`removed` entry for a session that no longer
+      // exists would be a fact nobody could ever read.
+      this.dropQuiet(key)
       dropped += 1
     }
     return dropped
@@ -134,7 +151,15 @@ export class AttachStore {
     this.items.clear()
   }
 
-  private drop(key: string): void {
+  private drop(key: string, reason: AttachDropReason): void {
+    const item = this.items.get(key)
+    this.clearTimer(key)
+    this.items.delete(key)
+    if (item === undefined) return
+    this.deps.onDrop?.(item.sessionId, item.envVar, reason)
+  }
+
+  private dropQuiet(key: string): void {
     this.clearTimer(key)
     this.items.delete(key)
   }

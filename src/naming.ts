@@ -28,6 +28,14 @@ export function isSecretScope(value: unknown): value is SecretScope {
   return typeof value === 'string' && (SCOPES as readonly string[]).includes(value)
 }
 
+/** Why one release was requested, as the history records it. */
+export type ReleaseReason = 'discarded' | 'withdrawn'
+
+/** Whether a raw value is one of the two release reasons the route accepts. */
+export function isReleaseReason(value: unknown): value is ReleaseReason {
+  return value === 'discarded' || value === 'withdrawn'
+}
+
 /** Whether a raw value is a well-formed credential key. */
 export function isCredentialName(value: unknown): value is string {
   return typeof value === 'string' && NAME_PATTERN.test(value)

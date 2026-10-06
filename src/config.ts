@@ -14,6 +14,14 @@ export interface SecretConfig {
   attachTtlMs: number
   /** How many attached secrets one session may hold at the same time. */
   maxAttachmentsPerSession: number
+  /**
+   * How many history entries one session may keep. The history is memory-only
+   * (it never reaches disk), so this bound is what keeps a long-lived session
+   * from accumulating an unbounded record of its own past.
+   */
+  maxHistoryPerSession: number
+  /** How many store-only rows the `@` menu's available list may carry. */
+  maxAvailableEntries: number
 }
 
 export const Config = z.object({
@@ -21,6 +29,8 @@ export const Config = z.object({
   maxPendingRequests: z.number().default(4),
   attachTtlMs: z.number().default(1800000),
   maxAttachmentsPerSession: z.number().default(8),
+  maxHistoryPerSession: z.number().default(32),
+  maxAvailableEntries: z.number().default(32),
 })
 
 /** Hand-check constraints the schema DSL does not express. */
@@ -30,6 +40,8 @@ export function assertConfig(config: SecretConfig): void {
     'maxPendingRequests',
     'attachTtlMs',
     'maxAttachmentsPerSession',
+    'maxHistoryPerSession',
+    'maxAvailableEntries',
   ] as const) {
     const value = config[key]
     if (!Number.isInteger(value) || value < 1) {

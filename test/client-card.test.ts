@@ -291,13 +291,22 @@ test('a settled failure keeps its structured identity, and an unreadable call st
 })
 
 test('exactly one card node and one tool-row placeholder are registered', () => {
-  assert.equal(definitions.length, 1, 'the client half must register exactly one conversation definition')
+  // Updated this round: the client half now registers TWO conversation
+  // definitions — the request card and the side-car attach row (requirement 1 /
+  // O2). The assertion is not relaxed: both are named, in registration order,
+  // and the card's shape is still pinned exactly.
+  assert.equal(definitions.length, 2, 'the client half must register the card and the side-car row')
   assert.equal((definitions[0] as { kind: string }).kind, 'secret-request')
   assert.equal((definitions[0] as { target: string }).target, 'chat')
+  assert.equal((definitions[1] as { kind: string }).kind, 'sr-chip')
+  assert.equal((definitions[1] as { target: string }).target, 'chat')
 
   const byName = (name: string) => registrations.filter((entry) => entry.name === name)
-  assert.equal(byName('conversation.chat.node').length, 1)
-  assert.equal(byName('conversation.chat.node')[0]?.key, 'secret-request')
+  assert.deepEqual(
+    byName('conversation.chat.node').map((entry) => entry.key).sort(),
+    ['secret-request', 'sr-chip'],
+    'one keyed chat node per kind, so neither can replace the other',
+  )
   assert.equal(byName('tool.call.toolview').length, 1)
   assert.equal(byName('tool.call.toolview')[0]?.key, 'secret_request')
   // A keyed slot keeps one entry per key and a later registration replaces the

@@ -76,6 +76,23 @@ export function credentialsPort(ctx: Context): CredentialsPort {
       const record: CredentialRecord = { kind: 'grant', payload }
       await credentials.modifyRecord(key as CredentialKey, () => Promise.resolve(record))
     },
+    // Enumeration is optional to the plugin's own job: a credentials
+    // implementation that cannot list records simply answers "nothing to
+    // enumerate", and the `@` menu then lists only what this session holds.
+    // Reading one record back is how a stored key's payload (envVar/name/scope)
+    // becomes visible without ever touching the value.
+    listRecords: async () =>
+      typeof credentials.listRecords === 'function' ? await credentials.listRecords() : [],
+    readRecord: async (key) => {
+      if (typeof credentials.readRecord !== 'function') return undefined
+      const record = await credentials.readRecord(key as CredentialKey)
+      if (record === undefined) return undefined
+      // The store's union has a payload-free arm (an api-key record carries its
+      // own key instead). This plugin only ever commits and reads grant
+      // records, so anything else reports "not readable" rather than a payload
+      // that never existed.
+      return record.kind === 'grant' ? { kind: record.kind, payload: record.payload } : undefined
+    },
   }
 }
 

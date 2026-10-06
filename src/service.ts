@@ -1,9 +1,17 @@
 import { findAnchorSeq, type AnchorSessionLike } from './anchor.ts'
-import { type AttachStore, type BoundAttach } from './attach.ts'
+import { type AttachDropReason, type AttachStore, type BoundAttach } from './attach.ts'
 import type { SecretConfig } from './config.ts'
 import { approvedResult, mapNonApproved, planGrant } from './decisions.ts'
 import { GrantStore, type Grant, type GrantSessionLike } from './grants.ts'
-import { effectiveEnvVar, recordKey, validateRequest } from './naming.ts'
+import { HistoryStore } from './history.ts'
+import {
+  effectiveEnvVar,
+  isCredentialName,
+  isExposedEnvVar,
+  RECORD_SCOPE,
+  recordKey,
+  validateRequest,
+} from './naming.ts'
 import {
   PendingStore,
   SecretAbortedError,
@@ -11,7 +19,7 @@ import {
   type Scheduler,
   type WaitOutcome,
 } from './pending.ts'
-import { parseAnswer, parseAttach, parseRelease } from './protocol.ts'
+import { availableView, historyView, parseAdopt, parseAnswer, parseAttach, parseRelease } from './protocol.ts'
 import { redactSecrets } from './redact.ts'
 import type {
   ModalAnswer,
@@ -19,8 +27,14 @@ import type {
   SecretAttachedView,
   SecretAttachOutcome,
   SecretAttachState,
+  SecretAvailableEntry,
+  SecretHistoryEntry,
+  SecretHistoryEvent,
+  SecretHistorySource,
+  SecretHistoryView,
   SecretRequestInput,
   SecretRequestResult,
+  SecretScope,
 } from './types.ts'
 
 /** How the caller of `secret_request` relates to the live runtime. */
@@ -39,6 +53,19 @@ export interface SecretCaller {
   readonly signal: AbortSignal
 }
 
+/** One credential-store record address, as enumeration reports it (value-free). */
+export interface CredentialRecordRef {
+  readonly key: string
+  /** Record kind tag the store assigned (this plugin commits `grant`). */
+  readonly kind: string
+}
+
+/** One credential-store record read back by key. */
+export interface CredentialRecordRead {
+  readonly kind: string
+  readonly payload: unknown
+}
+
 /** Credential-store operations this plugin needs. */
 export interface CredentialsPort {
   describe(ref: string): Promise<{ configured: boolean; source?: string; writable: boolean }>
@@ -46,6 +73,20 @@ export interface CredentialsPort {
   set(ref: string, value: string): Promise<void>
   /** Commit the durable authorization marker for one credential key. */
   commitRecord(key: string, payload: unknown): Promise<void>
+  /**
+   * Enumerate the store's records.
+   *
+   * Optional to the rest of the plugin's job: an environment whose credentials
+   * implementation cannot enumerate answers "nothing to enumerate", and the `@`
+   * menu then lists only what the session itself holds. Enumeration is
+   * value-free by contract — it reports record addresses, never payloads.
+   */
+  listRecords?(): Promise<readonly CredentialRecordRef[]>
+  /**
+   * Read one record back by key; a key with no record, or a store without
+   * read-back, answers undefined.
+   */
+  readRecord?(key: string): Promise<CredentialRecordRead | undefined>
 }
 
 /** What one authorization attempt needs from its flow. */
@@ -105,6 +146,16 @@ export interface SecretServiceDeps {
   readonly envs: EnvPort
   /** Staged secrets a human attached and has not sent yet. */
   readonly attachments: AttachStore
+  /**
+   * The session-scoped, memory-only record of what happened to every secret
+   * this session ever carried. It is the only place a released, discarded,
+   * expired or revoked entry still exists, and it holds no value.
+   *
+   * Omitted, the service keeps its own store of the same shape (the unit
+   * harnesses do this); production injects the one the plugin owns so the
+   * `session/disposed` hook can forget a session's history with its grants.
+   */
+  readonly history?: HistoryStore
   classifyCaller(agent: unknown): CallerClass
   sessionOf(agent: unknown): GrantSessionLike | undefined
   /** The live session one attach submission names, or undefined. */
@@ -130,6 +181,31 @@ export type AttachOutcome =
 export type ReleaseOutcome =
   | { readonly ok: true; readonly released: boolean; readonly state: SecretAttachState | 'none' }
   | { readonly ok: false; readonly status: number; readonly error: string }
+
+/** The result of one adopt request, as the route reports it. */
+export type AdoptOutcome =
+  | {
+      readonly ok: true
+      readonly outcome: { readonly variable: string; readonly scope: SecretScope; readonly replaced: boolean }
+    }
+  | { readonly ok: false; readonly status: number; readonly error: string }
+
+/**
+ * The value-free facts one durable marker carries.
+ *
+ * Two writers commit markers (the attach direction adds `kind:'attachment'`, the
+ * ask direction does not), so this reader tolerates both shapes and insists only
+ * on what both promise: the exposed variable, the credential key, and a durable
+ * scope. Anything else is not one of ours and is skipped rather than guessed at.
+ */
+function markerFacts(payload: unknown): { readonly envVar: string; readonly name: string } | undefined {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
+  const record = payload as Record<string, unknown>
+  if (record.scope !== 'persistent') return undefined
+  if (!isExposedEnvVar(record.envVar)) return undefined
+  if (!isCredentialName(record.name)) return undefined
+  return { envVar: record.envVar, name: record.name }
+}
 
 /**
  * How collecting one decision ended.
@@ -186,16 +262,23 @@ export class SecretService {
    * Attachment metadata per session, keyed by exposed variable.
    *
    * Only what the capsule needs to describe an entry that has left the staged
-   * store — a label and when it was created. It never holds a value: the value
-   * lives in the staged store until it is bound, and afterwards only in the
-   * grant store.
+   * store — the credential key, a label, a scope and when it was created (plus
+   * the anchor of a bound entry, for the history). It never holds a value: the
+   * value lives in the staged store until it is bound, and afterwards only in
+   * the grant store.
    */
-  private readonly attached = new Map<string, Map<string, { label: string; createdAt: number }>>()
+  private readonly attached = new Map<
+    string,
+    Map<string, { name: string; label: string; scope: SecretScope; createdAt: number; anchorSeq?: number }>
+  >()
+  /** The history this service writes to: the injected one, or its own. */
+  private readonly history: HistoryStore
   private readonly deps: SecretServiceDeps
 
   constructor(deps: SecretServiceDeps, grants: GrantStore = new GrantStore()) {
     this.deps = deps
     this.grants = grants
+    this.history = deps.history ?? new HistoryStore({ capacity: deps.config.maxHistoryPerSession })
   }
 
   /** The dialog-facing view of every waiting interaction. */
@@ -292,6 +375,13 @@ export class SecretService {
         error: `attach: 本会话登记的附加密钥已达上限（${String(this.deps.config.maxAttachmentsPerSession)}）`,
       }
     }
+    this.note(input.sessionId, 'staged', input.envVar, {
+      name: input.name,
+      label: input.label,
+      scope: input.scope,
+      source: 'attach',
+      replaced: written.replaced,
+    })
     return {
       ok: true,
       outcome: { variable: input.envVar, scope: input.scope, replaced: written.replaced },
@@ -308,9 +398,20 @@ export class SecretService {
   release(raw: unknown): ReleaseOutcome {
     const parsed = parseRelease(raw)
     if (!parsed.ok) return { ok: false, status: 400, error: parsed.error }
-    const { sessionId, envVar } = parsed.value
+    const { sessionId, envVar, reason } = parsed.value
+    // Read the entry before it is dropped: a history entry has to name the
+    // credential and its scope, and the store is the only place they exist.
+    const staged = this.deps.attachments.get(sessionId, envVar)
     if (this.deps.attachments.remove(sessionId, envVar)) {
       this.attached.get(sessionId)?.delete(envVar)
+      if (staged !== undefined) {
+        this.note(sessionId, reason === 'withdrawn' ? 'withdrawn' : 'discarded', envVar, {
+          name: staged.name,
+          label: staged.label,
+          scope: staged.scope,
+          source: 'attach',
+        })
+      }
       return { ok: true, released: true, state: 'staged' }
     }
     const session = this.deps.sessionById(sessionId)
@@ -347,6 +448,16 @@ export class SecretService {
       const live = session === undefined ? undefined : this.liveGrant(session, envVar)
       if (live === undefined) {
         known.delete(envVar)
+        // A bound entry whose anchor left the live surface is observed here and
+        // nowhere else: the history reports a revocation only once somebody has
+        // actually looked, so it never invents an exposure nobody could see.
+        this.note(sessionId, 'revoked', envVar, {
+          name: meta.name,
+          label: meta.label,
+          scope: meta.scope,
+          source: 'attach',
+          ...(meta.anchorSeq === undefined ? {} : { anchorSeq: meta.anchorSeq }),
+        })
         continue
       }
       views.push({
@@ -363,15 +474,241 @@ export class SecretService {
 
   /** Record that one attachment reached a message (called by the binding hook). */
   noteBound(attach: BoundAttach): void {
-    const known = this.attached.get(attach.sessionId) ?? new Map<string, { label: string; createdAt: number }>()
-    known.set(attach.variable, { label: attach.label, createdAt: attach.createdAt })
+    const known = this.attached.get(attach.sessionId)
+      ?? new Map<string, { name: string; label: string; scope: SecretScope; createdAt: number; anchorSeq?: number }>()
+    const session = this.deps.sessionById(attach.sessionId)
+    const grant = session === undefined ? undefined : this.liveGrant(session, attach.variable)
+    known.set(attach.variable, {
+      name: attach.name,
+      label: attach.label,
+      scope: attach.scope,
+      createdAt: attach.createdAt,
+      ...(grant === undefined ? {} : { anchorSeq: grant.anchorSeq }),
+    })
     this.attached.set(attach.sessionId, known)
+    this.note(attach.sessionId, 'bound', attach.variable, {
+      name: attach.name,
+      label: attach.label,
+      scope: attach.scope,
+      source: 'attach',
+      ...(grant === undefined ? {} : { anchorSeq: grant.anchorSeq }),
+    })
+  }
+
+  /**
+   * Record one staged entry that left the store on its own.
+   *
+   * Only a TTL expiry is reported: the store also reports every explicit
+   * removal, and those are recorded by the caller that asked for them (the
+   * capsule's discard, the draft watcher's withdrawal) — or, when the binding
+   * consumes an entry, are not a loss at all.
+   */
+  noteDropped(sessionId: string, envVar: string, reason: AttachDropReason): void {
+    if (reason !== 'expired') return
+    this.note(sessionId, 'expired', envVar, {})
   }
 
   /** Drop every attachment record of one session (session end). */
   forgetAttachments(sessionId: string): void {
     this.deps.attachments.forget(sessionId)
     this.attached.delete(sessionId)
+  }
+
+  /** The value-free history of one session, newest first. */
+  historyFor(sessionId: string): SecretHistoryView {
+    return { entries: this.history.list(sessionId).map((entry) => historyView(entry)) }
+  }
+
+  /**
+   * Every secret the `@` menu may offer this session: what the session itself
+   * holds, then what the credential store holds durably.
+   *
+   * A variable that is both is listed once, as the session's own row: the menu's
+   * job is to say what is *usable here*, and the session-side entry is the one
+   * that already has a staged or bound record behind it.
+   */
+  async available(sessionId: string): Promise<readonly SecretAvailableEntry[]> {
+    const entries: SecretAvailableEntry[] = []
+    const seen = new Set<string>()
+    const sessionSide = [...this.attachedViews(sessionId)].sort(
+      (left, right) =>
+        (left.state === right.state ? 0 : left.state === 'bound' ? -1 : 1)
+        || left.variable.localeCompare(right.variable),
+    )
+    for (const view of sessionSide) {
+      if (seen.has(view.variable)) continue
+      seen.add(view.variable)
+      entries.push({
+        variable: view.variable,
+        name: view.name,
+        label: view.label,
+        scope: view.scope,
+        state: view.state,
+        source: 'session',
+      })
+    }
+    for (const stored of await this.storedEntries()) {
+      if (entries.length >= this.deps.config.maxAvailableEntries) break
+      if (seen.has(stored.variable)) continue
+      seen.add(stored.variable)
+      entries.push(stored)
+    }
+    return entries
+  }
+
+  /**
+   * Register one durably stored secret for this session.
+   *
+   * The `@` menu cannot put a marker in a message that has nothing behind it: a
+   * marker with no record would produce no note and no variable, which is a lie
+   * the human would only discover at the far end. So a store-only pick first
+   * asks the Host to adopt it, and only then inserts the chip. The Host resolves
+   * the value itself — it never crosses the wire in either direction.
+   */
+  async adopt(raw: unknown): Promise<AdoptOutcome> {
+    const parsed = parseAdopt(raw)
+    if (!parsed.ok) return { ok: false, status: 400, error: parsed.error }
+    const { sessionId, envVar } = parsed.value
+    if (this.deps.sessionById(sessionId) === undefined) {
+      return { ok: false, status: 404, error: 'adopt: 找不到该会话，本次未登记' }
+    }
+    const existing = this.deps.attachments.get(sessionId, envVar)
+    if (
+      existing === undefined
+      && this.deps.attachments.countFor(sessionId) >= this.deps.config.maxAttachmentsPerSession
+    ) {
+      return {
+        ok: false,
+        status: 409,
+        error: `adopt: 本会话登记的附加密钥已达上限（${String(this.deps.config.maxAttachmentsPerSession)}）`,
+      }
+    }
+    const stored = (await this.storedEntries()).find((entry) => entry.variable === envVar)
+    if (stored === undefined) {
+      return { ok: false, status: 404, error: 'adopt: 凭据库里没有这个变量的持久记录' }
+    }
+    let value: string | undefined
+    try {
+      value = (await this.deps.credentials.resolve(envVar))?.value
+    } catch {
+      return { ok: false, status: 500, error: STORE_READ_FAILED_MESSAGE }
+    }
+    if (value === undefined || value.length === 0) {
+      // Nothing is staged on this path: a record with no resolvable value would
+      // give the human a chip that cannot be injected, so it fails closed.
+      return { ok: false, status: 404, error: 'adopt: 凭据库里已经没有这个变量的值' }
+    }
+    const written = this.deps.attachments.put({
+      sessionId,
+      name: stored.name,
+      label: stored.label,
+      scope: 'persistent',
+      envVar,
+      value,
+      createdAt: this.deps.now(),
+    })
+    if (written === undefined) {
+      return {
+        ok: false,
+        status: 409,
+        error: `adopt: 本会话登记的附加密钥已达上限（${String(this.deps.config.maxAttachmentsPerSession)}）`,
+      }
+    }
+    this.note(sessionId, 'staged', envVar, {
+      name: stored.name,
+      label: stored.label,
+      scope: 'persistent',
+      source: 'attach',
+      replaced: written.replaced,
+    })
+    return { ok: true, outcome: { variable: envVar, scope: 'persistent', replaced: written.replaced } }
+  }
+
+  /**
+   * Every record this plugin committed that is still durably usable.
+   *
+   * Enumeration and read-back are both optional capabilities: a store that
+   * cannot list, or a record that cannot be read, contributes nothing — the
+   * menu reports only what it could verify, never a guess.
+   */
+  private async storedEntries(): Promise<readonly SecretAvailableEntry[]> {
+    const enumerate = this.deps.credentials.listRecords
+    const readBack = this.deps.credentials.readRecord
+    // Both capabilities are optional: a store that cannot enumerate contributes
+    // nothing, and the menu still lists the session's own entries.
+    if (typeof enumerate !== 'function' || typeof readBack !== 'function') return []
+    let records: readonly CredentialRecordRef[]
+    try {
+      records = await enumerate.call(this.deps.credentials)
+    } catch {
+      return []
+    }
+    const out: SecretAvailableEntry[] = []
+    const seen = new Set<string>()
+    for (const record of records) {
+      if (out.length >= this.deps.config.maxAvailableEntries) break
+      if (!record.key.startsWith(`${RECORD_SCOPE}/`)) continue
+      let read: CredentialRecordRead | undefined
+      try {
+        read = await readBack.call(this.deps.credentials, record.key)
+      } catch {
+        continue
+      }
+      const facts = markerFacts(read?.payload)
+      if (facts === undefined || seen.has(facts.envVar)) continue
+      seen.add(facts.envVar)
+      out.push({
+        variable: facts.envVar,
+        name: facts.name,
+        // The marker carries no human-written title (both writers commit the
+        // same value-free facts), so the variable name is the honest label: it
+        // is what the human will see in their own message.
+        label: facts.envVar,
+        scope: 'persistent',
+        state: 'stored',
+        source: 'store',
+      })
+    }
+    return out.sort((left, right) => left.variable.localeCompare(right.variable))
+  }
+
+  /**
+   * Record one lifecycle transition, inheriting what the transition cannot know.
+   *
+   * A TTL expiry or a revoked anchor reports no facts of its own — by the time
+   * either is observed the entry is gone. Rather than invent a credential key or
+   * a scope, the entry inherits them from the variable's last recorded state;
+   * with no earlier entry there is nothing truthful to write, so nothing is.
+   */
+  private note(
+    sessionId: string,
+    event: SecretHistoryEvent,
+    variable: string,
+    facts: {
+      readonly name?: string
+      readonly label?: string
+      readonly scope?: SecretScope
+      readonly anchorSeq?: number
+      readonly source?: SecretHistorySource
+      readonly replaced?: boolean
+    },
+  ): void {
+    const previous = this.history.latest(sessionId, variable)
+    const name = facts.name ?? previous?.name
+    const label = facts.label ?? previous?.label
+    const scope = facts.scope ?? previous?.scope
+    if (name === undefined || label === undefined || scope === undefined) return
+    this.history.push(sessionId, {
+      at: this.deps.now(),
+      event,
+      variable,
+      name,
+      label,
+      scope,
+      source: facts.source ?? previous?.source ?? 'attach',
+      ...(facts.anchorSeq === undefined ? {} : { anchorSeq: facts.anchorSeq }),
+      ...(facts.replaced === undefined ? {} : { replaced: facts.replaced }),
+    })
   }
 
   /** The live grant one session holds for one exposed variable, if any. */
@@ -637,6 +974,15 @@ export class SecretService {
     }
     this.grants.put(grant)
     this.deps.envs.ensure(context.envVar)
+    // The ask direction lands in the same flow the attach direction does: one
+    // history, two sources, so "what happened in this session" has one answer.
+    this.note(sessionId, 'authorized', context.envVar, {
+      name: input.name,
+      label: input.label,
+      scope: plan.scope,
+      source: 'request',
+      anchorSeq: context.anchorSeq,
+    })
 
     const notice = revocation === undefined
       ? undefined

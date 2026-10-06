@@ -1,5 +1,12 @@
-import { deriveEnvVar, isCredentialName, isExposedEnvVar, isSecretScope } from './naming.ts'
-import type { ModalAnswer, PendingView, SecretAttachInput, SecretScope } from './types.ts'
+import { deriveEnvVar, isCredentialName, isExposedEnvVar, isReleaseReason, isSecretScope, type ReleaseReason } from './naming.ts'
+import type {
+  ModalAnswer,
+  PendingView,
+  SecretAttachInput,
+  SecretAvailableEntry,
+  SecretHistoryEntry,
+  SecretScope,
+} from './types.ts'
 
 /** Upper bound on a rejection reason echoed back by the dialog. */
 const MAX_REASON = 500
@@ -124,7 +131,10 @@ export type AttachValidation =
 
 /** One validated release request. */
 export type ReleaseValidation =
-  | { readonly ok: true; readonly value: { readonly sessionId: string; readonly envVar: string } }
+  | {
+      readonly ok: true
+      readonly value: { readonly sessionId: string; readonly envVar: string; readonly reason: ReleaseReason }
+    }
   | { readonly ok: false; readonly error: string }
 
 /**
@@ -203,7 +213,74 @@ export function parseRelease(raw: unknown): ReleaseValidation {
   if (!isExposedEnvVar(envVar)) {
     return { ok: false, error: 'release.variable must look like DSH_SECRET_OPENAI' }
   }
+  // The reason is diagnostic only: it decides which history event is recorded,
+  // never whether the record is dropped. A caller that names none means the
+  // human pressed discard, which is what every caller did before this round.
+  const rawReason = record.reason
+  if (rawReason !== undefined && !isReleaseReason(rawReason)) {
+    return { ok: false, error: 'release.reason must be "discarded" or "withdrawn"' }
+  }
+  return { ok: true, value: { sessionId, envVar, reason: rawReason === undefined ? 'discarded' : rawReason } }
+}
+
+/** One validated adopt request: which stored secret to register for a session. */
+export type AdoptValidation =
+  | { readonly ok: true; readonly value: { readonly sessionId: string; readonly envVar: string } }
+  | { readonly ok: false; readonly error: string }
+
+/**
+ * Validate one adopt submission.
+ *
+ * Adopting is the `@` menu's path for a secret that is already durable in the
+ * credential store but is not registered for this session: the Host resolves the
+ * stored value itself, so the value never crosses the wire in either direction.
+ */
+export function parseAdopt(raw: unknown): AdoptValidation {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ok: false, error: 'adopt must be a JSON object' }
+  }
+  const record = raw as Record<string, unknown>
+  const sessionId = trimmedString(record.sessionId)
+  if (sessionId === undefined) return { ok: false, error: 'adopt.sessionId is required' }
+  const envVar = trimmedString(record.variable)
+  if (envVar === undefined) return { ok: false, error: 'adopt.variable is required' }
+  if (!isExposedEnvVar(envVar)) {
+    return { ok: false, error: 'adopt.variable must look like DSH_SECRET_OPENAI' }
+  }
   return { ok: true, value: { sessionId, envVar } }
+}
+
+/** The session id one read-only query asks about, or undefined. */
+export function sessionIdQuery(raw: unknown): string | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+  return trimmedString((raw as Record<string, unknown>).sessionId)
+}
+
+/** The history entry as the wire carries it: rebuilt field by field. */
+export function historyView(entry: SecretHistoryEntry): SecretHistoryEntry {
+  return {
+    at: entry.at,
+    event: entry.event,
+    variable: entry.variable,
+    name: entry.name,
+    label: entry.label,
+    scope: entry.scope,
+    source: entry.source,
+    ...(entry.anchorSeq === undefined ? {} : { anchorSeq: entry.anchorSeq }),
+    ...(entry.replaced === undefined ? {} : { replaced: entry.replaced }),
+  }
+}
+
+/** One available row as the wire carries it: rebuilt field by field. */
+export function availableView(entry: SecretAvailableEntry): SecretAvailableEntry {
+  return {
+    variable: entry.variable,
+    name: entry.name,
+    label: entry.label,
+    scope: entry.scope,
+    state: entry.state,
+    source: entry.source,
+  }
 }
 
 /** The session id one attached-list query asks about, or undefined. */

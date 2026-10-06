@@ -11,6 +11,7 @@ import { AttachStore } from './attach.ts'
 import { assertConfig, Config, type SecretConfig } from './config.ts'
 import { EnvContributorRegistry } from './envs.ts'
 import { GrantStore } from './grants.ts'
+import { HistoryStore } from './history.ts'
 import { installAttachBinding, noteSourcesOn, type AttachNoteReader } from './inject.ts'
 import { registerSecretRoutes } from './routes.ts'
 import { SecretService } from './service.ts'
@@ -40,6 +41,9 @@ export function apply(ctx: Context, config: SecretConfig): void {
 
   const grants = new GrantStore()
   const envs = new EnvContributorRegistry(ctx, grants)
+  // The history is memory-only, session-scoped, and bounded: it is the one
+  // place a released, discarded, expired or revoked entry still exists.
+  const history = new HistoryStore({ capacity: config.maxHistoryPerSession })
   const attachments = new AttachStore({
     ttlMs: config.attachTtlMs,
     capacity: config.maxAttachmentsPerSession,
@@ -49,6 +53,12 @@ export function apply(ctx: Context, config: SecretConfig): void {
         clearTimeout(timer)
       }
     },
+    // Only a TTL expiry lands in the history from here: every explicit removal
+    // is recorded by the caller that asked for it (with its own reason), and the
+    // binding's own consumption of a staged entry is not a loss at all.
+    onDrop: (sessionId, envVar, reason) => {
+      service.noteDropped(sessionId, envVar, reason)
+    },
   })
   const service = new SecretService(
     {
@@ -57,6 +67,7 @@ export function apply(ctx: Context, config: SecretConfig): void {
       authorization: authorizationPort(ctx),
       envs,
       attachments,
+      history,
       classifyCaller: (agent) => classifyCaller(ctx, agent),
       sessionOf: (agent) => sessionOf(ctx, agent),
       sessionById: (id) => sessionById(ctx, id),
@@ -77,11 +88,13 @@ export function apply(ctx: Context, config: SecretConfig): void {
   ctx.on('session/disposed', (session) => {
     grants.forget(String(session.id))
     service.forgetAttachments(String(session.id))
+    history.forget(String(session.id))
   })
   // A dialog can never outlive the plugin that owns it.
   ctx.effect(() => () => {
     service.pending.abortAll()
     attachments.disposeAll()
+    history.disposeAll()
   })
 
   // The reverse direction: a secret the human attached to their own message.

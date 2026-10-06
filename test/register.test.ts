@@ -12,7 +12,16 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { apply, Config, inject, name } from '../src/index.ts'
-import { ATTACH_PATH, ATTACHED_PATH, ANSWER_PATH, PENDING_PATH, RELEASE_PATH } from '../src/routes.ts'
+import {
+  ADOPT_PATH,
+  ATTACH_PATH,
+  ATTACHED_PATH,
+  AVAILABLE_PATH,
+  ANSWER_PATH,
+  HISTORY_PATH,
+  PENDING_PATH,
+  RELEASE_PATH,
+} from '../src/routes.ts'
 
 const SECRET = 'sk-register-DO-NOT-LEAK'
 const ENV_VAR = 'DSH_SECRET_OPENAI'
@@ -320,11 +329,18 @@ test('plugin metadata, Config defaults and apply wiring', () => {
     const found = registered.find((route) => route.path === expected.path)
     assert.deepEqual(found, expected)
   }
+  // Round 4 appended three routes to the five the previous rounds pinned:
+  // the history flow, the `@` menu's available list, and the adopt write. The
+  // original five are unchanged, in the same order; this list is the original
+  // assertion extended by the three new entries.
   assert.deepEqual(registered, [
     { path: PENDING_PATH, methods: ['GET'] },
     { path: ATTACHED_PATH, methods: ['GET'] },
     { path: ATTACH_PATH, methods: ['POST'] },
     { path: RELEASE_PATH, methods: ['POST'] },
+    { path: HISTORY_PATH, methods: ['GET'] },
+    { path: AVAILABLE_PATH, methods: ['GET'] },
+    { path: ADOPT_PATH, methods: ['POST'] },
     { path: ANSWER_PATH, methods: ['POST'] },
   ])
   assert.equal(harness.listeners.get('session/disposed')?.length, 1)

@@ -1,5 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis'
-import { attachedSessionId, jsonResponse } from './protocol.ts'
+import { attachedSessionId, jsonResponse, sessionIdQuery } from './protocol.ts'
 import type { SecretService } from './service.ts'
 
 /** Exact `/api` route the dialog polls for waiting interactions. */
@@ -12,14 +12,22 @@ export const ATTACH_PATH = '/api/secret.attach'
 export const RELEASE_PATH = '/api/secret.release'
 /** Exact `/api` route the capsule reads its own session's attachments from. */
 export const ATTACHED_PATH = '/api/secret.attached'
+/** Exact `/api` route the capsule reads one session's attachment history from. */
+export const HISTORY_PATH = '/api/secret.history'
+/** Exact `/api` route the `@` menu reads this session's usable secrets from. */
+export const AVAILABLE_PATH = '/api/secret.available'
+/** Exact `/api` route one durably stored secret is registered for a session on. */
+export const ADOPT_PATH = '/api/secret.adopt'
 
 /**
- * Mount this plugin's two authenticated routes on the shared API channel.
+ * Mount this plugin's authenticated routes on the shared API channel.
  *
- * Both live inside Connection's trust fence (loopback/trusted Host, same-origin
- * markers, signed browser cookie), so only the page that already talks to this
- * Harness can list or answer a request. The value travels only in the answer
- * POST body — never a query string, never a URL, never a response body.
+ * All of them live inside Connection's trust fence (loopback/trusted Host,
+ * same-origin markers, signed browser cookie), so only the page that already
+ * talks to this Harness can list, read history from, adopt or answer a request.
+ * The value travels only in the attach/answer POST bodies — never a query
+ * string, never a URL, never a response body; the read-only routes carry names,
+ * scopes and states only.
  */
 export function registerSecretRoutes(ctx: Context, service: SecretService): void {
   ctx.effect(() => {
@@ -75,6 +83,47 @@ export function registerSecretRoutes(ctx: Context, service: SecretService): void
           const outcome = service.release(body)
           return outcome.ok
             ? jsonResponse({ ok: true, released: outcome.released, state: outcome.state })
+            : jsonResponse({ ok: false, error: outcome.error }, outcome.status)
+        },
+      }),
+      ctx.connection.fetch.register({
+        path: HISTORY_PATH,
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: (request) => {
+          const sessionId = sessionIdQuery({ sessionId: new URL(request.url).searchParams.get('sessionId') })
+          if (sessionId === undefined) {
+            return Promise.resolve(jsonResponse({ ok: false, error: 'history.sessionId is required' }, 400))
+          }
+          return Promise.resolve(jsonResponse({ ok: true, entries: service.historyFor(sessionId).entries }))
+        },
+      }),
+      ctx.connection.fetch.register({
+        path: AVAILABLE_PATH,
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          const sessionId = sessionIdQuery({ sessionId: new URL(request.url).searchParams.get('sessionId') })
+          if (sessionId === undefined) {
+            return jsonResponse({ ok: false, error: 'available.sessionId is required' }, 400)
+          }
+          return jsonResponse({ ok: true, entries: await service.available(sessionId) })
+        },
+      }),
+      ctx.connection.fetch.register({
+        path: ADOPT_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          let body: unknown
+          try {
+            body = await request.json()
+          } catch {
+            return jsonResponse({ ok: false, error: 'adopt body must be JSON' }, 400)
+          }
+          const outcome = await service.adopt(body)
+          return outcome.ok
+            ? jsonResponse({ ok: true, ...outcome.outcome })
             : jsonResponse({ ok: false, error: outcome.error }, outcome.status)
         },
       }),
