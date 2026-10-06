@@ -12,6 +12,7 @@
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { Context } from '@deepseek-ai/cordis'
 import { effectiveEnvVar } from '../src/naming.ts'
 
 const CALL_ID = 'call-card-1'
@@ -128,16 +129,47 @@ const plugin = (module_ as LoadedModule).factory(() => renderer.react)
 
 const definitions: unknown[] = []
 const registrations: { name: string; key?: string; priority?: number; component: unknown }[] = []
-plugin.apply({
-  uiConversation: { events: { register: (definition: unknown) => definitions.push(definition) } },
-  slots: {
+
+// Mount the artifact into a real cordis tree, the way the web entry point does:
+// sibling providers for the services it declares, the artifact's own `inject`
+// list as the fiber's gate. No optional service is provided here, so this also
+// pins that a client without a locale face, a trigger registry and a session
+// controller still comes up — a hand-rolled context object has no "read the
+// un-injected service and throw" semantics, which is exactly how the entry broke.
+const root = new Context()
+root.plugin((ctx) => {
+  ctx.provide('uiConversation', { events: { register: (definition: unknown) => definitions.push(definition) } })
+})
+root.plugin((ctx) => {
+  ctx.provide('slots', {
     inject: (_owner: string, declare: () => unknown) => declare(),
     register: (options: Record<string, unknown>, component: unknown) => {
       registrations.push({ ...(options as { name: string }), component })
       return () => undefined
     },
+  })
+})
+let applied = false
+let startError: unknown
+const startFiber = root.plugin({
+  inject: [...plugin.inject],
+  apply(ctx: unknown) {
+    try {
+      plugin.apply(ctx)
+      applied = true
+    } catch (error) {
+      startError = error
+    }
   },
 })
+await startFiber
+// The providers start on their own microtasks, so wait for the outcome.
+for (let attempt = 0; attempt < 25 && !applied && startError === undefined; attempt += 1) {
+  await new Promise((resolve) => {
+    setTimeout(resolve, 0)
+  })
+}
+assert.equal(startError, undefined, `the client artifact threw on startup: ${String(startError)}`)
 
 const seam = (globalThis as Record<string, unknown>).__cordisSecretClient as Record<string, any>
 

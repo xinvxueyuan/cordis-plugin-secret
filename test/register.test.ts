@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { apply, Config, inject, name } from '../src/index.ts'
-import { ANSWER_PATH, PENDING_PATH } from '../src/routes.ts'
+import { ATTACH_PATH, ATTACHED_PATH, ANSWER_PATH, PENDING_PATH, RELEASE_PATH } from '../src/routes.ts'
 
 const SECRET = 'sk-register-DO-NOT-LEAK'
 const ENV_VAR = 'DSH_SECRET_OPENAI'
@@ -310,13 +310,23 @@ test('plugin metadata, Config defaults and apply wiring', () => {
   // The plugin's own human timeout must fire before any cooperative call timeout.
   assert.equal((tool as { timeoutMs?: number }).timeoutMs, defaults.requestTimeoutMs + 30000)
 
-  assert.deepEqual(
-    harness.routes.map((route) => ({ path: route.path, methods: [...route.methods] })),
-    [
-      { path: PENDING_PATH, methods: ['GET'] },
-      { path: ANSWER_PATH, methods: ['POST'] },
-    ],
-  )
+  const registered = harness.routes.map((route) => ({ path: route.path, methods: [...route.methods] }))
+  // The agent-ask direction's two routes are asserted exactly as before: same
+  // paths, same methods. The reverse direction only appends to the list.
+  for (const expected of [
+    { path: PENDING_PATH, methods: ['GET'] },
+    { path: ANSWER_PATH, methods: ['POST'] },
+  ]) {
+    const found = registered.find((route) => route.path === expected.path)
+    assert.deepEqual(found, expected)
+  }
+  assert.deepEqual(registered, [
+    { path: PENDING_PATH, methods: ['GET'] },
+    { path: ATTACHED_PATH, methods: ['GET'] },
+    { path: ATTACH_PATH, methods: ['POST'] },
+    { path: RELEASE_PATH, methods: ['POST'] },
+    { path: ANSWER_PATH, methods: ['POST'] },
+  ])
   assert.equal(harness.listeners.get('session/disposed')?.length, 1)
   assert.equal(harness.contributors.length, 0, 'no variable is declared before the first approval')
 })

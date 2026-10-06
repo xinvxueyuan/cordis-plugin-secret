@@ -1,5 +1,5 @@
-import { isSecretScope } from './naming.ts'
-import type { ModalAnswer, PendingView, SecretScope } from './types.ts'
+import { deriveEnvVar, isCredentialName, isExposedEnvVar, isSecretScope } from './naming.ts'
+import type { ModalAnswer, PendingView, SecretAttachInput, SecretScope } from './types.ts'
 
 /** Upper bound on a rejection reason echoed back by the dialog. */
 const MAX_REASON = 500
@@ -110,6 +110,106 @@ export function pendingView(request: {
     alreadyConfigured: request.alreadyConfigured,
     createdAt: request.createdAt,
   }
+}
+
+/** One validated attach submission: the input plus the session it belongs to. */
+export interface AttachRequestValue extends SecretAttachInput {
+  readonly sessionId: string
+}
+
+/** Why one attach submission was refused, or the validated input. */
+export type AttachValidation =
+  | { readonly ok: true; readonly value: AttachRequestValue }
+  | { readonly ok: false; readonly error: string }
+
+/** One validated release request. */
+export type ReleaseValidation =
+  | { readonly ok: true; readonly value: { readonly sessionId: string; readonly envVar: string } }
+  | { readonly ok: false; readonly error: string }
+
+/**
+ * Validate one attach submission field by field, so the value can never be
+ * joined by fields the caller did not intend and every rejection is our own
+ * fixed wording.
+ *
+ * The value itself is only length-checked here: it is the one field this plugin
+ * must never inspect, compare, log or echo.
+ */
+export function parseAttach(raw: unknown): AttachValidation {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ok: false, error: 'attach must be a JSON object' }
+  }
+  const record = raw as Record<string, unknown>
+  const sessionId = trimmedString(record.sessionId)
+  if (sessionId === undefined) return { ok: false, error: 'attach.sessionId is required' }
+
+  const name = trimmedString(record.name)
+  if (name === undefined) return { ok: false, error: 'attach.name is required' }
+  if (!isCredentialName(name)) {
+    return { ok: false, error: `attach.name "${name}" must be lowercase kebab/snake, e.g. "openai" or "openai-key"` }
+  }
+
+  if (!isSecretScope(record.scope)) {
+    return { ok: false, error: 'attach.scope must be "session" or "persistent"' }
+  }
+
+  const value = typeof record.value === 'string' ? record.value : undefined
+  if (value === undefined || value.length === 0) {
+    return { ok: false, error: 'attach.value is required' }
+  }
+  if (value.length > MAX_VALUE) {
+    return { ok: false, error: `attach.value must be at most ${String(MAX_VALUE)} characters` }
+  }
+
+  const rawEnvVar = record.envVar
+  let envVar = deriveEnvVar(name)
+  if (rawEnvVar !== undefined && rawEnvVar !== null && rawEnvVar !== '') {
+    const candidate = trimmedString(rawEnvVar)
+    if (candidate === undefined) {
+      return { ok: false, error: 'attach.envVar, when present, must be a non-empty string' }
+    }
+    envVar = candidate
+  }
+  if (!isExposedEnvVar(envVar)) {
+    return {
+      ok: false,
+      error: `attach.envVar "${envVar}" must look like DSH_SECRET_OPENAI and must not be reserved by the Harness`,
+    }
+  }
+
+  return {
+    ok: true,
+    value: {
+      sessionId,
+      name,
+      label: trimmedString(record.label) ?? name,
+      scope: record.scope,
+      envVar,
+      value,
+    },
+  }
+}
+
+/** Validate one release request: the session plus the exposed variable to drop. */
+export function parseRelease(raw: unknown): ReleaseValidation {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ok: false, error: 'release must be a JSON object' }
+  }
+  const record = raw as Record<string, unknown>
+  const sessionId = trimmedString(record.sessionId)
+  if (sessionId === undefined) return { ok: false, error: 'release.sessionId is required' }
+  const envVar = trimmedString(record.variable)
+  if (envVar === undefined) return { ok: false, error: 'release.variable is required' }
+  if (!isExposedEnvVar(envVar)) {
+    return { ok: false, error: 'release.variable must look like DSH_SECRET_OPENAI' }
+  }
+  return { ok: true, value: { sessionId, envVar } }
+}
+
+/** The session id one attached-list query asks about, or undefined. */
+export function attachedSessionId(raw: unknown): string | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+  return trimmedString((raw as Record<string, unknown>).sessionId)
 }
 
 /** JSON response helper: no-store, JSON, and never an echoed value. */

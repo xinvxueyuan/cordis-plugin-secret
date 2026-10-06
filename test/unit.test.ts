@@ -5,6 +5,7 @@ import { findAnchorSeq } from '../src/anchor.ts'
 import { approvedResult, mapNonApproved, planGrant } from '../src/decisions.ts'
 import { EnvContributorRegistry, agentIdOf } from '../src/envs.ts'
 import { GrantStore, type GrantSessionLike } from '../src/grants.ts'
+import { AttachStore } from '../src/attach.ts'
 import { deriveEnvVar, effectiveEnvVar, recordKey, validateRequest } from '../src/naming.ts'
 import { PendingStore, SecretAbortedError } from '../src/pending.ts'
 import { parseAnswer } from '../src/protocol.ts'
@@ -125,12 +126,23 @@ function harness(
     }
   let counter = 0
   const service = new SecretService({
-    config: { requestTimeoutMs: 60000, maxPendingRequests: options.maxPendingRequests ?? 4 },
+    config: {
+      requestTimeoutMs: 60000,
+      maxPendingRequests: options.maxPendingRequests ?? 4,
+      attachTtlMs: 1800000,
+      maxAttachmentsPerSession: 8,
+    },
     credentials,
     authorization,
     envs: { ensure: (envVar) => calls.push(`ensure:${envVar}`) },
+    attachments: new AttachStore({
+      ttlMs: 1800000,
+      capacity: 8,
+      schedule: () => () => undefined,
+    }),
     classifyCaller: () => options.classify ?? 'live-root',
     sessionOf: () => session,
+    sessionById: () => session,
     anchorSessionOf: () => session,
     now: () => 1700000000000,
     schedule: options.schedule ?? (() => () => undefined),

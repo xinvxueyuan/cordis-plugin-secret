@@ -28,6 +28,21 @@ export function isSecretScope(value: unknown): value is SecretScope {
   return typeof value === 'string' && (SCOPES as readonly string[]).includes(value)
 }
 
+/** Whether a raw value is a well-formed credential key. */
+export function isCredentialName(value: unknown): value is string {
+  return typeof value === 'string' && NAME_PATTERN.test(value)
+}
+
+/** Whether a raw value is an exposed variable name this plugin may own. */
+export function isExposedEnvVar(value: unknown): value is string {
+  return typeof value === 'string' && ENV_VAR_PATTERN.test(value) && !RESERVED_ENV_VARS.has(value)
+}
+
+/** Whether a credential key derives a variable the harness itself reserves. */
+export function derivesReservedEnvVar(name: string): boolean {
+  return RESERVED_ENV_VARS.has(deriveEnvVar(name))
+}
+
 /** Derive the default exposed variable name from a credential key. */
 export function deriveEnvVar(name: string): string {
   return SECRET_PREFIX + name.replace(/[-_]+/gu, '_').toUpperCase()
@@ -62,6 +77,54 @@ function nonEmptyString(raw: unknown): string | undefined {
   if (typeof raw !== 'string') return undefined
   const trimmed = raw.trim()
   return trimmed.length > 0 ? trimmed : undefined
+}
+
+/** Glyph that carries one attached secret, by name, inside ordinary message text. */
+export const MARKER_PREFIX = '@'
+
+/**
+ * Marker matcher: an exposed variable name at a line start or after whitespace.
+ *
+ * The boundary discipline is deliberately the composer editor's own
+ * (`TEXT_REF_RE = /(^|\s)([/@])([\w-]+)/g`), so the token the editor decorates
+ * and the token this plugin binds are always the same one.
+ */
+const MARKER_PATTERN = /(^|\s)@(DSH_SECRET_[A-Z][A-Z0-9_]*)/gu
+
+/** The marker one attached secret travels as. Never a value. */
+export function markerFor(envVar: string): string {
+  return `${MARKER_PREFIX}${envVar}`
+}
+
+/** The model-facing form of one marker: `[secret DSH_SECRET_X]`. Never a value. */
+export function modelFormFor(envVar: string): string {
+  return `[secret ${envVar}]`
+}
+
+/** Every distinct attached-secret marker in one text, in first-seen order. */
+export function parseMarkers(text: string): readonly string[] {
+  const found: string[] = []
+  MARKER_PATTERN.lastIndex = 0
+  let match = MARKER_PATTERN.exec(text)
+  while (match !== null) {
+    const envVar = match[2]
+    if (envVar !== undefined && !found.includes(envVar)) found.push(envVar)
+    match = MARKER_PATTERN.exec(text)
+  }
+  return found
+}
+
+/**
+ * Replace every marker with its model-facing form.
+ *
+ * A pure function of the text alone: it never consults whether this session
+ * still holds the variable. That is what keeps the model-side form stable across
+ * a reload, a replay and a fork — the same logged message always yields the same
+ * model text, and no `@`-prefixed token survives into the request to be mistaken
+ * for a file path.
+ */
+export function rewriteMarkers(text: string): string {
+  return text.replace(MARKER_PATTERN, (_whole, lead: string, envVar: string) => `${lead}${modelFormFor(envVar)}`)
 }
 
 /**

@@ -142,3 +142,46 @@ export type SecretPresentationMeta = {
   /** Present only for `other`: the human's free-text instruction, as the agent receives it. */
   readonly text?: string
 }
+
+/**
+ * What one human submits when they attach a secret to the message they are
+ * about to send. The value lives in this request body and in the Host's staged
+ * record, and nowhere else. Type-level only: nothing here is imported at runtime.
+ */
+export interface SecretAttachInput {
+  /** Credential key: lowercase kebab/snake, e.g. `openai`. */
+  readonly name: string
+  /** Human-facing title; defaults to the key. */
+  readonly label: string
+  /** Where an approved secret lives. Chosen in the capsule; `session` by default. */
+  readonly scope: SecretScope
+  /** The exposed variable name (`DSH_SECRET_*`). */
+  readonly envVar: string
+  /** The value the human typed. */
+  readonly value: string
+}
+
+/** Lifecycle of one attached secret as the capsule reports it. */
+export type SecretAttachState =
+  /** Registered and waiting for the message that carries it. Nothing is exposed yet. */
+  | 'staged'
+  /** Bound to a durable message; the variable is live for this session. */
+  | 'bound'
+
+/** The capsule-facing view of one attached secret. Never carries a value. */
+export interface SecretAttachedView {
+  readonly variable: string
+  readonly name: string
+  readonly label: string
+  readonly scope: SecretScope
+  readonly state: SecretAttachState
+  readonly createdAt: number
+}
+
+/** The value-free outcome of one successful attach. */
+export interface SecretAttachOutcome {
+  readonly variable: string
+  readonly scope: SecretScope
+  /** True when this replaced an earlier attach for the same exposed variable. */
+  readonly replaced: boolean
+}

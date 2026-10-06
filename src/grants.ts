@@ -30,8 +30,14 @@ export interface Grant {
   readonly source: 'store' | 'entered'
   /** Sequence of the approval-anchoring event (the assistant message that called the tool). */
   readonly anchorSeq: number
-  /** Tool call identity that produced this grant. */
-  readonly callId: string
+  /**
+   * Tool call identity that produced this grant, when a tool call did.
+   *
+   * A grant a human attached to their own message has no tool call behind it, and
+   * a synthetic identity would be a lie the anchor check cannot verify, so the
+   * field is absent there instead.
+   */
+  readonly callId?: string
   /**
    * `surface.replaceGeneration` observed at approval time.
    *

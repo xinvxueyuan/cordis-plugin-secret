@@ -55,6 +55,14 @@ export function anchorSessionOf(ctx: Context, agent: unknown): AnchorSessionLike
   return ctx.sessions.get(id as SessionId)
 }
 
+/**
+ * One live session addressed by id: what an attach submission names, and what
+ * the capsule's own-session attachment list is resolved against.
+ */
+export function sessionById(ctx: Context, id: string): GrantSessionLike | undefined {
+  return ctx.sessions.get(id as SessionId)
+}
+
 /** The credential service, seen through this plugin's port. */
 export function credentialsPort(ctx: Context): CredentialsPort {
   const credentials = ctx.credentials

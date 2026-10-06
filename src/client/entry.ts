@@ -24,6 +24,11 @@
  * the body of one authenticated POST to this plugin's own `/api` route and
  * nowhere else: never a query string, never a URL, never the session log, never
  * a rendered attribute.
+ *
+ * The reverse direction's optional collaborators — a locale face, the
+ * input-trigger registry, the session controller — are never hard dependencies:
+ * they are reached through cordis's optional seat (`ctx.inject([...], cb)`), so
+ * a web client that lacks one degrades instead of failing the whole entry.
  */
 
 /** Just enough React surface for this one component. */
@@ -49,6 +54,17 @@ interface ClientContextLike {
   readonly uiConversation: {
     readonly events: { register(definition: unknown): unknown }
   }
+  /**
+   * Cordis's own optional-dependency seat.
+   *
+   * The callback runs with a context that has exactly `names` in scope, once
+   * every one of them is available; a name that never appears simply never runs
+   * it. This is the only way this half may touch a service the environment may
+   * not have: reading an undeclared service off `ctx` throws inside the context
+   * proxy (`cannot get property "<name>" without inject`) and fails the whole
+   * client entry, while a missing optional service must only degrade.
+   */
+  inject(names: readonly string[], callback: (scoped: OptionalServicesLike) => void): unknown
 }
 
 type Scope = 'session' | 'persistent'
@@ -1103,6 +1119,879 @@ function SecretRequestCard(props: {
   )
 }
 
+// ---------------------------------------------------------------------------
+// The reverse direction: a secret the human attaches to their own message.
+//
+// The value lives in exactly two places here: the capsule's masked input state,
+// and the body of one POST to this plugin's own route. It is never rendered,
+// never written to an attribute, never put in the draft, and never logged.
+// ---------------------------------------------------------------------------
+
+/** Where the entry button sits: immediately right of the composer's mode group. */
+const ATTACH_SLOT = 'conversation.input.left'
+/** Where the capsule floats: above the composer card, the `@` menu's own seat. */
+const CAPSULE_SLOT = 'conversation.input.overlay'
+/** Locale namespace of the attach surface, when the runtime has a locale face. */
+const ATTACH_NS = 'secretAttach'
+const ATTACH_PATH = '/api/secret.attach'
+const RELEASE_PATH = '/api/secret.release'
+const ATTACHED_PATH = '/api/secret.attached'
+/** Reference source name this plugin registers. It is also the chip's DOM anchor. */
+const SECRET_SOURCE = 'secret'
+/** Credential-key shape, mirrored from the Host so the form refuses early. */
+const ATTACH_KEY_RE = /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$/u
+/**
+ * Marker matcher, kept identical to the Host's (`MARKER_RE`): a variable name at
+ * a line start or after whitespace. A test drives the same table through both.
+ */
+const MARKER_RE = /(^|\s)@(DSH_SECRET_[A-Z][A-Z0-9_]*)/gu
+
+/** The dictionary of the attach surface. The zh table is also the fallback. */
+const ATTACH_ZH: Record<string, string> = {
+  toggle: '附密钥',
+  toggleOpen: '收起附密钥',
+  toggleHint: '把一枚密钥附加到这条消息：明文不进入对话，Agent 只会拿到变量名',
+  fillTitle: '附加一枚密钥',
+  detailTitle: '随这条消息附加的密钥',
+  keyLabel: '凭据键',
+  keyPlaceholder: 'openai',
+  keyHint: '小写 kebab/snake，例如 openai、openai-key；决定变量名 DSH_SECRET_*',
+  labelLabel: '标题',
+  labelPlaceholder: 'OpenAI API Key（可选）',
+  valueLabel: '密钥内容',
+  valuePlaceholder: '粘贴密钥…',
+  show: '显示',
+  hide: '隐藏',
+  scopeLabel: '保存方式',
+  persistent: '持久保存到凭据库',
+  persistentHint: '写入本机凭据库，之后所有会话都可复用。',
+  session: '仅本次会话有效',
+  sessionHint: '只保存在本次会话内存中，会话结束即失效。',
+  current: '当前选择：',
+  variableLabel: '变量名',
+  stateLabel: '状态',
+  stateStaged: '已登记，等待发送',
+  stateBound: '已绑定到这条消息',
+  statusUnknown: '状态未知（无法连接宿主）',
+  stagedNote: '未发送前不会注入任何变量；发送后该变量在本会话的后续 shell 中可用。',
+  boundNote: '已绑定到这条消息：回退该消息即失效。',
+  insert: '插入到光标处',
+  cancel: '取消',
+  close: '关闭',
+  discard: '丢弃',
+  busy: '正在登记…',
+  insertedChip: '已在光标处插入胶囊',
+  insertedText: '宿主未提供真 chip，已插入可点击的引用文本',
+  manualLead: '请在草稿中手动输入 ',
+  footerLead: '明文不会交给模型：这条消息只会带上变量名',
+  footerTail: '。',
+  badKey: '凭据键必须是小写 kebab/snake，例如 openai。',
+  noValue: '请先填入密钥内容。',
+}
+const ATTACH_EN: Record<string, string> = {
+  toggle: 'Attach secret',
+  toggleOpen: 'Close attach panel',
+  toggleHint: 'Attach a secret to this message: the value stays out of the conversation and the agent only receives the variable name',
+  fillTitle: 'Attach a secret',
+  detailTitle: 'Secret attached to this message',
+  keyLabel: 'Credential key',
+  keyPlaceholder: 'openai',
+  keyHint: 'Lowercase kebab/snake, e.g. openai or openai-key; decides the DSH_SECRET_* variable name',
+  labelLabel: 'Title',
+  labelPlaceholder: 'OpenAI API Key (optional)',
+  valueLabel: 'Secret value',
+  valuePlaceholder: 'Paste the secret…',
+  show: 'Show',
+  hide: 'Hide',
+  scopeLabel: 'Storage',
+  persistent: 'Save to the credential store',
+  persistentHint: 'Written to this machine’s credential store and reusable in later sessions.',
+  session: 'This session only',
+  sessionHint: 'Held in this session’s memory only; it expires when the session ends.',
+  current: 'Selected: ',
+  variableLabel: 'Variable',
+  stateLabel: 'State',
+  stateStaged: 'Registered, waiting to be sent',
+  stateBound: 'Bound to this message',
+  statusUnknown: 'State unknown (the host is unreachable)',
+  stagedNote: 'Nothing is injected until you send it; afterwards the variable is available to this session’s shells.',
+  boundNote: 'Bound to this message: rewinding the message revokes it.',
+  insert: 'Insert at the caret',
+  cancel: 'Cancel',
+  close: 'Close',
+  discard: 'Discard',
+  busy: 'Registering…',
+  insertedChip: 'Inserted the capsule at the caret',
+  insertedText: 'The host offers no real chip, so a clickable reference token was inserted',
+  manualLead: 'Type this into the draft yourself: ',
+  footerLead: 'The value never reaches the model: this message carries the variable name only',
+  footerTail: '.',
+  badKey: 'The credential key must be lowercase kebab/snake, e.g. openai.',
+  noValue: 'Enter the secret value first.',
+}
+
+/**
+ * One fixed sentence per refusal. The host's own error text is never echoed —
+ * not because it is untrusted, but because a credential backend's text can quote
+ * the value it was handed, and one rule with no exceptions is easier to keep.
+ */
+const ATTACH_FAILURE: Record<number, string> = {
+  400: '这次附加的字段不合法，未登记。',
+  404: '找不到该会话，未登记。',
+  409: '本会话登记的附加密钥已达上限，未登记。',
+  500: '凭据库写入失败，未登记。',
+}
+const ATTACH_FAILURE_UNKNOWN = '宿主拒绝了这次附加，未登记。'
+const ATTACH_UNREACHABLE = '暂时无法连接宿主，未登记。'
+
+/** Class-name prefix of the attach surface, distinct from the card's. */
+const AP = 'sra'
+const A = {
+  btn: `${AP}_btn`,
+  btnOn: `${AP}_btnOn`,
+  badge: `${AP}_badge`,
+  glyph: `${AP}_glyph`,
+  box: `${AP}_box`,
+  head: `${AP}_head`,
+  title: `${AP}_title`,
+  close: `${AP}_close`,
+  body: `${AP}_body`,
+  field: `${AP}_field`,
+  label: `${AP}_label`,
+  input: `${AP}_input`,
+  inputRow: `${AP}_inputRow`,
+  toggle: `${AP}_toggle`,
+  scope: `${AP}_scope`,
+  option: `${AP}_option`,
+  radio: `${AP}_radio`,
+  optionBody: `${AP}_optionBody`,
+  optionTitle: `${AP}_optionTitle`,
+  optionHint: `${AP}_optionHint`,
+  notice: `${AP}_notice`,
+  actions: `${AP}_actions`,
+  action: `${AP}_action`,
+  foot: `${AP}_foot`,
+  code: `${AP}_code`,
+  detail: `${AP}_detail`,
+  row: `${AP}_row`,
+  rowLabel: `${AP}_rowLabel`,
+  rowValue: `${AP}_rowValue`,
+}
+
+const ATTACH_CSS = `
+.${A.btn}{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;border-radius:999px;align-items:center;gap:5px;height:28px;padding:0 10px;font-size:12px;line-height:16px;display:inline-flex}
+.${A.btn}:hover{border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary)}
+.${A.btn}[aria-pressed=true]{background:var(--dsw-alias-button-ghost-active-fill);border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary)}
+.${A.btn}:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
+.${A.glyph}{font-size:12px;line-height:1}
+.${A.badge}{background:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary-foreground);border-radius:999px;min-width:16px;padding:0 5px;font-size:10px;line-height:16px;text-align:center}
+.${A.box}{box-sizing:border-box;box-shadow:var(--dsw-elevation-prominent);background:var(--dsw-alias-bg-module-platform);border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-panel,12px);flex-direction:column;gap:10px;padding:12px;display:flex;position:absolute;bottom:calc(100% + 4px);left:0;right:0;z-index:100}
+.${A.head}{align-items:center;gap:8px;display:flex}
+.${A.title}{color:var(--dsw-alias-label-primary);flex:auto;font-size:13px;font-weight:600;line-height:20px}
+.${A.close}{background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-label-secondary);cursor:pointer;font:inherit;font-size:12px;line-height:20px;padding:1px 8px}
+.${A.close}:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.${A.body}{flex-direction:column;gap:8px;display:flex;min-width:0}
+.${A.field}{flex-direction:column;gap:6px;display:flex;min-width:0}
+.${A.label}{color:var(--dsw-alias-label-caption);font-size:12px;line-height:18px}
+.${A.inputRow}{align-items:center;gap:8px;display:flex}
+.${A.input}{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-label-primary);flex:auto;font:inherit;font-size:13px;height:32px;min-width:0;outline:none;padding:0 10px}
+.${A.input}::placeholder{color:var(--dsw-alias-label-caption)}
+.${A.input}:focus{border-color:var(--dsw-alias-state-business-primary)}
+.${A.toggle}{background:0 0;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-label-secondary);cursor:pointer;flex:none;font:inherit;font-size:13px;height:32px;padding:0 12px}
+.${A.toggle}:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.${A.scope}{flex-direction:column;gap:6px;display:flex}
+.${A.option}{align-items:flex-start;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md);cursor:pointer;gap:8px;padding:8px 10px;display:flex;transition:background-color .12s,border-color .12s}
+.${A.option}:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.${A.option}[data-on]{background:var(--dsw-alias-button-ghost-active-fill);border-color:var(--dsw-alias-state-business-primary)}
+.${A.radio}{accent-color:var(--dsw-alias-state-business-primary);flex:none;margin:3px 0 0}
+.${A.optionBody}{flex-direction:column;display:flex;min-width:0}
+.${A.optionTitle}{color:var(--dsw-alias-label-primary);font-size:13px;line-height:20px}
+.${A.optionHint}{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.${A.notice}{background:var(--dsw-alias-bg-layer-2);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;margin:0;overflow-wrap:anywhere;padding:6px 10px}
+.${A.notice}[data-kind=error]{color:var(--dsw-alias-state-error-primary)}
+.${A.actions}{flex-wrap:wrap;gap:8px;display:flex}
+.${A.action}{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md);color:var(--dsw-alias-label-primary);cursor:pointer;font:inherit;font-size:13px;height:32px;padding:0 14px}
+.${A.action}:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.${A.action}[data-kind=primary]{background:var(--dsw-alias-button-primary-fill);border-color:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground)}
+.${A.action}:disabled,.${A.input}:disabled,.${A.toggle}:disabled{cursor:default;opacity:.55}
+.${A.row}{align-items:baseline;gap:8px;display:flex;min-width:0}
+.${A.rowLabel}{color:var(--dsw-alias-label-caption);flex:none;font-size:12px;line-height:18px;min-width:56px}
+.${A.rowValue}{color:var(--dsw-alias-label-primary);font-size:13px;line-height:18px;overflow-wrap:anywhere}
+.${A.code}{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-xs);color:var(--dsw-alias-label-secondary);font-family:var(--ds-font-family-code,ui-monospace,monospace);font-size:11px;padding:1px 6px}
+.${A.detail}{flex-direction:column;gap:6px;display:flex}
+.${A.foot}{border-top:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;margin:0;padding-top:10px}
+`
+
+const ATTACH_CSS_TAG_ID = `${PACKAGE_ID}/secret-attach.css`
+
+/** Inject (or refresh) the attach surface's stylesheet once per page. */
+function ensureAttachStyle(): void {
+  if (typeof document === 'undefined') return
+  let tag = document.querySelector(`style[data-plugin-css="${ATTACH_CSS_TAG_ID}"]`)
+  if (tag === null) {
+    tag = document.createElement('style')
+    tag.setAttribute('data-plugin', PACKAGE_ID)
+    tag.setAttribute('data-plugin-css', ATTACH_CSS_TAG_ID)
+    document.head.appendChild(tag)
+  }
+  tag.textContent = ATTACH_CSS
+}
+
+/** The session scope's one bailing event seat, as this half uses it. */
+interface SessionScopeLike {
+  bail?(subject: unknown, name: string, payload: unknown): unknown
+}
+/**
+ * The attach surface's services that a web client may or may not have.
+ *
+ * None of them is a hard dependency: no locale face, no trigger registry and no
+ * session controller must still leave the card, the entry button and the text
+ * fallback working. They are therefore reached only inside a `ctx.inject([...])`
+ * callback, never read off the context directly (see `ClientContextLike`).
+ */
+interface OptionalServicesLike {
+  readonly locale?: { register(namespace: string, dictionaries: Record<string, Record<string, string>>): unknown }
+  readonly inputTriggers?: { registerSource?: (source: unknown) => unknown }
+  readonly sessions?: { scope(id: string): SessionScopeLike | undefined }
+  /** The scoped context's effect seat, so a capture is released with its service. */
+  effect?(execute: () => () => void): unknown
+}
+/** The `sessions` scope reader, bound only while that optional service exists. */
+let sessionsScope: ((sessionId: string) => SessionScopeLike | undefined) | null = null
+
+/** One token span captured from the composer editor. */
+interface TokenSpanLike {
+  readonly start: number
+  readonly end: number
+  readonly draftRev: number
+}
+/** The public session input action face, as this half uses it. */
+interface InputActionsLike {
+  captureInsertion?(): TokenSpanLike
+  insertText?(text: string, span: TokenSpanLike): boolean
+}
+/** The editor's reference insertion, as the frozen contract spells it. */
+interface ReferenceInsertLike {
+  readonly source: string
+  readonly ref: string
+  readonly label: string
+  readonly appearance?: string
+  readonly clipboardText: string
+}
+/** Lifecycle of one attached secret. */
+type AttachState = 'staged' | 'bound'
+/** Everything the capsule shows about one attached secret. Never a value. */
+interface AttachedMeta {
+  readonly variable: string
+  readonly name: string
+  readonly label: string
+  readonly scope: Scope
+  readonly state: AttachState
+  readonly createdAt: number
+}
+/** Which face the capsule shows. `idle` renders nothing at all. */
+type AttachMode =
+  | { readonly kind: 'idle' }
+  | { readonly kind: 'fill' }
+  | { readonly kind: 'detail'; readonly variable: string }
+
+/** Attached secrets per session. Values are never stored here. */
+const attachedBySession = new Map<string, Map<string, AttachedMeta>>()
+const attachedListeners = new Set<() => void>()
+let attachMode: AttachMode = { kind: 'idle' }
+const modeListeners = new Set<() => void>()
+
+/** The live mode, for components that subscribe instead of re-reading props. */
+function currentMode(): AttachMode {
+  return attachMode
+}
+
+/** Move the capsule between faces and wake every subscriber. */
+function setAttachMode(next: AttachMode): void {
+  attachMode = next
+  for (const listener of [...modeListeners]) listener()
+}
+
+/** Subscribe to attachment changes. Returns the unsubscribe function. */
+function subscribeAttached(listener: () => void): () => void {
+  attachedListeners.add(listener)
+  modeListeners.add(listener)
+  return () => {
+    attachedListeners.delete(listener)
+    modeListeners.delete(listener)
+  }
+}
+
+function publishAttached(): void {
+  for (const listener of [...attachedListeners]) listener()
+}
+
+/** The attachment map of one session, created on demand. */
+function sessionAttachments(sessionId: string): Map<string, AttachedMeta> {
+  let map = attachedBySession.get(sessionId)
+  if (map === undefined) {
+    map = new Map()
+    attachedBySession.set(sessionId, map)
+  }
+  return map
+}
+
+/** How many attachments this session holds (staged or bound). */
+function attachmentCount(sessionId: string): number {
+  return attachedBySession.get(sessionId)?.size ?? 0
+}
+
+/** The marker one attached secret travels as. Never a value. */
+function markerOf(variable: string): string {
+  return `@${variable}`
+}
+
+/** Every distinct attached-secret marker in one text, in first-seen order. */
+function parseMarkers(text: string): readonly string[] {
+  const found: string[] = []
+  MARKER_RE.lastIndex = 0
+  let match = MARKER_RE.exec(text)
+  while (match !== null) {
+    const variable = match[2]
+    if (variable !== undefined && !found.includes(variable)) found.push(variable)
+    match = MARKER_RE.exec(text)
+  }
+  return found
+}
+
+/** Read one attach response. A shape this half cannot understand is a refusal. */
+function readAttachResponse(payload: unknown): { variable: string; scope: Scope; replaced: boolean } | null {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null
+  const record = payload as Record<string, unknown>
+  if (record.ok !== true) return null
+  const variable = text(record.variable)
+  const scope = scopeOf(record.scope)
+  if (variable === undefined || scope === undefined) return null
+  return { variable, scope, replaced: record.replaced === true }
+}
+
+/** Read the host's own attachment list. Anything unreadable answers null. */
+function readAttachedList(payload: unknown): readonly AttachedMeta[] | null {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null
+  const list = (payload as { attachments?: unknown }).attachments
+  if (!Array.isArray(list)) return null
+  const out: AttachedMeta[] = []
+  for (const candidate of list) {
+    if (typeof candidate !== 'object' || candidate === null) continue
+    const record = candidate as Record<string, unknown>
+    const variable = text(record.variable)
+    const scope = scopeOf(record.scope)
+    const state = record.state === 'bound' ? 'bound' : record.state === 'staged' ? 'staged' : undefined
+    if (variable === undefined || scope === undefined || state === undefined) continue
+    out.push({
+      variable,
+      name: text(record.name) ?? variable,
+      label: text(record.label) ?? variable,
+      scope,
+      state,
+      createdAt: typeof record.createdAt === 'number' ? record.createdAt : 0,
+    })
+  }
+  return out
+}
+
+/** The fixed sentence one refused attach reports. */
+function attachErrorFor(status: number): string {
+  return ATTACH_FAILURE[status] ?? ATTACH_FAILURE_UNKNOWN
+}
+
+/** Read the host's attachment list for one session and publish it. */
+async function refreshAttached(sessionId: string): Promise<void> {
+  if (sessionId === '') return
+  try {
+    const response = await fetch(`${ATTACHED_PATH}?sessionId=${encodeURIComponent(sessionId)}`, {
+      credentials: 'same-origin',
+      headers: { accept: 'application/json' },
+    })
+    if (!response.ok) return
+    const list = readAttachedList(await response.json())
+    if (list === null) return
+    const map = new Map<string, AttachedMeta>()
+    for (const entry of list) map.set(entry.variable, entry)
+    attachedBySession.set(sessionId, map)
+    publishAttached()
+  } catch {
+    // Unreachable is not evidence of anything: the capsule keeps what it knows.
+  }
+}
+
+/**
+ * Insert one attached-secret reference at the caret.
+ *
+ * L1 is the frozen contract's own scoped insertion event — the very event the
+ * `@` menu's pick pipeline ends in, so this is the official path rather than a
+ * private call. It replaces the captured span with one reference chip. When the
+ * editor refuses (a stale revision, a locked phase), L3 inserts the plain marker
+ * the source's lexicon already decorates as a clickable reference; L4 hands the
+ * variable to the human instead of pretending the draft was edited.
+ *
+ * @returns which rung actually applied.
+ */
+function insertChip(sessionId: string, variable: string, span: TokenSpanLike | null, actions: InputActionsLike | undefined): 'chip' | 'text' | 'manual' {
+  const reference: ReferenceInsertLike = {
+    source: SECRET_SOURCE,
+    ref: variable,
+    label: variable,
+    appearance: 'session',
+    clipboardText: markerOf(variable),
+  }
+  if (span !== null && sessionsScope !== null) {
+    const scope = sessionsScope(sessionId)
+    if (scope?.bail !== undefined) {
+      if (scope.bail(scope, 'slash/input-insert-reference', { reference, span }) === true) return 'chip'
+    }
+  }
+  const fresh = actions?.captureInsertion?.() ?? span
+  if (fresh !== null && actions?.insertText !== undefined) {
+    if (actions.insertText(markerOf(variable), fresh) === true) return 'text'
+  }
+  return 'manual'
+}
+
+/** The translate seat, with the literal table as the fallback. */
+function attachT(props: { readonly t?: unknown }): (key: string) => string {
+  const t = props.t
+  if (typeof t === 'function') return t as (key: string) => string
+  return (key: string) => ATTACH_ZH[key] ?? key
+}
+
+/**
+ * The composer's entry button: a toggle whose pressed state and label follow the
+ * capsule, exactly as the vision-mode toggle's follow theirs.
+ */
+function SecretAttachToggle(props: {
+  readonly sessionId?: unknown
+  readonly open?: () => void
+  readonly close?: () => void
+  readonly t?: unknown
+}): unknown {
+  const h = React.createElement
+  const t = attachT(props)
+  const sessionId = text(props.sessionId) ?? ''
+  const [snap, setSnap] = React.useState(0)
+  React.useEffect(() => {
+    const release = subscribeAttached(() => setSnap((previous: number) => previous + 1))
+    // The host is the authority for what is still attached after a reload.
+    void refreshAttached(sessionId)
+    return release
+  }, [sessionId])
+  void snap
+  const open = currentMode().kind !== 'idle'
+  const count = attachmentCount(sessionId)
+  return h(
+    'button',
+    {
+      type: 'button',
+      className: open ? `${A.btn} ${A.btnOn}` : A.btn,
+      'data-secret-attach-toggle': 'true',
+      'aria-pressed': open,
+      'aria-label': open ? t('toggleOpen') : t('toggle'),
+      title: t('toggleHint'),
+      onMouseDown: (event: { preventDefault?: () => void }) => {
+        event.preventDefault?.()
+      },
+      onClick: () => {
+        if (open) {
+          if (props.close !== undefined) props.close()
+          else setAttachMode({ kind: 'idle' })
+          return
+        }
+        if (props.open !== undefined) props.open()
+        else setAttachMode({ kind: 'fill' })
+      },
+    },
+    h('span', { className: A.glyph, 'aria-hidden': true }, '🔑'),
+    h('span', null, t('toggle')),
+    count > 0 ? h('span', { className: A.badge }, String(count)) : null,
+  )
+}
+
+/**
+ * The capsule: the value form while the human fills one in, and the read-only
+ * detail view once the reference is in the draft.
+ *
+ * It floats above the composer card (the `@` menu's own seat), so it never
+ * covers the line being typed. `idle` renders nothing.
+ */
+function SecretAttachCapsule(props: {
+  readonly sessionId?: unknown
+  readonly inputActions?: InputActionsLike
+  readonly t?: unknown
+}): unknown {
+  const h = React.createElement
+  const t = attachT(props)
+  const sessionId = text(props.sessionId) ?? ''
+  const actions = props.inputActions
+  const [snap, setSnap] = React.useState(0)
+  const [key, setKey] = React.useState('')
+  const [label, setLabel] = React.useState('')
+  const [value, setValue] = React.useState('')
+  const [reveal, setReveal] = React.useState(false)
+  const [scope, setScope] = React.useState<Scope>('session')
+  const [busy, setBusy] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
+  const [tier, setTier] = React.useState<string | null>(null)
+  React.useEffect(() => subscribeAttached(() => setSnap((previous: number) => previous + 1)), [])
+  void snap
+
+  const mode = currentMode()
+  if (mode.kind === 'idle') return null
+
+  async function submit(): Promise<void> {
+    if (busy) return
+    const name = key.trim()
+    if (!ATTACH_KEY_RE.test(name)) {
+      setError(t('badKey'))
+      return
+    }
+    if (value.length === 0) {
+      setError(t('noValue'))
+      return
+    }
+    setBusy(true)
+    setError(null)
+    const span = actions?.captureInsertion?.() ?? null
+    try {
+      const response = await fetch(ATTACH_PATH, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          sessionId,
+          name,
+          label: label.trim() === '' ? name : label.trim(),
+          scope,
+          value,
+        }),
+      })
+      const payload: unknown = await response.json().catch(() => undefined)
+      if (!response.ok) {
+        setError(attachErrorFor(response.status))
+        return
+      }
+      const accepted = readAttachResponse(payload)
+      if (accepted === null) {
+        setError(ATTACH_FAILURE_UNKNOWN)
+        return
+      }
+      // The value leaves this component here, and this is the only place it is
+      // ever read: it is not stored, echoed, or carried into the detail view.
+      setValue('')
+      const map = sessionAttachments(sessionId)
+      map.set(accepted.variable, {
+        variable: accepted.variable,
+        name,
+        label: label.trim() === '' ? name : label.trim(),
+        scope: accepted.scope,
+        state: 'staged',
+        createdAt: Date.now(),
+      })
+      publishAttached()
+      const applied = insertChip(sessionId, accepted.variable, span, actions)
+      setTier(applied)
+      setAttachMode({ kind: 'detail', variable: accepted.variable })
+    } catch {
+      setError(ATTACH_UNREACHABLE)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function discard(variable: string): Promise<void> {
+    setBusy(true)
+    setError(null)
+    try {
+      const response = await fetch(RELEASE_PATH, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, variable }),
+      })
+      if (!response.ok) {
+        setError(attachErrorFor(response.status))
+        return
+      }
+      sessionAttachments(sessionId).delete(variable)
+      publishAttached()
+      setAttachMode({ kind: 'idle' })
+    } catch {
+      setError(ATTACH_UNREACHABLE)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const head = h(
+    'header',
+    { className: A.head },
+    h('span', { className: A.title }, mode.kind === 'fill' ? t('fillTitle') : t('detailTitle')),
+    h(
+      'button',
+      {
+        type: 'button',
+        className: A.close,
+        'data-action': 'close',
+        onClick: () => {
+          setAttachMode({ kind: 'idle' })
+        },
+      },
+      t('close'),
+    ),
+  )
+
+  if (mode.kind === 'fill') {
+    const scopeOption = (next: Scope, title: string, hint: string): unknown =>
+      h(
+        'label',
+        { key: next, className: A.option, 'data-on': scope === next ? '' : undefined },
+        h('input', {
+          className: A.radio,
+          type: 'radio',
+          name: 'dsh-secret-attach-scope',
+          checked: scope === next,
+          disabled: busy,
+          onChange: () => setScope(next),
+        }),
+        h(
+          'span',
+          { className: A.optionBody },
+          h('span', { className: A.optionTitle }, title),
+          h('span', { className: A.optionHint }, hint),
+        ),
+      )
+    return h(
+      'div',
+      { className: A.box, 'data-secret-attach-capsule': 'fill', role: 'group', 'aria-label': t('fillTitle') },
+      head,
+      h(
+        'div',
+        { className: A.body },
+        h(
+          'div',
+          { className: A.field },
+          h('label', { className: A.label, htmlFor: 'dsh-secret-attach-key' }, t('keyLabel')),
+          h('input', {
+            id: 'dsh-secret-attach-key',
+            className: A.input,
+            type: 'text',
+            value: key,
+            placeholder: t('keyPlaceholder'),
+            autoComplete: 'off',
+            spellCheck: false,
+            disabled: busy,
+            onChange: (event: { target: { value: string } }) => setKey(event.target.value),
+          }),
+          h('span', { className: A.optionHint }, t('keyHint')),
+        ),
+        h(
+          'div',
+          { className: A.field },
+          h('label', { className: A.label, htmlFor: 'dsh-secret-attach-label' }, t('labelLabel')),
+          h('input', {
+            id: 'dsh-secret-attach-label',
+            className: A.input,
+            type: 'text',
+            value: label,
+            placeholder: t('labelPlaceholder'),
+            autoComplete: 'off',
+            disabled: busy,
+            onChange: (event: { target: { value: string } }) => setLabel(event.target.value),
+          }),
+        ),
+        h(
+          'div',
+          { className: A.field },
+          h('label', { className: A.label, htmlFor: 'dsh-secret-attach-value' }, t('valueLabel')),
+          h(
+            'div',
+            { className: A.inputRow },
+            h('input', {
+              id: 'dsh-secret-attach-value',
+              className: A.input,
+              type: reveal ? 'text' : 'password',
+              value,
+              placeholder: t('valuePlaceholder'),
+              autoComplete: 'off',
+              spellCheck: false,
+              disabled: busy,
+              'aria-label': t('valueLabel'),
+              onChange: (event: { target: { value: string } }) => setValue(event.target.value),
+            }),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: A.toggle,
+                'aria-pressed': reveal,
+                disabled: busy,
+                onClick: () => setReveal(!reveal),
+              },
+              reveal ? t('hide') : t('show'),
+            ),
+          ),
+        ),
+        h(
+          'div',
+          { className: A.field },
+          h('span', { className: A.label }, t('scopeLabel')),
+          h(
+            'div',
+            { className: A.scope, role: 'radiogroup', 'aria-label': t('scopeLabel') },
+            scopeOption('session', t('session'), t('sessionHint')),
+            scopeOption('persistent', t('persistent'), t('persistentHint')),
+          ),
+          h(
+            'p',
+            { className: A.notice },
+            t('current'),
+            h('b', null, scope === 'persistent' ? t('persistent') : t('session')),
+            ' — ',
+            scope === 'persistent' ? t('persistentHint') : t('sessionHint'),
+          ),
+        ),
+        h(
+          'div',
+          { className: A.actions },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: A.action,
+              'data-kind': 'primary',
+              disabled: busy,
+              onClick: () => void submit(),
+            },
+            t('insert'),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: A.action,
+              disabled: busy,
+              onClick: () => {
+                // Cancelling must leave nothing behind: no request was made yet,
+                // and the value exists only in this component's state.
+                setValue('')
+                setAttachMode({ kind: 'idle' })
+              },
+            },
+            t('cancel'),
+          ),
+        ),
+        busy ? h('p', { className: A.notice }, t('busy')) : null,
+        error === null ? null : h('p', { className: A.notice, 'data-kind': 'error', role: 'alert' }, error),
+        h('p', { className: A.foot }, `${t('footerLead')}${t('footerTail')}`),
+      ),
+    )
+  }
+
+  const meta = attachedBySession.get(sessionId)?.get(mode.variable)
+  const scopeTitle = meta === undefined ? undefined : meta.scope === 'persistent' ? t('persistent') : t('session')
+  const stateTitle = meta === undefined ? t('statusUnknown') : meta.state === 'bound' ? t('stateBound') : t('stateStaged')
+  const tierNote = tier === 'chip' ? t('insertedChip') : tier === 'text' ? t('insertedText') : null
+  return h(
+    'div',
+    { className: A.box, 'data-secret-attach-capsule': 'detail', role: 'group', 'aria-label': t('detailTitle') },
+    head,
+    h(
+      'div',
+      { className: `${A.body} ${A.detail}` },
+      h(
+        'div',
+        { className: A.row },
+        h('span', { className: A.rowLabel }, t('variableLabel')),
+        h('code', { className: A.code }, mode.variable),
+      ),
+      meta === undefined
+        ? null
+        : h(
+            'div',
+            { className: A.row },
+            h('span', { className: A.rowLabel }, t('labelLabel')),
+            h('span', { className: A.rowValue }, meta.label),
+          ),
+      h(
+        'div',
+        { className: A.row },
+        h('span', { className: A.rowLabel }, t('scopeLabel')),
+        h('span', { className: A.rowValue }, scopeTitle ?? t('statusUnknown')),
+      ),
+      h(
+        'div',
+        { className: A.row },
+        h('span', { className: A.rowLabel }, t('stateLabel')),
+        h('span', { className: A.rowValue }, stateTitle),
+      ),
+      h('p', { className: A.notice }, meta !== undefined && meta.state === 'bound' ? t('boundNote') : t('stagedNote')),
+      tierNote === null ? null : h('p', { className: A.notice }, tierNote),
+      tier === 'manual' ? h('p', { className: A.notice }, `${t('manualLead')}${markerOf(mode.variable)}`) : null,
+      h(
+        'div',
+        { className: A.actions },
+        meta !== undefined && meta.state === 'staged'
+          ? h(
+              'button',
+              {
+                type: 'button',
+                className: A.action,
+                disabled: busy,
+                onClick: () => void discard(mode.variable),
+              },
+              t('discard'),
+            )
+          : null,
+      ),
+      busy ? h('p', { className: A.notice }, t('busy')) : null,
+      error === null ? null : h('p', { className: A.notice, 'data-kind': 'error', role: 'alert' }, error),
+      h('p', { className: A.foot }, `${t('footerLead')}${t('footerTail')}`),
+    ),
+  )
+}
+
+/**
+ * The reference source this plugin registers.
+ *
+ * `codec` is not optional in practice: the composer routes every chip's model
+ * serialization through the source that owns it, and a missing codec blocks the
+ * send instead of silently downgrading. `lexicon` is what makes the plain marker
+ * a decorated reference after a reload, when the draft is text again and no chip
+ * node exists; `openReference` is how a click on either form reaches this
+ * plugin. No candidate ever appears in the `@` menu, and no space/enter hook is
+ * implemented, so typing `@` stays exactly the file/session affordance it is.
+ */
+const secretSource = {
+  trigger: '@',
+  name: SECRET_SOURCE,
+  showGroupTitle: false,
+  candidates: (): Promise<readonly unknown[]> => Promise.resolve([]),
+  lexicon: (session: { readonly sessionId?: unknown } | undefined): readonly string[] => {
+    const sessionId = text(session?.sessionId)
+    if (sessionId === undefined) return []
+    return [...(attachedBySession.get(sessionId)?.keys() ?? [])]
+  },
+  subscribeLexicon: (_session: unknown, listener: () => void): (() => void) => subscribeAttached(listener),
+  openReference: (_session: unknown, reference: { readonly ref?: unknown }): boolean => {
+    const ref = text(reference?.ref)
+    if (ref === undefined) return false
+    const variable = ref.startsWith(MARKER_PREFIX) ? ref.slice(1) : ref
+    setAttachMode({ kind: 'detail', variable })
+    return true
+  },
+  codec: {
+    clipboardText: (ref: string): string => markerOf(ref),
+    serialize: (ref: string): Promise<string> => Promise.resolve(markerOf(ref)),
+  },
+}
+
+/** The marker prefix, kept beside the marker helpers. */
+const MARKER_PREFIX = '@'
+
 /** The card's payload, declared against the Chat target's node map below. */
 type SecretRequestCardData = CardData
 
@@ -1146,6 +2035,48 @@ const SEAM = Object.freeze({
 
 ;(globalThis as unknown as { __cordisSecretClient?: unknown }).__cordisSecretClient = SEAM
 
+/**
+ * The attach surface's own read-only seam.
+ *
+ * Kept separate from the card's seam on purpose: the card's seam is a frozen,
+ * asserted contract from the previous round, and widening it would rewrite an
+ * accepted interface. This one exposes the reverse direction's pure logic and
+ * the registered source. Frozen, stateless and value-free: the attached-secret
+ * map it can reach holds names and scopes, never a value.
+ */
+const ATTACH_SEAM = Object.freeze({
+  version: 1,
+  ATTACH_SLOT,
+  CAPSULE_SLOT,
+  ATTACH_PATH,
+  RELEASE_PATH,
+  ATTACHED_PATH,
+  SECRET_SOURCE,
+  ATTACH_NS,
+  MARKER_RE,
+  ATTACH_ZH,
+  ATTACH_FAILURE,
+  ATTACH_FAILURE_UNKNOWN,
+  ATTACH_UNREACHABLE,
+  markerOf,
+  parseMarkers,
+  readAttachResponse,
+  readAttachedList,
+  attachErrorFor,
+  refreshAttached,
+  insertChip,
+  secretSource,
+  SecretAttachToggle,
+  SecretAttachCapsule,
+  currentMode,
+  setAttachMode,
+  subscribeAttached,
+  attachmentCount,
+  sessionAttachments,
+})
+
+;(globalThis as unknown as { __cordisSecretAttach?: unknown }).__cordisSecretAttach = ATTACH_SEAM
+
 const loader = (globalThis as unknown as { __ModuleLoader__?: ModuleLoaderTarget }).__ModuleLoader__
 
 loader?.load({
@@ -1157,6 +2088,7 @@ loader?.load({
       inject: ['slots', 'uiConversation'],
       apply(ctx: ClientContextLike) {
         ensureCardStyle()
+        ensureAttachStyle()
         // The one visible interaction surface: this plugin's own chat node.
         ctx.uiConversation.events.register(secretRequestDefinition)
         ctx.slots.inject('conversation.chat.node', () =>
@@ -1166,6 +2098,63 @@ loader?.load({
         ctx.slots.inject('tool.call.toolview', () =>
           ctx.slots.register({ name: 'tool.call.toolview', key: TOOL_NAME }, HiddenSecretToolRow),
         )
+
+        // The reverse direction's entry button: the same list-slot shape the
+        // vision-mode toggle uses, with the same reactive-state split (the
+        // registration supplies identity and actions; live state rides a store).
+        ctx.slots.inject(ATTACH_SLOT, () =>
+          ctx.slots.register(
+            {
+              name: ATTACH_SLOT,
+              id: 'secret-attach-toggle',
+              order: 30,
+              inject: () => ({
+                open: () => setAttachMode({ kind: 'fill' }),
+                close: () => setAttachMode({ kind: 'idle' }),
+              }),
+            },
+            SecretAttachToggle,
+          ),
+        )
+        // The capsule, floating above the composer card.
+        ctx.slots.inject(CAPSULE_SLOT, () =>
+          ctx.slots.register(
+            {
+              name: CAPSULE_SLOT,
+              id: 'secret-attach-capsule',
+              order: 10,
+            },
+            SecretAttachCapsule,
+          ),
+        )
+        // Every optional service is reached through cordis's own optional seat.
+        // Reading one that this environment does not have would throw inside the
+        // context proxy and fail this whole entry, so each one registers itself
+        // only when it is really there, and the rest keeps working without it.
+        ctx.inject(['locale'], (scoped) => {
+          // A dictionary only helps when a locale face exists to read it; without
+          // one the components fall back to their own literal table.
+          const locale = scoped.locale
+          if (locale?.register === undefined) return
+          locale.register(ATTACH_NS, { zh: ATTACH_ZH, en: ATTACH_EN })
+        })
+        ctx.inject(['inputTriggers'], (scoped) => {
+          // The reference source: codec for the model form, lexicon for the
+          // decorated plain token, openReference for the click.
+          const triggers = scoped.inputTriggers
+          if (triggers?.registerSource === undefined) return
+          triggers.registerSource(secretSource)
+        })
+        ctx.inject(['sessions'], (scoped) => {
+          // The chip rung needs the session scope; without it the insertion
+          // ladder simply starts one rung lower.
+          const sessions = scoped.sessions
+          if (sessions === undefined) return
+          sessionsScope = (sessionId: string) => sessions.scope(sessionId)
+          scoped.effect?.(() => () => {
+            sessionsScope = null
+          })
+        })
       },
     }
   },

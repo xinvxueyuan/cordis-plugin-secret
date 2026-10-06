@@ -6,5 +6,5 @@
     "types": ["node"],
     "allowImportingTsExtensions": true
   },
-  "include": ["src/client", "test/client-card.test.ts"]
+  "include": ["src/client", "test/client-card.test.ts", "test/client-attach.test.ts"]
 }

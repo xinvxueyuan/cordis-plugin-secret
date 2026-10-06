@@ -1,4 +1,5 @@
 import { findAnchorSeq, type AnchorSessionLike } from './anchor.ts'
+import { type AttachStore, type BoundAttach } from './attach.ts'
 import type { SecretConfig } from './config.ts'
 import { approvedResult, mapNonApproved, planGrant } from './decisions.ts'
 import { GrantStore, type Grant, type GrantSessionLike } from './grants.ts'
@@ -10,9 +11,17 @@ import {
   type Scheduler,
   type WaitOutcome,
 } from './pending.ts'
-import { parseAnswer } from './protocol.ts'
+import { parseAnswer, parseAttach, parseRelease } from './protocol.ts'
 import { redactSecrets } from './redact.ts'
-import type { ModalAnswer, PendingView, SecretRequestInput, SecretRequestResult } from './types.ts'
+import type {
+  ModalAnswer,
+  PendingView,
+  SecretAttachedView,
+  SecretAttachOutcome,
+  SecretAttachState,
+  SecretRequestInput,
+  SecretRequestResult,
+} from './types.ts'
 
 /** How the caller of `secret_request` relates to the live runtime. */
 export type CallerClass =
@@ -94,8 +103,12 @@ export interface SecretServiceDeps {
   readonly credentials: CredentialsPort
   readonly authorization: AuthorizationPort
   readonly envs: EnvPort
+  /** Staged secrets a human attached and has not sent yet. */
+  readonly attachments: AttachStore
   classifyCaller(agent: unknown): CallerClass
   sessionOf(agent: unknown): GrantSessionLike | undefined
+  /** The live session one attach submission names, or undefined. */
+  sessionById(id: string): GrantSessionLike | undefined
   /** Live session used to anchor approvals; must expose the event log. */
   anchorSessionOf(agent: unknown): AnchorSessionLike | undefined
   now(): number
@@ -106,6 +119,16 @@ export interface SecretServiceDeps {
 /** The result of one dialog submission, as the route reports it. */
 export type AnswerOutcome =
   | { readonly ok: true }
+  | { readonly ok: false; readonly status: number; readonly error: string }
+
+/** The result of one attach submission, as the route reports it. */
+export type AttachOutcome =
+  | { readonly ok: true; readonly outcome: SecretAttachOutcome }
+  | { readonly ok: false; readonly status: number; readonly error: string }
+
+/** The result of one release request, as the route reports it. */
+export type ReleaseOutcome =
+  | { readonly ok: true; readonly released: boolean; readonly state: SecretAttachState | 'none' }
   | { readonly ok: false; readonly status: number; readonly error: string }
 
 /**
@@ -122,6 +145,15 @@ export type ConverseResult =
 
 /** The fixed, value-free failure one credential-store read produces. */
 const STORE_READ_FAILED_MESSAGE = '凭据库读取失败；细节已省略'
+
+/**
+ * The fixed, value-free failure one credential-store write produces.
+ *
+ * Identical discipline to the read above: a backend that fails after being
+ * handed the value may quote it in its own error text, so the text is dropped
+ * and only our own wording is reported.
+ */
+const ATTACH_STORE_FAILED_MESSAGE = '凭据库写入失败；细节已省略，本次附加未登记'
 
 /**
  * Run one credential-store read, collapsing every upstream failure into this
@@ -150,6 +182,15 @@ async function readStore<T>(read: () => Promise<T>): Promise<T> {
 export class SecretService {
   readonly grants: GrantStore
   readonly pending = new PendingStore()
+  /**
+   * Attachment metadata per session, keyed by exposed variable.
+   *
+   * Only what the capsule needs to describe an entry that has left the staged
+   * store — a label and when it was created. It never holds a value: the value
+   * lives in the staged store until it is bound, and afterwards only in the
+   * grant store.
+   */
+  private readonly attached = new Map<string, Map<string, { label: string; createdAt: number }>>()
   private readonly deps: SecretServiceDeps
 
   constructor(deps: SecretServiceDeps, grants: GrantStore = new GrantStore()) {
@@ -184,6 +225,162 @@ export class SecretService {
       return { ok: false, status: 409, error: 'this authorization request was already answered' }
     }
     return { ok: true }
+  }
+
+  /**
+   * Register one human-attached secret for a session.
+   *
+   * Staging is not exposure. Nothing is injected while the attach waits for the
+   * message that carries it: a staged entry is invisible to the grant store, so
+   * an attach that is never sent yields no variable, no contributor and no
+   * grant. The single durable write in this plugin's reverse direction happens
+   * here, and only because the human explicitly chose `persistent`.
+   *
+   * @param raw - parsed JSON body of the attach request.
+   */
+  async attach(raw: unknown): Promise<AttachOutcome> {
+    const parsed = parseAttach(raw)
+    if (!parsed.ok) return { ok: false, status: 400, error: parsed.error }
+    const input = parsed.value
+    const session = this.deps.sessionById(input.sessionId)
+    if (session === undefined) {
+      return { ok: false, status: 404, error: 'attach: 找不到该会话，本次附加未登记' }
+    }
+    const existing = this.deps.attachments.get(input.sessionId, input.envVar)
+    if (existing === undefined && this.deps.attachments.countFor(input.sessionId) >= this.deps.config.maxAttachmentsPerSession) {
+      return {
+        ok: false,
+        status: 409,
+        error: `attach: 本会话登记的附加密钥已达上限（${String(this.deps.config.maxAttachmentsPerSession)}）`,
+      }
+    }
+
+    if (input.scope === 'persistent') {
+      try {
+        await this.deps.credentials.set(input.envVar, input.value)
+        // The durable record is the value-free marker, exactly as the agent-ask
+        // direction commits it: an authorization exists for this key, and the
+        // marker never quotes what was written.
+        await this.deps.credentials.commitRecord(recordKey(input.name), {
+          version: 1,
+          kind: 'attachment',
+          envVar: input.envVar,
+          name: input.name,
+          scope: 'persistent',
+          authorizedAt: this.deps.now(),
+        })
+      } catch {
+        // The backend's own text can quote the value it was handed, so it is
+        // dropped rather than forwarded (the same rule as a store read).
+        return { ok: false, status: 500, error: ATTACH_STORE_FAILED_MESSAGE }
+      }
+    }
+
+    const written = this.deps.attachments.put({
+      sessionId: input.sessionId,
+      name: input.name,
+      label: input.label,
+      scope: input.scope,
+      envVar: input.envVar,
+      value: input.value,
+      createdAt: this.deps.now(),
+    })
+    if (written === undefined) {
+      return {
+        ok: false,
+        status: 409,
+        error: `attach: 本会话登记的附加密钥已达上限（${String(this.deps.config.maxAttachmentsPerSession)}）`,
+      }
+    }
+    return {
+      ok: true,
+      outcome: { variable: input.envVar, scope: input.scope, replaced: written.replaced },
+    }
+  }
+
+  /**
+   * Drop one staged attach.
+   *
+   * A bound attachment is not released here on purpose: it is anchored to a
+   * message, and the only truthful way to take it back is to take the message
+   * back. The caller is told which state it found instead of being told a lie.
+   */
+  release(raw: unknown): ReleaseOutcome {
+    const parsed = parseRelease(raw)
+    if (!parsed.ok) return { ok: false, status: 400, error: parsed.error }
+    const { sessionId, envVar } = parsed.value
+    if (this.deps.attachments.remove(sessionId, envVar)) {
+      this.attached.get(sessionId)?.delete(envVar)
+      return { ok: true, released: true, state: 'staged' }
+    }
+    const session = this.deps.sessionById(sessionId)
+    const bound = session !== undefined && this.liveGrant(session, envVar) !== undefined
+    return { ok: true, released: false, state: bound ? 'bound' : 'none' }
+  }
+
+  /**
+   * The capsule-facing view of every secret a human attached in one session.
+   *
+   * An entry whose bound message has left the live surface (a rewind, a fork, a
+   * session end) is forgotten here, so the capsule can never report an exposure
+   * that no longer exists.
+   */
+  attachedViews(sessionId: string): readonly SecretAttachedView[] {
+    const views: SecretAttachedView[] = []
+    const seen = new Set<string>()
+    for (const item of this.deps.attachments.list(sessionId)) {
+      views.push({
+        variable: item.envVar,
+        name: item.name,
+        label: item.label,
+        scope: item.scope,
+        state: 'staged',
+        createdAt: item.createdAt,
+      })
+      seen.add(item.envVar)
+    }
+    const known = this.attached.get(sessionId)
+    if (known === undefined) return views
+    const session = this.deps.sessionById(sessionId)
+    for (const [envVar, meta] of [...known]) {
+      if (seen.has(envVar)) continue
+      const live = session === undefined ? undefined : this.liveGrant(session, envVar)
+      if (live === undefined) {
+        known.delete(envVar)
+        continue
+      }
+      views.push({
+        variable: envVar,
+        name: live.name,
+        label: meta.label,
+        scope: live.scope,
+        state: 'bound',
+        createdAt: meta.createdAt,
+      })
+    }
+    return views
+  }
+
+  /** Record that one attachment reached a message (called by the binding hook). */
+  noteBound(attach: BoundAttach): void {
+    const known = this.attached.get(attach.sessionId) ?? new Map<string, { label: string; createdAt: number }>()
+    known.set(attach.variable, { label: attach.label, createdAt: attach.createdAt })
+    this.attached.set(attach.sessionId, known)
+  }
+
+  /** Drop every attachment record of one session (session end). */
+  forgetAttachments(sessionId: string): void {
+    this.deps.attachments.forget(sessionId)
+    this.attached.delete(sessionId)
+  }
+
+  /** The live grant one session holds for one exposed variable, if any. */
+  private liveGrant(session: GrantSessionLike, envVar: string): Grant | undefined {
+    for (const name of this.grants.namesForEnvVar(envVar)) {
+      const lookup = this.grants.resolve(session, name)
+      if (lookup.code === 'ok') return lookup.grant
+    }
+    return undefined
   }
 
   /**
