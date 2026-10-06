@@ -330,6 +330,12 @@ npm stage approve <stage-id>                       # 需要 2FA
 
 ### GitHub Release 与签名
 
+> **已发生的事实**：`v0.2.0` 的 Release 是 https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.2.0
+> （2026-10-06 发布，`draft: false`），附件三件：`xinvxueyuan-cordis-plugin-secret-0.2.0.tgz`、`SHA256SUMS`、`SHA256SUMS.asc`；
+> tgz 与 SHA256SUMS 各有一份 `gh attestation verify` 可验的构建来源证明。tag 对象为 annotated + GPG 签名
+> （`git cat-file -t v0.2.0` → `tag`；GitHub API 的 `verification.verified` → `true`，`reason` → `valid`）。
+> 下表是**该版本确实按之执行**的机制，不是"将来会做"的计划。
+
 | 环节 | 机制 |
 | --- | --- |
 | tag | **annotated 且 GPG 签名**的 tag（`git tag -s`），GitHub 上显示 **Verified** 徽标。tag 由维护者在本机用私钥创建并推送，**私钥永不进入 CI**。 |
