@@ -206,6 +206,8 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
 
 ### 自己复测（活体，约 3 分钟）
 
+> **先重启。** dsh 在进程启动时加载插件的 `lib/` 构建，所以**发布 0.2.1 之后必须重启 `dsh web`** 才会加载修复后的产物；重启前的活体复测仍会复现 0.2.0 的现象（`staged` 不变 `bound`、shell 里没有变量），那是预期，不是修复失败。
+
 1. 在输入区点「附加密钥」按钮 → 胶囊里填名称（如 `openai`）与值，作用域保持默认「仅本次会话」→ 插入 → 输入框出现 `@DSH_SECRET_OPENAI` 胶囊。
 2. **发送前**：在同一浏览器（同源、带签名 cookie）打开 `GET /api/secret.attached?sessionId=$DSH_SESSION_ID` → 该条的 `state` 必须是 `"staged"`，且此刻 shell 里没有这个变量（未发送永不注入）。
 3. **发送后立刻**再查同一路由 → 该条的 `state` 变成 `"bound"`（不再停留在 `staged`）。**这是判别"绑定是否真的发生"的最快手段**，也就是这一轮修复的核心判据。
@@ -359,16 +361,20 @@ npm stage approve <stage-id>                       # 需要 2FA
 判断该版本是否已存在于目标 registry，已存在就跳过发布（并在 Step Summary 写明"该版本已存在，跳过发布"），
 因此对已发布版本重推 tag 不会产生必然失败的公开红叉。其它检查错误（网络、鉴权、registry 故障）仍会让 job 失败。
 
+**registry 现状（截至本文）**：npmjs 上有 `0.0.0-stage`、`0.1.0`、`0.2.0`；`0.2.1` 已由 CI 放入 stage 队列，等维护者用 2FA 批准（`npm stage approve`）后才上线。GitHub Packages 上 `0.1.0`/`0.2.0`/`0.2.1` 都在（那里由 CI 直接发布，不经人工批准）。
+
 同一份包也会发布到 **GitHub Packages**（`npm.pkg.github.com`，`github-packages` job，用内置 `GITHUB_TOKEN`），
 使包在仓库页面上可见、可被 `@xinvxueyuan:registry=https://npm.pkg.github.com` 的消费者安装。
 
 ### GitHub Release 与签名
 
-> **已发生的事实**：`v0.2.0` 的 Release 是 https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.2.0
-> （2026-10-06 发布，`draft: false`），附件三件：`xinvxueyuan-cordis-plugin-secret-0.2.0.tgz`、`SHA256SUMS`、`SHA256SUMS.asc`；
-> tgz 与 SHA256SUMS 各有一份 `gh attestation verify` 可验的构建来源证明。tag 对象为 annotated + GPG 签名
-> （`git cat-file -t v0.2.0` → `tag`；GitHub API 的 `verification.verified` → `true`，`reason` → `valid`）。
-> 下表是**该版本确实按之执行**的机制，不是"将来会做"的计划。
+> **已发生的事实**：`v0.2.1` 的 Release 是 https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.2.1
+> （2026-10-06 发布，`draft: false`），附件三件：`xinvxueyuan-cordis-plugin-secret-0.2.1.tgz`（sha256 `55076023121254ba1a12c3718d4d2f6c3d03c64eb2667920fc19036e270b7edd`）、`SHA256SUMS`、`SHA256SUMS.asc`；
+> tgz 与 SHA256SUMS 各有一份 `gh attestation verify` 可验的构建来源证明，且**证明绑定在 tag 上**（签名证书 SAN = `.../release.yml@refs/tags/v0.2.1`，`resolvedDependencies` = `git+https://github.com/xinvxueyuan/cordis-plugin-secret@refs/tags/v0.2.1@a01dee656eb0d9ec654a79842b9a7064378d02f1`）——即 tag→commit 是证明的一部分，而不是只绑定到 `refs/heads/main`。tag 对象为 annotated + GPG 签名
+> （`git cat-file -t v0.2.1` → `tag`；GitHub API 的 `verification.verified` → `true`，`reason` → `valid`）。
+> 上一个版本 `v0.2.0` 的 Release（https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.2.0 ）同样是同形三附件；
+> 它的功能缺陷与 0.2.1 的修复见「人类主动附加密钥（反方向）→ 0.2.0 的缺陷与本版修复（0.2.1）」。
+> 下表是**这些版本确实按之执行**的机制，不是"将来会做"的计划。
 
 | 环节 | 机制 |
 | --- | --- |
@@ -379,21 +385,21 @@ npm stage approve <stage-id>                       # 需要 2FA
 | 构建来源证明 | `release.yml` 调用 `actions/attest-build-provenance`（pin 到 commit SHA），为 **tgz 与 SHA256SUMS 两者**生成 Sigstore 签名的 SLSA 构建来源证明，可用 `gh attestation verify` 校验。 |
 | npm 侧 | `release.yml` **完全不执行任何 npm publish**；npm 发布只由上面的 `publish.yml` staged publishing 负责。 |
 
-维护者操作顺序（`v0.2.0` 已按此执行）：
+维护者操作顺序（`v0.2.0` 与 `v0.2.1` 都已按此执行）：
 
 ```sh
 # 1) 本机确认工作区干净、package.json 的 version 已就位（版本号由发布者手工提升）
 git status --porcelain
 
 # 2) 创建 annotated + GPG 签名 tag（私钥仅在本机使用；本机需能完成 GPG 签名）
-git tag -s v0.2.0 -m "v0.2.0"
+git tag -s v0.2.1 -m "v0.2.1"
 
 # 3) 只推 tag —— release.yml 会构建产物、生成来源证明并创建 Release
-git push origin v0.2.0
+git push origin v0.2.1
 
 # 4) 对本机生成的 SHA256SUMS 做分离签名并附到 Release（私钥不进 CI）
 gpg --armor --detach-sign SHA256SUMS
-gh release upload v0.2.0 SHA256SUMS.asc --clobber
+gh release upload v0.2.1 SHA256SUMS.asc --clobber
 ```
 
 校验方式：
