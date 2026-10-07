@@ -209,7 +209,7 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
 
 ### 自己复测（活体，约 3 分钟）
 
-> **先重启。** dsh 在进程启动时加载插件的 `lib/` 构建，所以**发布 0.2.1 之后必须重启 `dsh web`** 才会加载修复后的产物；重启前的活体复测仍会复现 0.2.0 的现象（`staged` 不变 `bound`、shell 里没有变量），那是预期，不是修复失败。同理，**发布 0.3.0 之后也必须重启 `dsh web`** 才会加载四项增强的产物——重启前看不到消息旁的旁挂胶囊、信息框里的「历史记录」区、草稿移除后的自动撤销，`@` 菜单也不会有新分组，这些都属预期（下面是这四项各自的复测方式）。
+> **先重启。** dsh 在进程启动时加载插件的 `lib/` 构建，所以**发布 0.2.1 之后必须重启 `dsh web`** 才会加载修复后的产物；重启前的活体复测仍会复现 0.2.0 的现象（`staged` 不变 `bound`、shell 里没有变量），那是预期，不是修复失败。同理，**发布 0.3.0 之后也必须重启 `dsh web`** 才会加载四项增强的产物——重启前看不到消息旁的旁挂胶囊、信息框里的「历史记录」区、草稿移除后的自动撤销，`@` 菜单也不会有新分组，这些都属预期（下面是这四项各自的复测方式）。**发布 0.4.0 之后同样必须重启 `dsh web`** 才会加载管理面——重启前 `secret_manage` 工具不会出现在工具列表里，信息框里也没有五条管理路径，历史里不会有 `updated`/`scope-changed`/`unbound`/`deleted` 四类事件；活体上仍是 `0.3.0` 的四个方向，这属预期，不是发布失败。
 
 1. 在输入区点「附加密钥」按钮 → 胶囊里填名称（如 `openai`）与值，作用域保持默认「仅本次会话」→ 插入 → 输入框出现 `@DSH_SECRET_OPENAI` 胶囊。
 2. **发送前**：在同一浏览器（同源、带签名 cookie）打开 `GET /api/secret.attached?sessionId=$DSH_SESSION_ID` → 该条的 `state` 必须是 `"staged"`，且此刻 shell 里没有这个变量（未发送永不注入）。
@@ -560,14 +560,18 @@ npm stage approve <stage-id>                       # 需要 2FA
 判断该版本是否已存在于目标 registry，已存在就跳过发布（并在 Step Summary 写明"该版本已存在，跳过发布"），
 因此对已发布版本重推 tag 不会产生必然失败的公开红叉。其它检查错误（网络、鉴权、registry 故障）仍会让 job 失败。
 
-**registry 现状（截至本文）**：npmjs 上已上线 `0.0.0-stage`、`0.1.0`、`0.2.0`、`0.2.1`（`dist-tags.latest = 0.2.1`）；`0.3.0` 已由 CI 放入 stage 队列（stage id `38507d88-1558-4a17-afd2-6b14ed1f720f`，shasum `ceec688a12cadf260fb1b5e05dbaee99f6ff2c1d`），等维护者用 2FA 批准（`npm stage approve`）后才上线。GitHub Packages 上 `0.1.0`/`0.2.0`/`0.2.1`/`0.3.0` 都在（那里由 CI 直接发布，不经人工批准；`0.3.0` 的包版本 id `1346087280`）。
+**registry 现状（截至本文）**：npmjs 上已上线 `0.0.0-stage`、`0.1.0`、`0.2.0`、`0.2.1`、`0.3.0`（`dist-tags.latest = 0.3.0`，说明 `0.3.0` 的 stage 已由维护者用 2FA 批准）；`0.4.0` 已由 CI 放入 stage 队列（stage id `dd9ef8e8-866b-498d-a8f5-8ee33e32f62f`，shasum `22dfadfc613695018adfd5ee09eb8b71b1ba9edc`，provenance 已发布到 Sigstore 透明度日志 `logIndex=3133868807`），等维护者用 2FA 批准（`npm stage approve dd9ef8e8-866b-498d-a8f5-8ee33e32f62f`）后才上线——**批准只能由人来做**，发布流程不登录 npm、不处理任何令牌、不代做需要 2FA 的动作。GitHub Packages 上 `0.1.0`/`0.2.0`/`0.2.1`/`0.3.0`/`0.4.0` 都在（那里由 CI 直接发布，不经人工批准；`0.4.0` 的包版本 id `1351737947`，上一个 `0.3.0` 的是 `1346087280`）。
 
 同一份包也会发布到 **GitHub Packages**（`npm.pkg.github.com`，`github-packages` job，用内置 `GITHUB_TOKEN`），
 使包在仓库页面上可见、可被 `@xinvxueyuan:registry=https://npm.pkg.github.com` 的消费者安装。
 
 ### GitHub Release 与签名
 
-> **已发生的事实**：`v0.3.0` 的 Release 是 https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.3.0
+> **已发生的事实**：`v0.4.0` 的 Release 是 https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.4.0
+> （2026-10-07 发布，`draft: false`；`release.yml` 运行 `37661019203` 成功，`publish.yml` 运行 `37661018704` 成功），附件三件：`xinvxueyuan-cordis-plugin-secret-0.4.0.tgz`（260287 B，sha256 `4612be9c9c8ed9475d236693c32d3d473bad2803aeea2ff55f027da9f677c7e8`，与 `SHA256SUMS` 里记的一致）、`SHA256SUMS`（109 B，sha256 `f54b947346dd196ed6aa48dead4721c828b81d611b073f82548132d311d3e3be`）、`SHA256SUMS.asc`（887 B，sha256 `239251f88159500f6af917c41138b4a83e6aa42c307e98e6e8cbdc86dba4bb13`；RSA 4096 `6C6FD9B2…72B7B35A` 对 **CI 那份 `SHA256SUMS`** 的分离签名，本机 `gpg --verify` 通过）；
+> tgz 与 SHA256SUMS 都由 `gh attestation verify` 可验（一份 attestation，subject 同时列出两者），且**证明绑定在 tag 上**（builder id / 签名证书 SAN = `.../release.yml@refs/tags/v0.4.0`，`externalParameters.workflow.ref` = `refs/tags/v0.4.0`，`resolvedDependencies` = `git+https://github.com/xinvxueyuan/cordis-plugin-secret@refs/tags/v0.4.0` @ commit `26bd420e40bd242d6096478fce50ff0fbdb84655`）——即 tag→commit 是证明的一部分，而不是只绑定到 `refs/heads/main`（`--format json` 全文对 `refs/heads/` **零命中**）。tag 对象为 annotated + GPG 签名
+> （`git cat-file -t v0.4.0` → `tag`，tag 对象 sha `05942e0bba94b717b61cb0896ddf74eb2025dc9f`；GitHub API 的 `verification.verified` → `true`，`reason` → `valid`，`verified_at` → `2026-10-07T17:42:58Z`）。
+> 上一个版本 `v0.3.0` 的 Release 是 https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.3.0
 > （2026-10-06 发布，`draft: false`），附件三件：`xinvxueyuan-cordis-plugin-secret-0.3.0.tgz`（196451 B，sha256 `1dc16de16dfd9e75cacc90330b78c4ba9f56973a970fb5cef9f4695f0cbb844e`）、`SHA256SUMS`、`SHA256SUMS.asc`；
 > tgz 与 SHA256SUMS 都由 `gh attestation verify` 可验（一份 attestation，subject 同时列出两者），且**证明绑定在 tag 上**（builder id / 签名证书 SAN = `.../release.yml@refs/tags/v0.3.0`，`externalParameters.workflow.ref` = `refs/tags/v0.3.0`，`resolvedDependencies` = `git+https://github.com/xinvxueyuan/cordis-plugin-secret@refs/tags/v0.3.0` @ commit `7df8c048f678d163a26ee44c52133f8b458c0f7b`）——即 tag→commit 是证明的一部分，而不是只绑定到 `refs/heads/main`（`--format json` 全文对 `refs/heads/` **零命中**）。tag 对象为 annotated + GPG 签名
 > （`git cat-file -t v0.3.0` → `tag`，tag 对象 sha `fc7bf1b89b21caca70a8be514203e9f3bb5fe50e`；GitHub API 的 `verification.verified` → `true`，`reason` → `valid`）。
@@ -584,22 +588,25 @@ npm stage approve <stage-id>                       # 需要 2FA
 | 构建来源证明 | `release.yml` 调用 `actions/attest-build-provenance`（pin 到 commit SHA），为 **tgz 与 SHA256SUMS 两者**生成 Sigstore 签名的 SLSA 构建来源证明，可用 `gh attestation verify` 校验。 |
 | npm 侧 | `release.yml` **完全不执行任何 npm publish**；npm 发布只由上面的 `publish.yml` staged publishing 负责。 |
 
-维护者操作顺序（`v0.2.0`、`v0.2.1` 与 `v0.3.0` 都已按此执行）：
+维护者操作顺序（`v0.2.0`、`v0.2.1`、`v0.3.0` 与 `v0.4.0` 都已按此执行）：
 
 ```sh
 # 1) 本机确认工作区干净、package.json 的 version 已就位（版本号由发布者手工提升）
 git status --porcelain
 
 # 2) 创建 annotated + GPG 签名 tag（私钥仅在本机使用；本机需能完成 GPG 签名）
-git tag -s v0.3.0 -m "v0.3.0"
+git tag -s v0.4.0 -m "v0.4.0"
 
-# 3) 只推 tag —— release.yml 会构建产物、生成来源证明并创建 Release
-git push origin v0.3.0
+# 3) 只推 tag —— release.yml 会构建产物、生成来源证明并创建 Release（不要用 workflow_dispatch：那样证明会绑到 refs/heads/main）
+git push origin v0.4.0
 
-# 4) 对本机生成的 SHA256SUMS 做分离签名并附到 Release（私钥不进 CI）
-gpg --armor --detach-sign SHA256SUMS
-gh release upload v0.3.0 SHA256SUMS.asc --clobber
+# 4) 取 Release 上 CI 生成的那份 SHA256SUMS，做分离签名并附回 Release（私钥不进 CI）
+gh release download v0.4.0 --pattern SHA256SUMS --clobber
+gpg --armor --detach-sign SHA256SUMS          # 生成 SHA256SUMS.asc
+gh release upload v0.4.0 SHA256SUMS.asc --clobber
 ```
+
+> **为什么第 4 步要下 CI 的 `SHA256SUMS` 而不是签本机 `npm pack` 那份**：本机是 Windows 且 `core.autocrlf=true`，工作树里 `LICENSE-MIT`/`LICENSE-APACHE` 被 checkout 成 CRLF，本机打出的 tgz 是 260311 B / sha256 `0a6fd66c…`，而 CI（Linux checkout，LF）打出的是 260287 B / sha256 `4612be9c…`——两者只差这两个 LICENSE 文件的行尾。在一个 `core.autocrlf=false` 的干净克隆里本机 `npm pack` 复现出的正是 CI 的 `4612be9c…`（`docs/` 之类不进包，`lib/**` 与 `src/**` 逐字节相同）。签错那份会让 `gpg --verify SHA256SUMS.asc SHA256SUMS` 在下载来的附件上对不上。
 
 校验方式：
 
@@ -611,8 +618,9 @@ sha256sum -c SHA256SUMS
 gpg --verify SHA256SUMS.asc SHA256SUMS
 
 # 校验构建来源证明（需要 gh CLI）
-gh attestation verify xinvxueyuan-cordis-plugin-secret-0.3.0.tgz --repo xinvxueyuan/cordis-plugin-secret
+gh attestation verify xinvxueyuan-cordis-plugin-secret-0.4.0.tgz --repo xinvxueyuan/cordis-plugin-secret
 gh attestation verify SHA256SUMS --repo xinvxueyuan/cordis-plugin-secret
+gh attestation verify xinvxueyuan-cordis-plugin-secret-0.4.0.tgz --repo xinvxueyuan/cordis-plugin-secret --format json   # 查 externalParameters.workflow.ref 是否为 refs/tags/v0.4.0
 ```
 
 补充说明：
