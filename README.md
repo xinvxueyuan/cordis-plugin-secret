@@ -565,6 +565,11 @@ npm stage approve <stage-id>                       # 需要 2FA
 同一份包也会发布到 **GitHub Packages**（`npm.pkg.github.com`，`github-packages` job，用内置 `GITHUB_TOKEN`），
 使包在仓库页面上可见、可被 `@xinvxueyuan:registry=https://npm.pkg.github.com` 的消费者安装。
 
+`publish.yml` 的两个发布 job 在日志里都打印了同一份包的 `shasum`（sha1）`22dfadfc613695018adfd5ee09eb8b71b1ba9edc`
+与 `integrity` `sha512-N2aBH5qpKPZPl…==`；对 Release 的 tgz 逐字节计算，得到的正是这两个值（`sha1` 与 `sha512` 都相同），
+所以 npm stage 队列里与 GitHub Packages 上的那份，就是 Release 的那 260287 B（未做的一步是：从 `npm.pkg.github.com`
+下载回来再逐字节比对——那需要认证，本文没有做，如实标注）。
+
 ### GitHub Release 与签名
 
 > **已发生的事实**：`v0.4.0` 的 Release 是 https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.4.0
