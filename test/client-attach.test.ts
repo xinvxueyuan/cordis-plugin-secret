@@ -283,13 +283,21 @@ test('a client without the optional services degrades instead of failing the ent
   // each. The right-column viewer (requirement 1 / O1) is deliberately NOT in
   // this list: it lives behind `ctx.inject(['sidebarRightTabs'])`, which this
   // service-less boot never satisfies.
+  //
+  // Round 5 grows this by exactly two rows: the management card
+  // (`conversation.chat.node`, key `sr-manage`) and its own tool-row placeholder
+  // (`tool.call.toolview`, key `secret_manage`). Neither existing row changed.
+  // Disclosed change: the two expected lists below each gained one entry; no
+  // prior expectation was removed or altered.
   assert.deepEqual(
     bare.registrations.map((entry) => entry.name).sort(),
     [
       'conversation.chat.node',
       'conversation.chat.node',
+      'conversation.chat.node',
       'conversation.input.left',
       'conversation.input.overlay',
+      'tool.call.toolview',
       'tool.call.toolview',
     ],
   )
@@ -298,8 +306,8 @@ test('a client without the optional services degrades instead of failing the ent
       .filter((entry) => entry.name === 'conversation.chat.node')
       .map((entry) => entry.key)
       .sort(),
-    ['secret-request', api.CHIP_KIND],
-    'one registration per chat node kind: the card and the side-car row',
+    ['secret-request', api.CHIP_KIND, 'sr-manage'],
+    'one registration per chat node kind: the request card, the side-car row, and the management card',
   )
   // The reference source is simply absent, exactly like the locale dictionary.
   assert.deepEqual(bare.sources, [])
@@ -1557,4 +1565,361 @@ test('a refused registration inserts nothing and says so, and the failure senten
     api.clearPendingPick()
     restoreFetch()
   }
+})
+
+// ---- the management surface (round 5) ---------------------------------------
+//
+// Three things have to be true of the info box's management face, and these
+// tests are about exactly those: the list shows both halves with the Host's own
+// `can` facts, the two deletion tiers are two different buttons with two
+// different confirmations, and the only field a value can travel in is a masked
+// input a human typed into.
+
+const MANAGE = (globalThis as Record<string, unknown>).__cordisSecretManage as Record<string, any>
+
+/** One management row as the wire carries it, value-free by construction. */
+function manageRow(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    variable: ENV_VAR,
+    name: 'openai',
+    label: 'OpenAI',
+    scope: 'persistent',
+    state: 'staged',
+    source: 'both',
+    can: { unbind: true, delete: true, scope: true, value: true },
+    ...over,
+  }
+}
+
+/** Serve one management list to this page's read. */
+async function withManageList(entries: readonly unknown[], run: () => Promise<void>): Promise<void> {
+  const stub = stubFetch()
+  try {
+    stub.answer.payload = { ok: true, entries }
+    await MANAGE.refreshManage(SESSION_ID)
+    await run()
+  } finally {
+    restoreFetch()
+  }
+}
+
+test('the management readers drop what they cannot understand, and never guess a can', () => {
+  const row = manageRow()
+  assert.deepEqual(MANAGE.readManageEntry(row), {
+    variable: ENV_VAR,
+    name: 'openai',
+    label: 'OpenAI',
+    scope: 'persistent',
+    state: 'staged',
+    source: 'both',
+    can: { unbind: true, delete: true, scope: true, value: true },
+  })
+  // A missing or mangled `can` means "not proven", which is the safe direction
+  // for an action that changes durable state.
+  assert.deepEqual(MANAGE.readManageEntry({ ...row, can: undefined })?.can, {
+    unbind: false,
+    delete: false,
+    scope: false,
+    value: false,
+  })
+  assert.deepEqual(MANAGE.readManageEntry({ ...row, can: { unbind: 'yes' } })?.can, {
+    unbind: false,
+    delete: false,
+    scope: false,
+    value: false,
+  })
+  // Unknown shapes are dropped, never rendered as a half-read row.
+  assert.equal(MANAGE.readManageEntry({ ...row, state: 'bound-and-then-some' }), null)
+  assert.equal(MANAGE.readManageEntry({ ...row, source: 'elsewhere' }), null)
+  assert.equal(MANAGE.readManageEntry({ ...row, variable: undefined }), null)
+  assert.equal(MANAGE.readManageList({ ok: true, entries: [row, 7, null] })?.length, 1)
+  assert.equal(MANAGE.readManageList({ entries: [row] }), null)
+  assert.equal(MANAGE.readManageList(null), null)
+  // The wire row and the reader carry no value field at all.
+  assert.equal(JSON.stringify(MANAGE.readManageEntry(row)).includes(SECRET), false)
+})
+
+test('the management face lists both halves and offers only what the Host proved', async () => {
+  reset()
+  api.setAttachMode({ kind: 'manage' })
+  await withManageList(
+    [
+      manageRow(),
+      manageRow({
+        variable: 'DSH_SECRET_OTHER',
+        name: 'other',
+        label: 'DSH_SECRET_OTHER',
+        scope: 'persistent',
+        state: 'stored',
+        source: 'store',
+        can: { unbind: false, delete: true, scope: false, value: true },
+      }),
+    ],
+    async () => {
+      const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      const text = visibleText(tree)
+      assert.equal(text.includes(api.ATTACH_ZH.manageSectionSession), true)
+      assert.equal(text.includes(api.ATTACH_ZH.manageSectionStore), true)
+      assert.equal(text.includes(ENV_VAR), true)
+      assert.equal(text.includes('DSH_SECRET_OTHER'), true)
+      // The two deletion tiers are two differently-worded buttons.
+      assert.equal(text.includes(api.ATTACH_ZH.manageActUnbind), true)
+      assert.equal(text.includes(api.ATTACH_ZH.manageActDelete), true)
+      assert.notEqual(api.ATTACH_ZH.manageActUnbind, api.ATTACH_ZH.manageActDelete)
+      assert.equal(text.includes(api.ATTACH_ZH.manageActScopeDown), true)
+      const rows = elements(tree).filter((element) => element.props['data-secret-manage-row'] !== undefined)
+      assert.equal(rows.length, 2)
+      // A store-only row offers no unbind and no re-scope — the Host said so.
+      const storeRow = rows.find((element) => element.props['data-secret-manage-row'] === 'store')
+      const storeActions = elements(storeRow)
+        .map((element) => element.props['data-action'])
+        .filter((action: unknown): action is string => typeof action === 'string')
+      assert.deepEqual(storeActions.sort(), ['manage-delete', 'manage-value'])
+      // No value can reach this tree: the face renders names and metadata only.
+      assert.equal(text.includes(SECRET), false)
+    },
+  )
+  reset()
+})
+
+test('cancelling the value form leaves the human’s value nowhere', () => {
+  reset()
+  api.setAttachMode({ kind: 'edit', variable: ENV_VAR, target: 'store' })
+  const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+  const inputs = elements(tree).filter((element) => element.type === 'input')
+  const field = inputs.find((element) => element.props.id === 'dsh-secret-manage-value')
+  assert.notEqual(field, undefined, 'the value form owns a masked input')
+  assert.equal(field?.props.type, 'password')
+  ;(field?.props.onChange as ((event: { target: { value: string } }) => void) | undefined)?.({
+    target: { value: SECRET },
+  })
+  const filled = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+  // Positive control: the value really is in this control's own value (P1), so
+  // the scan below is proving a leak rather than an empty tree.
+  const refilled = elements(filled).find((element) => element.props.id === 'dsh-secret-manage-value')
+  assert.equal(refilled?.props.value, SECRET, 'the masked control holds what the human typed')
+  const elsewhere = elements(filled)
+    .flatMap((element) =>
+      Object.entries(element.props)
+        .filter(([key]) => key !== 'value' && key !== 'onChange' && key !== 'children')
+        .map(([, held]) => JSON.stringify(held) ?? ''),
+    )
+    .join('|')
+  assert.equal(elsewhere.includes(SECRET), false, 'the typed value never lands in an attribute')
+  assert.equal(visibleText(filled).includes(SECRET), false, 'nor in any rendered text')
+  clickAction(filled, 'manage-value-cancel')
+  assert.equal(api.currentMode().kind, 'manage')
+  const back = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+  assert.equal(JSON.stringify(back).includes(SECRET), false, 'cancelling keeps nothing behind')
+  reset()
+})
+
+test('the danger face asks two different questions for the two deletion tiers', () => {
+  reset()
+  api.setAttachMode({ kind: 'danger', variable: ENV_VAR, act: 'unbind' })
+  const unbind = visibleText(renderer.render(CAPSULE, { sessionId: SESSION_ID }))
+  assert.equal(unbind.includes(api.ATTACH_ZH.dangerUnbindTitle), true)
+  assert.equal(unbind.includes('不可恢复'), false, 'unbinding is not irreversible, and must not claim to be')
+  assert.equal(unbind.includes(api.ATTACH_ZH.dangerConfirmUnbind), true)
+
+  api.setAttachMode({ kind: 'danger', variable: ENV_VAR, act: 'delete' })
+  const remove = visibleText(renderer.render(CAPSULE, { sessionId: SESSION_ID }))
+  assert.equal(remove.includes(api.ATTACH_ZH.dangerDeleteTitle), true)
+  assert.equal(remove.includes('不可恢复'), true)
+  assert.equal(remove.includes(api.ATTACH_ZH.dangerConfirmDelete), true)
+  // The two confirmations are different words for different acts.
+  assert.notEqual(api.ATTACH_ZH.dangerConfirmUnbind, api.ATTACH_ZH.dangerConfirmDelete)
+  reset()
+})
+
+test('the scope change keeps the two directions apart, and only one of them is destructive', async () => {
+  reset()
+  api.setAttachMode({ kind: 'manage' })
+  const sent: Record<string, unknown>[] = []
+  const realFetch = (globalThis as Record<string, unknown>).fetch
+  ;(globalThis as Record<string, unknown>).fetch = async (_url: unknown, init?: { body?: unknown }) => {
+    if (init?.body !== undefined) sent.push(JSON.parse(String(init.body)) as Record<string, unknown>)
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        action: 'scope',
+        variable: ENV_VAR,
+        scope: 'session',
+        changed: { session: true, store: false },
+      }),
+    }
+  }
+  try {
+    await MANAGE.refreshManage(SESSION_ID)
+    const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    clickAction(tree, 'manage-scope-session')
+    await flushOneTurn()
+    assert.equal(sent.length, 1)
+    // The non-destructive direction carries no confirmation and no delete.
+    assert.deepEqual(sent[0], { sessionId: SESSION_ID, action: 'scope', variable: ENV_VAR, to: 'session' })
+    assert.equal('confirm' in (sent[0] ?? {}), false, 'the non-destructive direction needs no confirmation')
+    assert.equal(JSON.stringify(sent[0]).includes(SECRET), false)
+    // And the sentence the human reads afterwards must state this direction's
+    // own fact: the store record is kept. The two directions have two different
+    // sentences, and only the deletion one may claim a deletion.
+    assert.equal(api.ATTACH_ZH.reportScopeDown.includes('保留'), true)
+    assert.equal(api.ATTACH_ZH.reportScopeDown.includes('已删除'), false)
+    assert.notEqual(api.ATTACH_ZH.reportScopeDown, api.ATTACH_ZH.reportDelete)
+    assert.equal(api.ATTACH_ZH.reportDelete.includes('已从凭据库删除'), true)
+  } finally {
+    ;(globalThis as Record<string, unknown>).fetch = realFetch
+    reset()
+  }
+})
+
+test('the management seam is a third frozen object, and the two older ones are untouched', () => {
+  assert.equal(Object.isFrozen(MANAGE), true)
+  assert.deepEqual(Object.keys(MANAGE).sort(), [
+    'HiddenSecretManageToolRow',
+    'MANAGE_CARD_KIND',
+    'MANAGE_FAILURE',
+    'MANAGE_FAILURE_UNKNOWN',
+    'MANAGE_META_KIND',
+    'MANAGE_PATH',
+    'MANAGE_TOOL_NAME',
+    'MANAGE_UNREACHABLE',
+    'SecretManageCard',
+    'asManageCardData',
+    'describeManage',
+    'manageActionTitle',
+    'manageErrorFor',
+    'manageFailed',
+    'manageOf',
+    'manageRead',
+    'parseManageCallRequest',
+    'postManage',
+    'readManageEntry',
+    'readManageList',
+    'readManageOutcome',
+    'readManagePending',
+    'refreshManage',
+    'secretManageDefinition',
+    'version',
+  ])
+  // The card's own seam is frozen from the rounds before it: same keys.
+  assert.deepEqual(
+    Object.keys((globalThis as Record<string, unknown>).__cordisSecretClient as object).sort(),
+    [
+      'ANSWER_PATH',
+      'CARD_KIND',
+      'HiddenSecretToolRow',
+      'PENDING_PATH',
+      'TEXT',
+      'TOOL_NAME',
+      'deriveVariable',
+      'findEntry',
+      'mergeRequest',
+      'nextPendingState',
+      'parseCallRequest',
+      'readEntries',
+      'readFailure',
+      'readOutcome',
+      'secretRequestDefinition',
+      'version',
+    ],
+  )
+  // New history events are mirrored in both tables, and the unknown-event rule
+  // still holds: a label lookup for an event nobody renders is not a crash.
+  assert.deepEqual([...api.HISTORY_EVENTS].sort(), Object.keys(api.HISTORY_LABEL).sort())
+  for (const event of ['updated', 'scope-changed', 'unbound', 'deleted']) {
+    assert.equal(api.HISTORY_EVENTS.includes(event), true)
+    assert.notEqual(api.historyEventKey(event), undefined)
+  }
+  assert.equal(api.historyEventKey('invented-by-nobody'), undefined)
+  // And the management card's own tool can never claim the request card's call.
+  const requestCall = { type: 'tool/call', data: { name: 'secret_request', callId: 'c1' } }
+  const manageCall = { type: 'tool/call', data: { name: 'secret_manage', callId: 'c2' } }
+  assert.equal(MANAGE.secretManageDefinition.match(requestCall), null)
+  assert.deepEqual(MANAGE.secretManageDefinition.match(manageCall), { id: 'c2', role: 'start' })
+  const CARD_SEAM = (globalThis as Record<string, unknown>).__cordisSecretClient as Record<string, any>
+  assert.equal(CARD_SEAM.secretRequestDefinition.match(manageCall), null)
+})
+
+// ---------------------------------------------------------------------------
+// Round 5, second pass (the user's ruling ①): the management list's
+// "usable in this session" section covers both directions, and a reader can
+// always tell which one a row came from.
+//
+// These two tests live at the end of the file on purpose: `reset()` does not
+// clear the management list this module caches per session, and the two clicks
+// above read that cache when their own list read is stubbed. Adding a list here
+// would silently repaint their fixture.
+// ---------------------------------------------------------------------------
+
+test('the management readers name the session-side direction, and never guess one', () => {
+  // A row from a Host that predates `origin` stays readable: the field is
+  // information, not an action, so its absence offers nothing.
+  const older = MANAGE.readManageEntry(manageRow())
+  assert.equal(older?.origin, undefined)
+  assert.equal(MANAGE.describeManage(older).includes(api.ATTACH_ZH.manageOriginAttach), false)
+
+  const attached = MANAGE.readManageEntry(manageRow({ origin: 'attach' }))
+  assert.equal(attached?.origin, 'attach')
+  const asked = MANAGE.readManageEntry(
+    manageRow({ variable: 'DSH_SECRET_ASKED', state: 'authorized', origin: 'request' }),
+  )
+  assert.equal(asked?.state, 'authorized')
+  assert.equal(asked?.origin, 'request')
+  // A mangled direction is dropped, never invented.
+  assert.equal(MANAGE.readManageEntry(manageRow({ origin: 'elsewhere' }))?.origin, undefined)
+
+  // The provenance line puts the direction first, so the two classes never read
+  // the same — and a store-only row reports no session-side direction at all.
+  const attachedLine = MANAGE.describeManage(attached)
+  const askedLine = MANAGE.describeManage(asked)
+  assert.equal(attachedLine.includes(api.ATTACH_ZH.manageOriginAttach), true)
+  assert.equal(askedLine.includes(api.ATTACH_ZH.manageOriginRequest), true)
+  assert.equal(askedLine.includes(api.ATTACH_ZH.manageStateAuthorized), true)
+  assert.notEqual(attachedLine, askedLine)
+  const storeLine = MANAGE.describeManage(MANAGE.readManageEntry(manageRow({ state: 'stored', source: 'store' })))
+  assert.equal(storeLine.includes(api.ATTACH_ZH.manageOriginAttach), false)
+  assert.equal(storeLine.includes(api.ATTACH_ZH.manageOriginRequest), false)
+})
+
+test('the management face shows both session-side directions and labels each one', async () => {
+  reset()
+  api.setAttachMode({ kind: 'manage' })
+  await withManageList(
+    [
+      manageRow({
+        variable: 'DSH_SECRET_LOCAL_ONLY',
+        label: 'Local Only',
+        state: 'staged',
+        source: 'session',
+        origin: 'attach',
+      }),
+      manageRow({
+        variable: 'DSH_SECRET_ASKED',
+        label: 'Asked',
+        state: 'authorized',
+        source: 'session',
+        origin: 'request',
+      }),
+    ],
+    async () => {
+      const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      const text = visibleText(tree)
+      assert.equal(text.includes(api.ATTACH_ZH.manageSectionSession), true)
+      assert.equal(text.includes(api.ATTACH_ZH.manageSectionStore), false, 'both rows are session-side')
+      const rows = elements(tree).filter((element) => element.props['data-secret-manage-row'] !== undefined)
+      assert.deepEqual(
+        rows.map((element) => element.props['data-secret-manage-origin']),
+        ['attach', 'request'],
+        'each row carries the direction it came from',
+      )
+      assert.equal(text.includes(api.ATTACH_ZH.manageOriginAttach), true)
+      assert.equal(text.includes(api.ATTACH_ZH.manageOriginRequest), true)
+      assert.equal(text.includes(api.ATTACH_ZH.manageStateAuthorized), true)
+      assert.equal(text.includes(api.ATTACH_ZH.manageStateStaged), true)
+      assert.equal(text.includes(SECRET), false)
+    },
+  )
+  reset()
 })

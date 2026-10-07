@@ -10,7 +10,8 @@
 - Host 半（附加方向）：`POST /api/secret.attach` 把人类填的值**暂存**在进程内存（暂存不等于授权：此时不注入任何变量）；携带标记 `@DSH_SECRET_*` 的用户消息一旦落进会话日志，`session/event` 就把它**提升为按该条消息锚定的授权**；`agent/pre-step` 追加一条**只有变量名**的说明消息，其中逐变量写明这枚标记在模型侧写作 `[secret DSH_SECRET_*]`（正文本身不改写——harness 会让改写落盘，见下文）。
 - Client 半（索取方向）：在 Agent 输出流里渲染**会话流内一级卡片**（`conversation.chat.node`，`key=secret-request`），**无 `shell.overlay` 遮罩**；卡片带 `type="password"` 输入与显示/隐藏切换，把「同意 / 拒绝 / 忽略 / 其他」四个决定、申请理由、用途说明与**授权范围**摆在人类眼前，并允许人类**改写 Agent 请求的范围**。
 - Client 半（附加方向）：在输入区 `conversation.input.left`（紧随「访问模式 / 计划」控件组右侧）加一个**切换式按钮**；按下后在输入框上方（`conversation.input.overlay`）浮起**填值胶囊**；填完点「插入到光标处」，草稿光标处得到**真正的内联 chip**（`data-composer-chip="secret"`，只显示变量名），可在后续 shell 取用；点击该 chip（或刷新后由 lexicon 装饰出的同名引用）会在同一浮层展开**只读详情胶囊**。0.3.0 起，消息旁的**旁挂胶囊**与（被接管后的）**原胶囊**都能打开详情——前者开输入框上方的信息框、后者开右侧栏详情页；信息框内另有**历史记录**区，`@` 菜单会列出可用密钥（详见「人类主动附加密钥（反方向）→ 0.3.0 的四项增强」）。
-- 传输：两个方向的对话框都经本插件自有的、位于 `ctx.connection` 信任栅栏内的 `/api` 路由与 Host 通信。密钥值只出现在 `POST /api/secret.answer` 与 `POST /api/secret.attach` 的请求体里，从不进入 URL / 查询串 / 会话日志 / 响应体。
+- 管理方向（0.4.0）：注册第二个工具 **`secret_manage`**（列举 / 解绑 / 真删 / 改作用域 / 请人类改值）与 `/api/secret.manage`（GET 列举、POST 执行）；**参数集里没有 `value`，Agent 没有任何提交值的通道**——值只能由人类在掩码输入框里键入。人类侧信息框新增「管理 / 改值 / 危险确认」三个面（详见「秘密的完整 CRUD（0.4.0）」）。
+- 传输：两个方向的对话框都经本插件自有的、位于 `ctx.connection` 信任栅栏内的 `/api` 路由与 Host 通信。密钥值只出现在 `POST /api/secret.answer`、`POST /api/secret.attach` 与（仅 `action:"value"` 时）`POST /api/secret.manage` 的请求体里，从不进入 URL / 查询串 / 会话日志 / 响应体。
 
 ## 安全不变量与副作用披露
 
@@ -18,13 +19,13 @@
 
 1. **插件自身的输出永不携带明文**：工具结果、错误消息、日志、事件、渲染文本、HTTP 响应体与 DOM 属性中都不含密钥值；`render()` 只输出变量名与元数据。单测对四种 decision 的所有字段做全量字符串扫描，断言值不出现；Client 半另有断言证明填值胶囊的值不越出那个掩码输入框。**边界**：值确实会按会话注入到 shell 环境（这是本插件的功能），因此"明文不进上下文"取决于 Agent 不回显 `$env:DSH_SECRET_*`，而不是插件的输出通道。
 2. **Agent 只拿到变量名**：`approved` 返回 `{ decision, variable, scope, ref, source }`，`variable` 形如 `DSH_SECRET_OPENAI`。
-3. **值只发给本机 Host**：客户端只向 `/api/secret.answer`（索取方向）与 `/api/secret.attach`（附加方向）发起同源 POST（签名 HttpOnly Cookie + Host/Origin 栅栏），不写 URL、不写 localStorage、不打印 console。附加方向的 `GET /api/secret.attached` 只回传变量名/名称/范围/状态，永不回传值；0.3.0 的 `POST /api/secret.adopt` 同样**不携带值**（由宿主自己从凭据库解析），`GET /api/secret.history` 与 `GET /api/secret.available` 也只回传值无关字段。
+3. **值只发给本机 Host**：客户端只向 `/api/secret.answer`（索取方向）与 `/api/secret.attach`（附加方向）发起同源 POST（签名 HttpOnly Cookie + Host/Origin 栅栏），不写 URL、不写 localStorage、不打印 console。附加方向的 `GET /api/secret.attached` 只回传变量名/名称/范围/状态，永不回传值；0.3.0 的 `POST /api/secret.adopt` 同样**不携带值**（由宿主自己从凭据库解析），`GET /api/secret.history` 与 `GET /api/secret.available` 也只回传值无关字段。0.4.0 的 `GET /api/secret.manage` 只回传变量名与元数据（**无值字段**），`POST /api/secret.manage` 只在 `action:"value"` 时携带人类在掩码框里键入的值——它由人类提交，不经模型。
 4. **会话级密钥不落盘**：`scope: "session"` 的值只存在于进程内存（Host 的暂存表与会话授权表）。落盘只走凭据服务，且只发生在 `persistent`。
 5. **持久化只经凭据服务**：`persistent` 经 `ctx.credentials.set(<变量名>, value)` 写入凭据引用空间（provider 管理的可写源）；同时向记录空间提交一条**不含密钥材料**的标记记录（索取方向 `kind: "grant"`，附加方向 `kind: "attachment"`，payload 只有 `envVar/name/scope/authorizedAt`）。绝不写自建文件，绝不在仓库里存明文。
 6. **会话边界失败关闭**（见「边界处理」）：锚点离开会话表面即撤销并不再注入。
 7. **明文允许存在的全部位置（穷举，仅此六处）**：
-   - P1 填值胶囊的本地输入 state（掩码输入框）；
-   - P2 一次 `POST /api/secret.attach` 的请求体；
+   - P1 填值胶囊 / 管理面「改值」面的本地输入 state（掩码输入框）；
+   - P2 一次 `POST /api/secret.attach`（附加方向）或一次 `action:"value"` 的 `POST /api/secret.manage`（改值方向）的请求体；
    - P3 Host 进程内存里的暂存记录（已登记但尚未随消息发送）；
    - P4 Host 进程内存里的 `GrantStore` 记录（已绑定到某条消息）；
    - P5 **仅当人类显式选择「持久」**时写入的凭据库；
@@ -41,9 +42,9 @@
 - **可能写凭据库（仅当人类显式选「持久」）**：经 `ctx.credentials.set(<变量名>, value)` 写入凭据引用空间，并追加一条不含密钥材料的标记记录；`session` 范围不落盘。
 - **模型侧的改写由注记承担，且注记会落盘（按 source 去重）**：`agent/pre-step` **不改**用户消息正文（harness 会让改写落盘，见「人类主动附加密钥（反方向）→ 模型侧到底看到什么」），而是追加一条只含变量名的注记，其中**逐变量逐字**写出「正文里的 `@DSH_SECRET_*` 即该变量，模型侧写作 `[secret DSH_SECRET_*]`；它不是文件路径」。注记是 durable 的 `user/message`（因此在对话流里是一行注入说明），且**按自身 source 去重**：模型可见 surface 上已有同一条就不再追加，重复引入同一标记不会堆叠。
 - **会在会话日志里留下变量名标记**：人类发送的消息本身（含 `@DSH_SECRET_OPENAI` 这种**变量名**）作为普通 `user/message` 事件持久化。变量名不是密钥材料，但它会长期留在日志里。
-- **会挂 8 条 `/api` 路由**：`/api/secret.pending`(GET)、`/api/secret.attached`(GET)、`/api/secret.attach`(POST)、`/api/secret.release`(POST)、`/api/secret.answer`(POST)，以及 0.3.0 新增的三条——`/api/secret.history`(GET，本会话历史流水)、`/api/secret.available`(GET，`@` 菜单的可用密钥)、`/api/secret.adopt`(POST，把凭据库里的持久记录登记到本会话)。全部位于 `ctx.connection` 的信任栅栏内（本机 / 可信 Host、同源标记、签名浏览器 Cookie）。值只出现在 `attach` 与 `answer` 的请求体里；三条新路由都**不回传值**，`adopt` 的取值也由宿主自己经 `credentials.resolve` 完成，值不跨线。
-- **会注册客户端座位与一个引用源**：`conversation.chat.node`（key `secret-request`）、`tool.call.toolview`（key `secret_request` 的 `null` 占位）、`conversation.input.left`（id `secret-attach-toggle`）、`conversation.input.overlay`（id `secret-attach-capsule`），外加一个名为 `secret` 的 `InputTriggerSource` 与 locale 命名空间 `secretAttach`。0.3.0 起再增加三处**增量**注册：`conversation.chat.node`（key `sr-chip`，消息旁的旁挂胶囊）、`sidebarRightTabs` 的 `secret-attach-detail` 类型，以及它的**正文座位** `sidebar.right.pane.tab`（key `@xinvxueyuan/cordis-plugin-secret/secret-attach-detail`）。该页签的**标题不另注册座位**：注册表走 fallback 取类型自己声明的 `title(address)`，即**变量名**（`src/client/entry.ts:3555`），所以用户看到的结果是对的。`tool.call.toolview` 只替换本插件自己那次调用的泛型工具行，不触碰别的工具；其余都是增量座位。
-- **不做的事**：插件自身不 spawn 子进程、不读写仓库文件、不发起网络请求（除被 Harness 自己的 API 通道承载的那 5 条同源路由外），也没有任何遥测。
+- **会挂 10 条 `/api` 路由**：`/api/secret.pending`(GET)、`/api/secret.attached`(GET)、`/api/secret.attach`(POST)、`/api/secret.release`(POST)、`/api/secret.answer`(POST)，以及 0.3.0 新增的三条——`/api/secret.history`(GET，本会话历史流水)、`/api/secret.available`(GET，`@` 菜单的可用密钥)、`/api/secret.adopt`(POST，把凭据库里的持久记录登记到本会话)，以及 0.4.0 新增的两条——`/api/secret.manage`(GET，管理面列表)、`/api/secret.manage`(POST，执行一个管理动作)。全部位于 `ctx.connection` 的信任栅栏内（本机 / 可信 Host、同源标记、签名浏览器 Cookie）。值只出现在 `attach`、`answer` 与（仅 `action:"value"` 时）`manage` 的请求体里；其余路由都**不回传值**，`adopt` 的取值也由宿主自己经 `credentials.resolve` 完成，值不跨线。
+- **会注册客户端座位与一个引用源**：`conversation.chat.node`（key `secret-request`）、`tool.call.toolview`（key `secret_request` 的 `null` 占位）、`conversation.input.left`（id `secret-attach-toggle`）、`conversation.input.overlay`（id `secret-attach-capsule`），外加一个名为 `secret` 的 `InputTriggerSource` 与 locale 命名空间 `secretAttach`。0.3.0 起再增加三处**增量**注册：`conversation.chat.node`（key `sr-chip`，消息旁的旁挂胶囊）、`sidebarRightTabs` 的 `secret-attach-detail` 类型，以及它的**正文座位** `sidebar.right.pane.tab`（key `@xinvxueyuan/cordis-plugin-secret/secret-attach-detail`）。该页签的**标题不另注册座位**：注册表走 fallback 取类型自己声明的 `title(address)`，即**变量名**（`src/client/entry.ts:3555`），所以用户看到的结果是对的。`tool.call.toolview` 只替换本插件自己那次调用的泛型工具行，不触碰别的工具；其余都是增量座位。0.4.0 再增加两处**增量**注册：`conversation.chat.node`（key `sr-manage`，Agent 侧的管理确认卡）与 `tool.call.toolview`（key `secret_manage` 的 `null` 占位）；同样只影响本插件自己那次调用，且管理面的三个新面都在**既有胶囊组件**里，不新增座位、不新增引用源，`dsh.client.inject` 也不变。
+- **不做的事**：插件自身不 spawn 子进程、不读写仓库文件、不发起网络请求（除被 Harness 自己的 API 通道承载的上面列出的 10 条同源路由外），也没有任何遥测。
 
 ## 安装
 
@@ -334,6 +335,88 @@ if ($env:DSH_SECRET_OPENAI) { "present length=$($env:DSH_SECRET_OPENAI.Length)" 
 - **工具结果里的 `@DSH_SECRET_*` 没有注记解释**（**值无关，不是泄漏**）：注记只为**本步引入的、载有标记的用户消息**追加，所以当同一形状的标记出现在**工具结果**（例如某条命令的回显）里时，它会**原样**进入模型上下文，且那一步的注记不会覆盖它——模型可能按系统提示里"`@` 前缀是文件路径"的约定去解读它，例如尝试读取一个同名文件（会失败）。**它不会因此获得任何值**：这条缺口只涉及"标记的解释范围"，与明文无关；变量名本来就在会话日志、用户气泡与注入说明里可见。**准确定性**：这是解释范围的一个已知缺口（不是未做完的功能），既没有把值带进上下文，也没有影响绑定、授权或 shell 注入。
 - 视觉与真机点击路径需要人工确认（见「边界与已知限制」）。
 
+## 秘密的完整 CRUD（0.4.0）
+
+0.3.0 之前，这个插件只有「要一枚密钥」与「人类附加一枚密钥」两个方向；0.4.0 补上**管理**：Agent 可以在获得人类确认后**列举 / 解绑 / 真删 / 改作用域 / 请人类改值**，人类可以在信息框里做同样的事。核心边界不但没变，还被进一步钉死：**值只能由人类输入，Agent 既拿不到、也提交不了值。**
+
+### Agent 侧工具 `secret_manage`
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `action` | ✅ | `list` / `unbind` / `delete` / `scope` / `value`。 |
+| `variable` | 除 `list` 外 ✅ | 目标变量名，形如 `DSH_SECRET_OPENAI`。 |
+| `to` | 仅 `scope` ✅ | `session` 或 `persistent`。 |
+| `target` | 仅 `value` ✅ | `session`（本会话这份值）或 `store`（凭据库那份值）。 |
+| `reason` | ✅ | 原样展示给要确认的人，也是对方同意的那份理由。 |
+
+**参数集里没有 `value`，也没有任何别名**：`validateManage` 对带 `value` 的调用直接拒绝（「this tool never carries a value; a human types it into the confirmation surface」），而工具 schema 的属性名集合被单测逐字断言为 `{action, reason, target, to, variable}`。
+
+| action | 语义 | 需要人类确认 |
+| --- | --- | --- |
+| `list` | 只读列举：变量名 + 凭据键 + 标签 + 有效作用域 + 状态 + 来源（`session`/`store`/`both` 两个半区）+ 方向（`origin`：`attach`/`request`，仅会话侧的行有）+ Host 亲算的 `can.*`（**这一行支持什么**，不是"你能执行什么"） | 不需要（**委派子代理也可调用**；其渲染会明说写动作只对活跃的会话根代理开放） |
+| `unbind` | 从**本会话**移除：凭据库不动，零持久写 | 需要（主 Agent；一次确认） |
+| `delete` | 从**凭据库真删**：先删引用空间的值，再删记录空间的标记 | 需要（主 Agent；**危险确认**） |
+| `scope` | 改本会话这份的作用域；`to:"persistent"` 会把**本会话已持有的那份值**写入凭据库 | 需要（主 Agent） |
+| `value` | 请人类改值（`target` 决定改哪一份） | 需要（主 Agent）；**值由人类在掩码框键入** |
+
+返回 `{ decision: 'listed' | 'applied' | 'rejected' | 'ignored' | 'other', … }`；失败码：`BAD_REQUEST`、`CALLER_NOT_LIVE`、`DELEGATED_CALLER`、`NO_SESSION`、`NOT_FOUND`、`STORE_EMPTY`、`STORE_SHADOWED`、`STORE_DELETE_FAILED`、`TOO_MANY_PENDING`、`TIMEOUT`、`MANAGE_FAILED`。结算载荷 `presentationMeta` 是 `{v:1, kind:'secret-manage', decision, action?, variable?, scope?, notice?}`，值无关且模型不可见。
+
+### 权限边界（可用单测核查）
+
+- **`list` 是唯一对子代理开放的动作**：它只读且值无关。子代理拿到的永远是**它自己会话**的事实——凭据库那一侧的**全局名字行**（`source:'store'`，`can.unbind`/`can.scope` 均为 `false`）+ 它自己会话的附加/授权记录；父会话自己的变量不会出现。返回里的 `can` 仍然是**这一行支持什么**（与人类信息框读到的是同一事实），因此子代理的列表结果另附一句 value-free 的注意：`unbind`/`delete`/`scope`/`value` 只对活跃的会话根代理开放，子代理调用会得到 `DELEGATED_CALLER`，不会有对话框出现——渲染会原样引用这句话，不把它读成"你可以执行"。
+- **四个写动作只对「活跃的会话根代理」开放**：被委派的子代理得到结构化 `DELEGATED_CALLER`，陈旧 id 得到 `CALLER_NOT_LIVE`，两者都在**创建任何对话框之前**失败，绝不挂起——子代理没有可靠的人类确认通道，就不问。
+- **没有任何 Agent 可达的提交值路径**：工具参数集里**没有 `value`**（schema 不声明这个参数，因此它也不会出现在属性名集合断言里），而**承重的参数层拒绝在服务侧** `validateManage`——任何带 `value` 的调用都会被它直接拒绝（「this tool never carries a value; a human types it into the confirmation surface」）。工具参数根是隐式开放对象（`additionalProperties` 未声明 `false`），所以「拒绝」这件事由服务侧承担，不写成「schema 自身拒绝」。`POST /api/secret.manage` 的请求体只接受 `{sessionId, action, variable, to?, target?, value?, confirm?}`，其中 `value` **仅**在 `action:"value"` 时被接受（其余动作带上它一律 400），且这条路由是**人类界面**的路，不是模型的路。
+- **未确认时零持久副作用**：`delete` 缺 `confirm:true` 直接 400；`unbind` 不接受 `confirm`（它没有不可逆性）；被拒绝 / 忽略 / 超时的确认不写凭据库、不写历史。
+
+### 人类侧信息框（五条路径）
+
+胶囊头部的「管理」链接（以及详情面的「管理」按钮）打开管理面，分两个分区：**本会话可用**（人工附加的 `staged` / `bound` 行 **与** Agent 经 `secret_request` 获得的本会话授权行 `authorized`；每行以 `origin`=`attach`/`request` 与 `state` 如实区分）与**凭据库（持久）**，每行显示变量名 + 凭据键 + 作用域 + 方向 + 来源 + 状态；动作按钮**按 Host 亲算的 `can.*` 渲染**——不可用的动作根本不出现，所以界面不会提供一个注定失败的动作。五条路径：
+
+1. **列表**：两类来源可区分（分区标题与 `source` 都写明「本会话可用」/「凭据库（持久）」）；读不到时用固定文案，不猜。
+2. **改值**：掩码输入（`type=password` + 显示/隐藏），目标写清「改本会话这份值」或「改凭据库里的值」；值只在这个组件的 state 与这一次 POST 体里，提交后清空、取消即丢弃。**Agent 无法替人类做这一步。**
+3. **改作用域**：升为持久 / 降级（见下表）。
+4. **解绑**：只影响本会话，凭据库不动。
+5. **真删**：从凭据库删除记录，危险面上必须**第二次显式点击**（确认按钮文案是「不再持久，并从库中删除」，不是含糊的「确定」）。
+
+**降级给两个明确按钮，各有各的后果**：
+
+| 按钮 | 线上动作 | 后果 |
+| --- | --- | --- |
+| 仅改为本会话（保留库中记录） | `{action:'scope', to:'session'}` | 本会话这份降为 session；**凭据库的值与记录原样保留**，之后仍可升回持久或再登记 |
+| 不再持久，并从库中删除 | `{action:'delete', confirm:true}` | 真正删除凭据库里的值与标记，**不可恢复** |
+
+**解绑 ≠ 真删**：解绑只撤掉本会话的暴露（可逆，库里的记录还在，之后还能再登记）；真删抹掉盘上那份（不可逆，谁都找不回）。两者在动作名、请求体字段、确认强度与历史事件上都分开，不是同一个动作的两个措辞。
+
+**升为持久不要求重新输入值**：`scope → persistent` 用的是**本会话当前持有的那份值**，确认面上逐字写明「将把本会话当前持有的值写入凭据库，并把这份记录改为持久保存」——人类在知情的前提下点同意，不构成"偷偷写库"。
+
+**真删之后**：本会话内存里的那一份**继续可用**（删库不等于撤权），但它的作用域**如实降级为 session**，并在管理列表（`scope: session`）与历史（一条 `deleted`）里如实呈现；该授权照旧随锚点失效、会话结束即消失。
+
+**新增历史事件**：`updated`（人类改值）、`scope-changed`（改作用域）、`unbound`（解绑）、`deleted`（真删），来源均为 `manage`。历史仍是**纯进程内存**：刷新页面还在，宿主重启或插件重载后为空，重放 / 分叉的会话不会重建它——`deleted` 这种"盘上确实变了"的事实也只在历史里留一条内存记录，不落盘。
+
+**需真人确认（本 README 不把它们写成已验证）**：管理入口可达且两个分区读得清；不可用的动作确实不出现；改值链路在活体 shell 里真的换成了新值；升为持久真的写库；真删的现场效果（该行从库侧分区消失、会话侧作用域变「仅本次会话」、历史多一条、**其它三条外来记录一字未动**）；以及用子代理调 `list` 不挂起、调四个写动作得到结构化 `DELEGATED_CALLER`。
+
+### 删除一条遗留测试凭据（现场动作，需人类在场）
+
+发布后若要把早期测试写进凭据库的那条记录清掉，**走信息框的真删路径，不要手改 YAML**（手改会绕过"谁写的、谁确认的、删了什么"三件事）。前置只读核对（**只看键名，不打印任何值**）：
+
+1. `Select-String -Path C:\Users\admin\.dsh\.credentials.yaml -Pattern 'cordis-plugin-secret/dsh-selftest-persist' -Quiet` → 期望 `True`（已是 `False` 说明删过了，到此为止）。
+2. 键前缀必须是 `cordis-plugin-secret/`；同一个文件里 `client-connection/…`、`deepseek-account-platform/…` 这些**别人的记录永不可碰**。
+3. 进程环境里 `DSH_SECRET_DSH_SELFTEST_PERSIST` 必须**未设置**（被启动环境遮蔽时删除会返回 `STORE_SHADOWED` 且不进行第二步；先在自己启动 dsh 的 shell 里 `unset`）。
+
+执行（**两次显式点击**）：打开 Harness Web 本会话 → 输入框左侧「附密钥」按钮 → 胶囊头部「管理」→ 分区「凭据库（持久）」里找到 `DSH_SECRET_DSH_SELFTEST_PERSIST`（同时显示凭据键 `dsh-selftest-persist`）→ 点该行的「不再持久，并从库中删除」→ 读完危险面文案后点带「真删」语义的确认按钮。
+
+**不可恢复性与副作用（逐字告知）**：引用空间的值被原子重写掉（`writeFileAtomic` + 0600），**没有任何副本**，也无法从会话日志反推（日志里只有变量名）；记录空间的标记一并删除，因此**其它会话再也 adopt 不到它**。想再用同一变量，只能重新走 `secret_request` 或重新附加，**重新输入新值**。删除后刷新页面，「管理」面（每次都向 Host 现问）里该行消失，历史里多一条 `deleted`（仅本进程内可见）。若某个会话此前已把它绑到某条消息上，那个会话的内存副本仍在，直到消息回退或会话结束。
+
+### 怎么复测 0.4.0（先重启 `dsh web`）
+
+1. **自动化（不需要浏览器，约 6 秒，自然退出，无需清场）**：
+   ```sh
+   npm run typecheck && npm test
+   ```
+   共 7 个测试文件 / 122 个用例。管理面在 `test/register.test.ts`：两个工具的参数集（逐字断言没有 `value`）、`list`/`unbind`/`delete`/`scope`/`value` 五个动作、五条人类侧路径、降级两个按钮（文案与线上动作都不同）、真删两档（缺 `confirm` 零副作用）、列表两个方向的 `origin` 与委派子代理的可达性注意（含根代理的正对照）；四类新历史事件在 `test/history.test.ts`。`npm test` 若挂住，按仓库红线处理：**先查泄漏**（本插件自己的 teardown/定时器），临时排障才用 `node --test --test-force-exit`，**不得按进程名清场**。
+2. **活体（需真人；管理面每次都向 Host 现问，改完刷新即可再核对）**：按上面「人类侧信息框（五条路径）」逐条点一遍——列举（两个分区读得清）、改值（掩码框）、改作用域（两个降级按钮各点一次，核对其后果不同）、解绑（凭据库不动）、真删（两次点击）。断言点是上面「需真人确认」列出的那些：不可用的动作不出现；改值后活体 shell 里真的是新值；`scope → persistent` 真的写库；真删后该行从库侧分区消失、会话侧作用域如实变「仅本次会话」、历史多一条 `deleted`、其它三条外来记录一字未动；子代理调 `list` 不挂起、调四个写动作得到结构化 `DELEGATED_CALLER`（无对话框）。
+3. **旧版对照**：`git stash` 或 checkout `v0.3.0` 后 `git diff v0.3.0 -- src test` 可看到本轮的全部改动面；`.credentials.yaml` 的基线（大小与 SHA256）应在复测前后逐字节不变。
+
 ## 存储与传播
 
 - `persistent`：值写入凭据**引用空间**（`ctx.credentials.set(<变量名>, value)`）→ 可被其他工具按凭据引用解析；再提交一条 `cordis-plugin-secret/<name>` 的 `grant` 记录作为授权标记（不含值）。
@@ -376,13 +459,17 @@ if ($env:DSH_SECRET_OPENAI) { "present length=$($env:DSH_SECRET_OPENAI.Length)" 
   - **O2**：`persistent` 等待本身超时（`requestTimeoutMs`）时，错误码一律是 `TIMEOUT`，不会被 seam 的 `failed` 包装成 `AUTHORIZATION_FAILED`。
 - **`shellEnv` 的 resolver 是同步的**，而 `ctx.credentials.resolve` 是异步的：无法在每次 shell 执行时回源凭据库。因此授权通过时把值读入该会话的授权表（并在每次注入前做锚点/会话校验），凭据库仍是持久层的真相。**轮换凭据后请重新调用 `secret_request` 刷新会话内副本。**
 - **验证限制**：本插件的安装与注册由 `cordis_inspect_query` 的 Tool/Slots 证据覆盖；卡片的**视觉**（浅色/深色、布局、四档"工作步骤展示"下的实际渲染位置）与附加方向胶囊的**视觉 / 真机点击路径**只有在浏览器里有页面时才可能确认，无浏览器控制时不做渲染器/截图等替代验证。"卡片在四个档位下都位于步骤进程分组之外"由结构证明（节点无 Turn/Step 坐标 ⇒ 根条目、非 process member）加单测（`buildViewNode` 的 `location.kind === 'session'`）覆盖，**未经真人点击/切档验证**。单测覆盖 Host 侧全部纯逻辑、register 级装配与 Client 半的纯逻辑（节点状态机、四态判定、表单控件、明文不越界、以及浏览器产物在真 cordis 上下文里的 boot）；真机点击路径需要人工确认。
+- **0.4.0 的三条已知限制（如实记录）**：
+  - **管理列表里一个变量只占一行，「本会话可用」分区同时覆盖两个方向**：人工附加（`staged` / `bound`）**与** Agent 经 `secret_request` 获得的本会话授权（`authorized`）都在这个分区里，每行以 `origin`（`attach` / `request`）与 `state` 如实区分，`can` 仍是 Host 亲算的**行能力**。若**同一变量**同时存在两个方向的会话侧记录（例如已有一条会话内授权，又用 `@` 菜单把同一变量登记了一次），列表仍只给一行——仍以附加方向那一行为准，此时那个 `unbind` 作用于附加下来的暂存记录。
+  - **记录键可能撞名**：记录键由 name 推导，`recordKeyId` 把 `_` 换成 `-`，所以 `a_b` 与 `a-b` 指向同一条记录键；真删按记录键寻址，撞键时删掉的是同一条。
+  - **历史里 `deleted` 行的 `scope` 字段记的是「被删掉那条的作用域」**（`persistent`），不是"现在还剩什么"；会话里那份的当前作用域以管理列表为准（`session`）。
 - **0.3.0 新增的"需真人确认"清单（如实标注，未验证即写"未验证"）**：① **旁挂胶囊确实渲染在用户气泡之后**（含四档"工作步骤展示"下的实际位置与视觉贴合）；② **点旁挂胶囊**打开的是输入框上方的信息框；③ **点原胶囊**打开的是右侧栏详情页（且**不再是**"文件不存在"），以及页面顶栏右栏行为符合预期；④ **原胶囊接管的可争用性**在现场的表现（装/卸 `dsh-better-sidebar`，或临时注册一个更长的同档 pattern，观察是否被静默抢走）；⑤ **移除即撤销**的真实时序（删掉 → 约 0.6s 后 `GET /api/secret.attached` 不再是 `staged`；删掉后 600ms 内插回 ⇒ 记录仍在；**发送不得触发撤销**）；⑥ **历史区**在刷新后仍在、宿主重启/插件重载后清空、重放/分叉会话不重建；⑦ **`@` 菜单**两类来源的 `section`/`description` 文案在实际宽度下不被截断，且凭据库条目的确认→登记→插入链路真的能取到值。以上 7 项在无浏览器控制时均为**需真人确认**，本 README 不把它们写成已验证。
 
 ## 开发
 
 ```sh
 npm run typecheck   # tsc：Host 半（Node）+ Client 半（DOM），erasableSyntaxOnly，兼容 Node 原生类型剥离
-npm test            # node --test 六个文件：
+npm test            # node --test 七个文件：
                     #   test/unit.test.ts         参数校验、变量名推导、decision 映射、session/persistent 路由、
                     #                             四类返回都不含值、锚点撤销、fork 不继承、压缩不误撤销（含真实表面折叠）、
                     #                             子代理失败关闭、超时、O1（已答复但落库失败 ⇒ 降级 session 并如实回报）、
@@ -390,7 +477,9 @@ npm test            # node --test 六个文件：
                     #                             env contributor 注入与撤销、adapters 端口映射
                     #   test/register.test.ts      用真实 apply + 假 Context 走完整链路：工具/路由/session-disposed 注册、
                     #                             Config 校验、tool→卡片→shellEnv 的值交付、回退与会话结束后的取回消失、
-                    #                             persistent 经 authorization seam 落库且标记不含值、409 冲突
+                    #                             persistent 经 authorization seam 落库且标记不含值、409 冲突、
+                    #                             0.4.0 管理面（工具/两条路由/五条路径/降级两按钮/真删两档）、
+                    #                             管理列表两个方向（`origin`：人工附加 + Agent 索要）与委派子代理的可达性注意
                     #   test/client-card.test.ts   以 __ModuleLoader__ + 假 React 加载浏览器产物：节点在 tool/call 即存在且
                     #                             无 Turn 坐标、结算态来自 meta、注册面恰好两处（无 shell.overlay/composer）、
                     #                             假过期四态（不可达/未列出/已提交）、表单控件齐备、明文不越出掩码输入
@@ -407,7 +496,12 @@ npm test            # node --test 六个文件：
                     #                             0.3.0 起还覆盖：旁挂节点定义的 match/buildViewNode 与其 key 的
                     #                             排序性质、`@` 菜单候选的两类来源与描述、凭据库条目的确认分支、
                     #                             历史读取器的防御式校验、撤销判定 `decideWithdraw` 的真值表；
-                    #                             Host 侧的历史存储/三条新路由/release 的 reason 由上述 Host 用例覆盖
+                    #                             Host 侧的历史存储/三条新路由/release 的 reason 由上述 Host 用例覆盖；
+                    #                             0.4.0 第二轮补：管理列表两方向的读取器/渲染与 `origin` 文案
+                    #   test/history.test.ts       0.4.0 补上的关键缺口：**没有任何 Host 侧测试断言 HistoryStore 的写入点**
+                    #                             之前是真的。四类新事件（updated / scope-changed / unbound / deleted）
+                    #                             各由驱动它的 service 方法产生，再断言事件、来源（manage）、作用域与有界环形缓冲；
+                    #                             并断言每条记录都值无关（细节扫描 0 命中）
 npm run build       # 产出 lib/（Host 半 + 浏览器产物 ./client）
 ```
 

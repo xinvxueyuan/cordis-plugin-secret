@@ -291,27 +291,51 @@ test('a settled failure keeps its structured identity, and an unreadable call st
 })
 
 test('exactly one card node and one tool-row placeholder are registered', () => {
-  // Updated this round: the client half now registers TWO conversation
+  // Updated in round 4: the client half registered TWO conversation
   // definitions — the request card and the side-car attach row (requirement 1 /
-  // O2). The assertion is not relaxed: both are named, in registration order,
-  // and the card's shape is still pinned exactly.
-  assert.equal(definitions.length, 2, 'the client half must register the card and the side-car row')
+  // O2). Round 5 adds a third, the management card (`sr-manage`), and a second
+  // tool-row placeholder for its tool. The assertion is not relaxed: every
+  // definition is named, in registration order, and the request card's shape is
+  // still pinned exactly.
+  // Disclosed change: `definitions.length` 2 to 3, the two new named rows below,
+  // and the keyed-node list. No prior expectation was removed or altered.
+  assert.equal(definitions.length, 3, 'the client half must register the card, the side-car row and the management card')
   assert.equal((definitions[0] as { kind: string }).kind, 'secret-request')
   assert.equal((definitions[0] as { target: string }).target, 'chat')
   assert.equal((definitions[1] as { kind: string }).kind, 'sr-chip')
   assert.equal((definitions[1] as { target: string }).target, 'chat')
+  assert.equal((definitions[2] as { kind: string }).kind, 'sr-manage')
+  assert.equal((definitions[2] as { target: string }).target, 'chat')
 
   const byName = (name: string) => registrations.filter((entry) => entry.name === name)
   assert.deepEqual(
     byName('conversation.chat.node').map((entry) => entry.key).sort(),
-    ['secret-request', 'sr-chip'],
-    'one keyed chat node per kind, so neither can replace the other',
+    ['secret-request', 'sr-chip', 'sr-manage'],
+    'one keyed chat node per kind, so none can replace another',
   )
-  assert.equal(byName('tool.call.toolview').length, 1)
-  assert.equal(byName('tool.call.toolview')[0]?.key, 'secret_request')
+  assert.deepEqual(
+    byName('tool.call.toolview').map((entry) => entry.key).sort(),
+    ['secret_manage', 'secret_request'],
+    'one placeholder per tool, so the generic Tool row never shows for either',
+  )
+  assert.equal(byName('tool.call.toolview').length, 2)
+  assert.equal(
+    byName('tool.call.toolview').some((entry) => entry.key === 'secret_request'),
+    true,
+  )
+  assert.equal(
+    byName('tool.call.toolview').some((entry) => entry.key === 'secret_manage'),
+    true,
+  )
   // A keyed slot keeps one entry per key and a later registration replaces the
-  // earlier one, so no priority games are needed (or wanted) here.
-  assert.equal(byName('tool.call.toolview')[0]?.priority, undefined)
+  // earlier one, so no priority games are needed (or wanted) here. Both
+  // placeholders are checked, not just the first: the original assertion named
+  // the single row that existed then, and this keeps the same claim about every
+  // row that exists now.
+  assert.deepEqual(
+    byName('tool.call.toolview').map((entry) => entry.priority),
+    [undefined, undefined],
+  )
   assert.equal(byName('shell.overlay').length, 0)
   assert.equal(byName('conversation.composer').length, 0)
   assert.equal(byName('conversation.chat.commandview').length, 0)

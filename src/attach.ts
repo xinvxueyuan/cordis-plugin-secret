@@ -29,6 +29,21 @@ export interface StagedAttach {
 /** Timer seam so tests never depend on the wall clock (mirrors `Scheduler`). */
 export type AttachScheduler = (delayMs: number, callback: () => void) => () => void
 
+/**
+ * The store's own copy of one staged entry.
+ *
+ * `scope` and `value` are the two fields a human may change in place (the info
+ * box's re-scope and re-value actions), and they are the only two the store
+ * treats as mutable. Both are edited *in place* on purpose: the TTL timer drops
+ * an entry by comparing the object it was armed for against what the map holds
+ * (`put` above), so replacing the object would disarm the bound that keeps a
+ * value out of a long-lived process.
+ */
+interface MutableStagedAttach extends StagedAttach {
+  scope: SecretScope
+  value: string
+}
+
 /** Why one staged attach left the store. */
 export type AttachDropReason =
   /** The TTL elapsed before the entry was sent. */
@@ -67,7 +82,7 @@ export interface StagedWrite {
  * message can never be injected into a shell.
  */
 export class AttachStore {
-  private readonly items = new Map<string, StagedAttach>()
+  private readonly items = new Map<string, MutableStagedAttach>()
   private readonly timers = new Map<string, () => void>()
   private readonly deps: AttachStoreDeps
 
@@ -97,7 +112,7 @@ export class AttachStore {
     const key = pairKey(input.sessionId, input.envVar)
     const replaced = this.items.has(key)
     if (!replaced && this.countFor(input.sessionId) >= this.deps.capacity) return undefined
-    const stored: StagedAttach = { ...input }
+    const stored: MutableStagedAttach = { ...input }
     this.clearTimer(key)
     this.items.set(key, stored)
     this.timers.set(
@@ -114,6 +129,36 @@ export class AttachStore {
   /** One staged attach, or undefined. */
   get(sessionId: string, envVar: string): StagedAttach | undefined {
     return this.items.get(pairKey(sessionId, envVar))
+  }
+
+  /**
+   * Change one staged entry's scope in place.
+   *
+   * In place, and never through `put`: `put` re-arms the TTL, and a management
+   * action must not extend how long a value sits in memory. The entry's
+   * identity is also what the TTL timer compares against, so replacing the
+   * object would silently disarm that bound.
+   *
+   * @returns true when a staged entry was there and its scope really changed.
+   */
+  reScope(sessionId: string, envVar: string, scope: SecretScope): boolean {
+    const stored = this.items.get(pairKey(sessionId, envVar))
+    if (stored === undefined || stored.scope === scope) return false
+    stored.scope = scope
+    return true
+  }
+
+  /**
+   * Replace the value one staged entry holds, in place and for the same
+   * reasons {@link reScope} gives. The old value has no other copy in the store.
+   *
+   * @returns true when a staged entry was there to change.
+   */
+  reValue(sessionId: string, envVar: string, value: string): boolean {
+    const stored = this.items.get(pairKey(sessionId, envVar))
+    if (stored === undefined) return false
+    stored.value = value
+    return true
   }
 
   /** Every staged attach of one session, oldest first. */

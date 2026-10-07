@@ -93,6 +93,26 @@ export function credentialsPort(ctx: Context): CredentialsPort {
       // that never existed.
       return record.kind === 'grant' ? { kind: record.kind, payload: record.payload } : undefined
     },
+    // The removal half. Both are optional capabilities for the same reason
+    // enumeration is: a store that cannot remove answers "cannot", and the
+    // management surface then reports that it could not delete anything rather
+    // than claiming it did. `unset` removes the value from the reference space
+    // and `deleteRecord` removes the marker from the record space — two
+    // disjoint key spaces, so a real deletion needs both.
+    unset: async (ref) => {
+      if (typeof credentials.unset !== 'function') return false
+      await credentials.unset(ref as CredentialRef)
+      return true
+    },
+    deleteRecord: async (key) => {
+      if (typeof credentials.deleteRecord !== 'function') return false
+      await credentials.deleteRecord(key as CredentialKey)
+      return true
+    },
+    describeRecord: async (key) => {
+      if (typeof credentials.describeRecord !== 'function') return undefined
+      return await credentials.describeRecord(key as CredentialKey)
+    },
   }
 }
 
@@ -124,6 +144,13 @@ export function authorizationPort(ctx: Context): AuthorizationPort {
               placeholder: '粘贴密钥后点击「同意」',
             })
             await input.persist(value)
+          } else if (input.preloaded !== undefined) {
+            // The value is already held by this session (a staged entry, or a
+            // grant), and the human consented to making it durable. Writing it
+            // here — inside the attempt, before the commit — is the same order
+            // the prompt path above runs in, so the "value may be stored even
+            // though the attempt failed" caveat keeps exactly its old shape.
+            await input.persist(input.preloaded)
           }
           await session.commit({ kind: 'grant', payload: input.marker() })
         },

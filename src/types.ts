@@ -112,6 +112,27 @@ export interface PendingView {
   /** True when a value is already stored, so the dialog hides the value field. */
   readonly alreadyConfigured: boolean
   readonly createdAt: number
+  /**
+   * Present only for a `secret_manage` interaction: which action is waiting.
+   *
+   * Additive and optional on purpose. A `secret_request` interaction carries
+   * none of these, and a reader that predates them simply ignores them, so the
+   * request card's own contract is untouched.
+   */
+  readonly action?: Exclude<SecretManageAction, 'list'>
+  /** Present only for `action:'value'`: which half the value replaces. */
+  readonly target?: SecretManageTarget
+  /** Present only for `action:'scope'`: the scope the exposure should become. */
+  readonly to?: SecretScope
+  /**
+   * Whether an approval must carry a value.
+   *
+   * The Host decides this per interaction (a manage `value` action always
+   * needs one, a manage `delete` never does), and the answer route holds an
+   * approval to it. Absent, the answer route falls back to the request
+   * direction's own rule (`!alreadyConfigured`).
+   */
+  readonly expectValue?: boolean
 }
 
 /**
@@ -205,9 +226,23 @@ export type SecretHistoryEvent =
   | 'expired'
   /** An agent-asked authorization produced a grant. */
   | 'authorized'
+  /** A human replaced this variable's material (the value, never the name). */
+  | 'updated'
+  /** The variable's scope changed; the entry's own `scope` is what it became. */
+  | 'scope-changed'
+  /** This session's exposure was withdrawn deliberately (not by an anchor loss). */
+  | 'unbound'
+  /** The durable credential-store record (value and marker) was removed. */
+  | 'deleted'
 
 /** Which direction produced one history entry. */
-export type SecretHistorySource = 'attach' | 'request'
+export type SecretHistorySource =
+  /** The human attached it to their own message. */
+  | 'attach'
+  /** The agent asked for it through `secret_request`. */
+  | 'request'
+  /** Somebody managed it through `secret_manage` or the info box. */
+  | 'manage'
 
 /**
  * One record of the session's attachment/authorization history.
@@ -260,4 +295,152 @@ export interface SecretAvailableEntry {
   readonly scope: SecretScope
   readonly state: SecretAvailableState
   readonly source: SecretAvailableSource
+}
+
+/** One management action. `list` reads; the other four change something. */
+export type SecretManageAction =
+  /** Enumerate what this session may use, plus what the store holds. */
+  | 'list'
+  /** Remove the variable from this session only. Never touches the store. */
+  | 'unbind'
+  /** Remove the durable credential-store record (value and marker). */
+  | 'delete'
+  /** Re-scope this session's exposure. */
+  | 'scope'
+  /** Replace the material with a value a human typed. */
+  | 'value'
+
+/** Which half of one variable a management action addresses. */
+export type SecretManageTarget = 'session' | 'store'
+
+/** Where one management row's facts come from. */
+export type SecretManageSource = 'session' | 'store' | 'both'
+
+/**
+ * Lifecycle of one row of the management list.
+ *
+ * `staged`/`bound` are the attach direction's two states (the `@` menu's own
+ * vocabulary); `authorized` is the ask direction's — a live grant the human
+ * approved for this session through `secret_request`, with no attach record
+ * behind it; `stored` means the row has no session side at all.
+ */
+export type SecretManageState = SecretAvailableState | 'authorized'
+
+/**
+ * Which session-side direction put one management row there.
+ *
+ * `attach` is the human's own direction (the `@` menu: a staged entry, or a
+ * grant bound to a message); `request` is the ask direction (`secret_request`,
+ * approved by the human in the dialog). The two must stay distinguishable, and
+ * the field is present exactly when the row has a session side: a store-only
+ * row describes no session-side record, so it carries no origin.
+ */
+export type SecretManageOrigin = 'attach' | 'request'
+
+/**
+ * Which actions the Host proved are currently possible for one row.
+ *
+ * Computed by the Host from live facts (never inferred by a client, never taken
+ * from the caller), so a UI can hide what cannot be done instead of offering an
+ * action that would only fail.
+ *
+ * Declared as an object type alias (not an interface) for the reason the result
+ * arms below give: a lossless JSON value the tool output contract accepts.
+ */
+export type SecretManageCan = {
+  readonly unbind: boolean
+  readonly delete: boolean
+  readonly scope: boolean
+  readonly value: boolean
+}
+
+/** One row of the management surface. Never carries a value. */
+export type SecretManageEntry = {
+  readonly variable: string
+  readonly name: string
+  readonly label: string
+  readonly scope: SecretScope
+  readonly state: SecretManageState
+  readonly source: SecretManageSource
+  /** Present exactly when this row has a session side: who created it. */
+  readonly origin?: SecretManageOrigin
+  readonly can: SecretManageCan
+}
+
+/** Arguments the agent supplies to `secret_manage`. There is no value field. */
+export type SecretManageInput = {
+  readonly action: SecretManageAction
+  /** Required for every action except `list`. */
+  readonly variable?: string
+  /** Required for `scope`: the scope this session's exposure should become. */
+  readonly to?: SecretScope
+  /** Required for `value`: which half the human's new value replaces. */
+  readonly target?: SecretManageTarget
+  /** Why this is being asked; shown verbatim to the human who confirms it. */
+  readonly reason: string
+}
+
+/** What one management submission changed, as both surfaces report it. */
+export type SecretManageChange = {
+  /** This session's own record (a staged entry or a live grant) changed. */
+  readonly session: boolean
+  /** The durable credential-store record changed. */
+  readonly store: boolean
+}
+
+/** The listing: what this session may use. Carries names and metadata only. */
+export type SecretManageListedResult = {
+  readonly decision: 'listed'
+  /**
+   * A mutable array on purpose: a result is handed to the tool output contract
+   * as a JSON value, and `readonly T[]` is not assignable to one.
+   */
+  readonly entries: SecretManageEntry[]
+  readonly notice?: string
+}
+
+/** The action ran (or was a no-op the Host can account for). */
+export type SecretManageAppliedResult = {
+  readonly decision: 'applied'
+  readonly action: Exclude<SecretManageAction, 'list'>
+  readonly variable: string
+  /** The scope in force after the action. */
+  readonly scope: SecretScope
+  readonly changed: SecretManageChange
+  readonly notice?: string
+}
+
+/** Everything `secret_manage` can return. Never contains a secret value. */
+export type SecretManageResult =
+  | SecretManageListedResult
+  | SecretManageAppliedResult
+  | SecretRejectedResult
+  | SecretIgnoredResult
+  | SecretOtherResult
+
+/** The decisions a management result can carry (adds the two non-dialog arms). */
+export type SecretManageDecision = SecretDecisionKind | 'listed' | 'applied'
+
+/**
+ * Value-free settlement payload of `secret_manage`, persisted on
+ * `tool/result.meta` exactly as the request tool's own meta is.
+ */
+export type SecretManageMeta = {
+  readonly v: 1
+  readonly kind: 'secret-manage'
+  readonly decision: SecretManageDecision
+  /** Present for `applied`. */
+  readonly action?: Exclude<SecretManageAction, 'list'>
+  /** Present for `applied`. */
+  readonly variable?: string
+  /** Present for `applied`. */
+  readonly scope?: SecretScope
+  /** Present for `listed`: how many rows the agent was told about. */
+  readonly count?: number
+  /** Additive, value-free diagnostic. */
+  readonly notice?: string
+  /** Present only for `rejected`. */
+  readonly reason?: string
+  /** Present only for `other`. */
+  readonly text?: string
 }

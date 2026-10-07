@@ -127,6 +127,16 @@ interface PendingEntry {
   readonly variable?: string
   readonly alreadyConfigured?: boolean
   readonly createdAt?: number
+  /**
+   * Present only for a management interaction: which action is waiting.
+   *
+   * A request-direction interaction carries none of these four fields, which is
+   * exactly how the management card refuses to claim one (and vice versa).
+   */
+  readonly action?: 'unbind' | 'delete' | 'scope' | 'value'
+  readonly target?: 'session' | 'store'
+  readonly to?: Scope
+  readonly expectValue?: boolean
 }
 
 /** What one poll learned. `unreachable` is never evidence that a request ended. */
@@ -459,6 +469,15 @@ function readEntry(raw: unknown): PendingEntry | null {
     ...(variable === undefined ? {} : { variable }),
     ...(record.alreadyConfigured === true ? { alreadyConfigured: true } : {}),
     ...(createdAt === undefined ? {} : { createdAt }),
+    // The four management fields. Read one by one and only when they are
+    // well-formed, so a mangled payload can never make this card offer an
+    // action the Host did not state.
+    ...(record.action === 'unbind' || record.action === 'delete' || record.action === 'scope' || record.action === 'value'
+      ? { action: record.action }
+      : {}),
+    ...(record.target === 'session' || record.target === 'store' ? { target: record.target } : {}),
+    ...(scopeOf(record.to) === undefined ? {} : { to: scopeOf(record.to) as Scope }),
+    ...(record.expectValue === true ? { expectValue: true } : {}),
   }
 }
 
@@ -1143,6 +1162,20 @@ const AVAILABLE_PATH = '/api/secret.available'
 /** Register one durably stored secret for this session (the `@` menu's pick). */
 const ADOPT_PATH = '/api/secret.adopt'
 /**
+ * The management surface: one path, two methods.
+ *
+ * GET lists (value-free); POST performs exactly one action, named by a closed
+ * enum in the body. That closed enum is what keeps "从本会话移除" and "从凭据库
+ * 真删" as separate wire actions rather than one action with a flag.
+ */
+const MANAGE_PATH = '/api/secret.manage'
+/** The agent tool the management card belongs to. */
+const MANAGE_TOOL_NAME = 'secret_manage'
+/** Chat node kind of the management card. */
+const MANAGE_CARD_KIND = 'sr-manage'
+/** Value-free settlement payload kind the Host persists for that tool. */
+const MANAGE_META_KIND = 'secret-manage'
+/**
  * Chat node kind of the attached-secret row (requirement 1 / O2).
  *
  * The engine keys one node as `${kind.length}:${kind}${id}`
@@ -1287,6 +1320,62 @@ const ATTACH_ZH: Record<string, string> = {
   descSessionStagedPersistent: '本会话 · 持久保存到凭据库 · 已登记，等待发送',
   descSessionBoundPersistent: '本会话 · 持久保存到凭据库 · 已绑定到消息',
   descStore: '凭据库 · 持久保存到凭据库 · 尚未用于本会话',
+  // Round 5: the management surface. Every action says what it will do to which
+  // half, because that is the distinction the two deletion tiers depend on.
+  manageLink: '管理',
+  manageTitle: '管理密钥（本会话与凭据库）',
+  manageReading: '正在读取管理列表…',
+  manageUnavailable: '暂时无法读取管理列表（「读不到」不等于「没有」）。',
+  manageEmpty: '本会话与凭据库里都没有可管理的变量。',
+  manageSectionSession: '本会话可用',
+  manageSectionStore: '凭据库（持久）',
+  manageNotice: '这里只显示变量名与元数据：值只在人类输入时存在，永不显示也永不回显。真删会同时删除凭据库里的值与授权标记，不可恢复。',
+  manageSourceSession: '本会话',
+  manageSourceStore: '凭据库',
+  manageSourceBoth: '本会话 + 凭据库',
+  manageOriginAttach: '人工附加',
+  manageOriginRequest: 'Agent 索要',
+  manageStateStaged: '已登记，等待发送',
+  manageStateBound: '已绑定到消息',
+  manageStateAuthorized: '已授权（Agent 经 secret_request 获得）',
+  manageStateStored: '仅在凭据库',
+  manageActValue: '改值',
+  manageActScopeUp: '升为持久',
+  manageActScopeDown: '仅改为本会话（保留库中记录）',
+  manageActUnbind: '解绑',
+  manageActDelete: '不再持久，并从库中删除',
+  manageNone: '这条目前没有可执行的管理动作。',
+  manageDone: '已完成：',
+  manageScopeUpLead: '将把本会话当前持有的值写入凭据库，并把这份记录改为持久保存。',
+  manageScopeUpCurrent: '当前值（掩码显示，永不回显）：',
+  manageDeleteLead: '这会删除凭据库里的值与授权标记，所有会话都将再也用不到它，且不可恢复；本会话内存里那一份继续可用，作用域会如实降为「仅本次会话」。',
+  editTitleSession: '改本会话这份值',
+  editTitleStore: '改凭据库里的值',
+  editValueLabel: '新密钥内容',
+  editValuePlaceholder: '粘贴新的密钥…',
+  editHintSession: '只替换本会话内存里的这一份，凭据库不动；变量名、作用域与锚点都不变。',
+  editHintStore: '写入凭据库并重提授权标记；本会话里的那一份也会同步替换。',
+  editApply: '写入',
+  editNoValue: '请先填入新的密钥内容。',
+  editFailed: '这次改值失败，未做任何改动。',
+  editUnreachable: '暂时无法连接宿主，未做任何改动。',
+  dangerUnbindTitle: '从本会话移除这个变量？',
+  dangerUnbindBody: '只影响本会话：变量立刻不再注入。凭据库里的记录不动，之后还可以再登记回来。',
+  dangerDeleteTitle: '从凭据库真删这条记录？',
+  dangerDeleteBody: '会删除凭据库里的值与授权标记：所有会话都将再也用不到它，且不可恢复。本会话内存里那一份仍然保留，但作用域会如实降为「仅本次会话」。',
+  dangerConfirmUnbind: '解绑',
+  dangerConfirmDelete: '不再持久，并从库中删除',
+  evUpdated: '值已改（人类输入）',
+  evScopeChanged: '作用域已改',
+  evUnbound: '已从本会话移除',
+  evDeleted: '已从凭据库删除',
+  sourceManage: '管理',
+  reportUnbind: '已从本会话移除；凭据库未改动。',
+  reportDelete: '已从凭据库删除这条记录（值与授权标记）。',
+  reportScopeUp: '已升为持久保存；本会话这份值已写入凭据库。',
+  reportScopeDown: '已降为仅本次会话；凭据库里的记录保留（要连记录一起删，请用「真删」）。',
+  reportValueSession: '本会话这份值已改（人类输入）。',
+  reportValueStore: '凭据库里的值已改，本会话这份已同步。',
 }
 const ATTACH_EN: Record<string, string> = {
   toggle: 'Attach secret',
@@ -1380,6 +1469,60 @@ const ATTACH_EN: Record<string, string> = {
   descSessionStagedPersistent: 'This session · durable in the credential store · registered, waiting to be sent',
   descSessionBoundPersistent: 'This session · durable in the credential store · bound to a message',
   descStore: 'Credential store · durable in the credential store · not used in this session yet',
+  manageLink: 'Manage',
+  manageTitle: 'Manage secrets (this session and the credential store)',
+  manageReading: 'Reading the management list…',
+  manageUnavailable: 'The management list cannot be read right now (unreadable is not the same as empty).',
+  manageEmpty: 'Neither this session nor the credential store holds anything to manage.',
+  manageSectionSession: 'Usable in this session',
+  manageSectionStore: 'Credential store (durable)',
+  manageNotice: 'Only variable names and metadata are shown here: a value exists only while a human types it, and is never displayed or echoed. A real delete removes both the stored value and its authorization marker, irreversibly.',
+  manageSourceSession: 'This session',
+  manageSourceStore: 'Credential store',
+  manageSourceBoth: 'This session + credential store',
+  manageOriginAttach: 'Attached by a human',
+  manageOriginRequest: 'Requested by the agent',
+  manageStateStaged: 'Registered, waiting to be sent',
+  manageStateBound: 'Bound to a message',
+  manageStateAuthorized: 'Authorized (obtained by the agent through secret_request)',
+  manageStateStored: 'In the credential store only',
+  manageActValue: 'Change value',
+  manageActScopeUp: 'Make durable',
+  manageActScopeDown: 'Make session-only (keep the record)',
+  manageActUnbind: 'Unbind',
+  manageActDelete: 'Stop being durable and delete it',
+  manageNone: 'Nothing can be managed for this row right now.',
+  manageDone: 'Done: ',
+  manageScopeUpLead: 'This writes the value this session currently holds into the credential store, and makes this record durable.',
+  manageScopeUpCurrent: 'Current value (masked, never echoed):',
+  manageDeleteLead: 'This deletes the stored value and its authorization marker: no session can use it again, and it cannot be recovered. The copy in this session’s memory keeps working, and its scope is reported as “this session only”.',
+  editTitleSession: 'Change this session’s value',
+  editTitleStore: 'Change the stored value',
+  editValueLabel: 'New secret value',
+  editValuePlaceholder: 'Paste the new secret…',
+  editHintSession: 'Replaces only this session’s in-memory copy; the credential store is untouched. The variable name, scope and anchor all stay the same.',
+  editHintStore: 'Writes to the credential store and re-commits the authorization marker; this session’s copy is replaced too.',
+  editApply: 'Write',
+  editNoValue: 'Enter the new secret value first.',
+  editFailed: 'This change failed; nothing was modified.',
+  editUnreachable: 'The host is unreachable; nothing was modified.',
+  dangerUnbindTitle: 'Remove this variable from this session?',
+  dangerUnbindBody: 'This session only: the variable stops being injected immediately. The credential-store record is untouched and can be registered again later.',
+  dangerDeleteTitle: 'Delete this record from the credential store?',
+  dangerDeleteBody: 'This removes the stored value and its authorization marker: no session can use it again, and it cannot be recovered. The copy still held in this session’s memory stays usable, but its scope is reported as “this session only”.',
+  dangerConfirmUnbind: 'Unbind',
+  dangerConfirmDelete: 'Stop being durable and delete it',
+  evUpdated: 'Value changed (human input)',
+  evScopeChanged: 'Scope changed',
+  evUnbound: 'Removed from this session',
+  evDeleted: 'Deleted from the credential store',
+  sourceManage: 'managed',
+  reportUnbind: 'Removed from this session; the credential store is untouched.',
+  reportDelete: 'Deleted this record (value and authorization marker) from the credential store.',
+  reportScopeUp: 'Now durable; this session’s value was written to the credential store.',
+  reportScopeDown: 'Now session-only; the credential-store record is kept (use the real deletion to remove it).',
+  reportValueSession: 'This session’s value was changed (human input).',
+  reportValueStore: 'The stored value was changed, and this session’s copy now matches it.',
 }
 
 /**
@@ -1602,7 +1745,7 @@ interface HistoryEntry {
   readonly label: string
   readonly scope: Scope
   readonly anchorSeq?: number
-  readonly source: 'attach' | 'request'
+  readonly source: 'attach' | 'request' | 'manage'
   readonly replaced?: boolean
 }
 /**
@@ -1621,6 +1764,10 @@ const HISTORY_EVENTS: readonly string[] = [
   'revoked',
   'expired',
   'authorized',
+  'updated',
+  'scope-changed',
+  'unbound',
+  'deleted',
 ]
 /** One row the `@` menu may offer: this session's own, or one the store holds. */
 interface AvailableEntry {
@@ -1631,6 +1778,37 @@ interface AvailableEntry {
   readonly state: 'staged' | 'bound' | 'stored'
   readonly source: 'session' | 'store'
 }
+/**
+ * Which actions the Host proved are possible for one management row.
+ *
+ * All four are false unless the payload said otherwise: a shape this page
+ * cannot read must not become an offer to do something.
+ */
+interface ManageCan {
+  readonly unbind: boolean
+  readonly delete: boolean
+  readonly scope: boolean
+  readonly value: boolean
+}
+/** One row of the management list. Never carries a value. */
+interface ManageEntry {
+  readonly variable: string
+  readonly name: string
+  readonly label: string
+  readonly scope: Scope
+  readonly state: 'staged' | 'bound' | 'authorized' | 'stored'
+  readonly source: 'session' | 'store' | 'both'
+  /**
+   * Which session-side direction put this row there. Absent for a store-only row
+   * (no session side) and for a payload from a Host that predates the field.
+   */
+  readonly origin?: 'attach' | 'request'
+  readonly can: ManageCan
+}
+/** The two halves one management action can address. */
+type ManageTarget = 'session' | 'store'
+/** The two destructive questions the danger face can ask. */
+type ManageDanger = 'unbind' | 'delete'
 /** One `@` menu row as this source hands it to the menu. */
 interface CandidateLike {
   readonly name: string
@@ -1688,6 +1866,18 @@ type AttachMode =
    */
   | { readonly kind: 'history'; readonly variable?: string }
   | { readonly kind: 'confirm'; readonly variable: string; readonly name: string }
+  /**
+   * The management face: two sections (this session, the credential store),
+   * each row offering only the actions the Host said are possible.
+   */
+  | { readonly kind: 'manage' }
+  /**
+   * The masked value form, for the one action whose material a human supplies.
+   * `target` names which half of the variable the new value replaces.
+   */
+  | { readonly kind: 'edit'; readonly variable: string; readonly target: ManageTarget }
+  /** The confirmation one destructive action needs before it runs. */
+  | { readonly kind: 'danger'; readonly variable: string; readonly act: ManageDanger }
 
 /** Attached secrets per session. Values are never stored here. */
 const attachedBySession = new Map<string, Map<string, AttachedMeta>>()
@@ -1963,6 +2153,10 @@ const HISTORY_LABEL: Record<string, string> = {
   revoked: 'evRevoked',
   expired: 'evExpired',
   authorized: 'evAuthorized',
+  updated: 'evUpdated',
+  'scope-changed': 'evScopeChanged',
+  unbound: 'evUnbound',
+  deleted: 'evDeleted',
 }
 
 /** The message key of one history event, or undefined for an unknown one. */
@@ -2002,7 +2196,7 @@ function historyRowMeta(entry: HistoryEntry, t: (key: string) => string): string
   const parts = [
     entry.label,
     t(entry.scope === 'persistent' ? 'persistent' : 'session'),
-    entry.source === 'request' ? t('sourceRequest') : t('sourceAttach'),
+    entry.source === 'request' ? t('sourceRequest') : entry.source === 'manage' ? t('sourceManage') : t('sourceAttach'),
     stamp === '' ? t('historyNoTime') : stamp,
   ]
   if (entry.anchorSeq !== undefined) parts.push(`${t('anchorLabel')} ${entry.anchorSeq}`)
@@ -2323,7 +2517,7 @@ function readHistoryEntry(raw: unknown): HistoryEntry | null {
   const variable = text(record.variable)
   const event = text(record.event)
   const scope = scopeOf(record.scope)
-  const source = record.source === 'attach' ? 'attach' : record.source === 'request' ? 'request' : undefined
+  const source = record.source === 'attach' ? 'attach' : record.source === 'request' ? 'request' : record.source === 'manage' ? 'manage' : undefined
   const label = text(record.label)
   const name = text(record.name)
   if (variable === undefined || event === undefined || scope === undefined || source === undefined) return null
@@ -2517,6 +2711,212 @@ async function refreshAvailable(sessionId: string): Promise<readonly AvailableEn
 /** The last available list this page read for one session (empty when it never did). */
 function availableOf(sessionId: string): readonly AvailableEntry[] {
   return availableBySession.get(sessionId) ?? []
+}
+
+/**
+ * The last management list this page read, per session. Never a value.
+ *
+ * Kept apart from the `@` menu's list on purpose: that one collapses a variable
+ * that is both session-side and durable into a single session row, while the
+ * management surface has to show both sides of it and say which actions the
+ * Host proved each side supports.
+ */
+const manageBySession = new Map<string, readonly ManageEntry[]>()
+const manageInFlight = new Map<string, Promise<readonly ManageEntry[]>>()
+/** Whether the last management read failed (fixed wording, never a false empty). */
+const manageUnavailable = new Set<string>()
+/** The last management action's own report, shown once in the manage face. */
+let manageReport: string | null = null
+
+/** Read one management row. Anything unreadable is dropped, never guessed at. */
+function readManageEntry(raw: unknown): ManageEntry | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null
+  const record = raw as Record<string, unknown>
+  const variable = text(record.variable)
+  const name = text(record.name)
+  const label = text(record.label)
+  const scope = scopeOf(record.scope)
+  const state =
+    record.state === 'staged' || record.state === 'bound' || record.state === 'authorized' || record.state === 'stored'
+      ? record.state
+      : undefined
+  const source =
+    record.source === 'session' || record.source === 'store' || record.source === 'both'
+      ? record.source
+      : undefined
+  const origin = record.origin === 'attach' || record.origin === 'request' ? record.origin : undefined
+  if (variable === undefined || name === undefined || label === undefined) return null
+  if (scope === undefined || state === undefined || source === undefined) return null
+  let can: ManageCan = { unbind: false, delete: false, scope: false, value: false }
+  if (typeof record.can === 'object' && record.can !== null && !Array.isArray(record.can)) {
+    const raw = record.can as Record<string, unknown>
+    // True only on an explicit `true`: every other shape means "not proven",
+    // which is the safe direction for an action that changes durable state.
+    can = {
+      unbind: raw.unbind === true,
+      delete: raw.delete === true,
+      scope: raw.scope === true,
+      value: raw.value === true,
+    }
+  }
+  // An unreadable `origin` is simply absent: which direction a row came from is
+  // information, not an action, so dropping it cannot offer anything that fails.
+  return { variable, name, label, scope, state, source, ...(origin === undefined ? {} : { origin }), can }
+}
+
+/** Read the host's management answer. A malformed payload answers null. */
+function readManageList(payload: unknown): readonly ManageEntry[] | null {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null
+  const record = payload as Record<string, unknown>
+  if (record.ok !== true || !Array.isArray(record.entries)) return null
+  const out: ManageEntry[] = []
+  for (const raw of record.entries) {
+    const entry = readManageEntry(raw)
+    if (entry !== null) out.push(entry)
+  }
+  return out
+}
+
+/**
+ * The one-line provenance of a management row, from the same literal table.
+ *
+ * The direction (a human attached it, or the agent asked for it) comes first
+ * when the row has one: "usable in this session" covers two different stories,
+ * and a reader must be able to tell which one they are looking at.
+ */
+function describeManage(entry: ManageEntry): string {
+  const source =
+    entry.source === 'both'
+      ? ATTACH_ZH.manageSourceBoth ?? ''
+      : entry.source === 'store'
+        ? ATTACH_ZH.manageSourceStore ?? ''
+        : ATTACH_ZH.manageSourceSession ?? ''
+  const origin =
+    entry.origin === 'request'
+      ? ATTACH_ZH.manageOriginRequest ?? ''
+      : entry.origin === 'attach'
+        ? ATTACH_ZH.manageOriginAttach ?? ''
+        : undefined
+  const state =
+    entry.state === 'bound'
+      ? ATTACH_ZH.manageStateBound ?? ''
+      : entry.state === 'staged'
+        ? ATTACH_ZH.manageStateStaged ?? ''
+        : entry.state === 'authorized'
+          ? ATTACH_ZH.manageStateAuthorized ?? ''
+          : ATTACH_ZH.manageStateStored ?? ''
+  const scope = entry.scope === 'persistent' ? ATTACH_ZH.persistent ?? '' : ATTACH_ZH.session ?? ''
+  return [...(origin === undefined ? [] : [origin]), source, scope, state].join(' · ')
+}
+
+/** Read the host's management list for one session (never a cached lie on failure). */
+async function refreshManage(sessionId: string): Promise<readonly ManageEntry[]> {
+  if (sessionId === '') return []
+  const inFlight = manageInFlight.get(sessionId)
+  if (inFlight !== undefined) return inFlight
+  const run = (async (): Promise<readonly ManageEntry[]> => {
+    try {
+      const response = await fetch(`${MANAGE_PATH}?sessionId=${encodeURIComponent(sessionId)}`, {
+        credentials: 'same-origin',
+        headers: { accept: 'application/json' },
+      })
+      if (!response.ok) {
+        manageUnavailable.add(sessionId)
+        publishAttached()
+        return manageBySession.get(sessionId) ?? []
+      }
+      const list = readManageList(await response.json())
+      if (list === null) {
+        manageUnavailable.add(sessionId)
+        publishAttached()
+        return manageBySession.get(sessionId) ?? []
+      }
+      manageUnavailable.delete(sessionId)
+      manageBySession.set(sessionId, list)
+      publishAttached()
+      return list
+    } catch {
+      manageUnavailable.add(sessionId)
+      publishAttached()
+      return manageBySession.get(sessionId) ?? []
+    } finally {
+      manageInFlight.delete(sessionId)
+    }
+  })()
+  manageInFlight.set(sessionId, run)
+  return run
+}
+
+/** The management list this page last read for one session (empty when it never did). */
+function manageOf(sessionId: string): readonly ManageEntry[] {
+  return manageBySession.get(sessionId) ?? []
+}
+
+/** Whether the last management read for this session failed. */
+function manageFailed(sessionId: string): boolean {
+  return manageUnavailable.has(sessionId)
+}
+
+/** Whether this page has ever completed a management read for one session. */
+function manageRead(sessionId: string): boolean {
+  return manageBySession.has(sessionId)
+}
+
+/** One management action's outcome, as the poster reports it. */
+interface ManageAttempt {
+  readonly ok: boolean
+  readonly status: number
+  readonly notice?: string
+  readonly error?: string
+}
+
+/** The fixed sentence one refused management action reports. */
+const MANAGE_FAILURE: Record<number, string> = {
+  400: '这次请求的字段不合法，未做任何改动。',
+  404: '目标已经不在（本会话或凭据库里都没有它），未做任何改动。',
+  409: '目标状态已经变了，未做任何改动。',
+  500: '宿主未能完成这次改动，未做任何改动。',
+  501: '当前凭据库实现不提供删除能力，未做任何改动。',
+}
+const MANAGE_FAILURE_UNKNOWN = '宿主拒绝了这次管理动作，未做任何改动。'
+const MANAGE_UNREACHABLE = '暂时无法连接宿主，未做任何改动。'
+
+function manageErrorFor(status: number): string {
+  return MANAGE_FAILURE[status] ?? MANAGE_FAILURE_UNKNOWN
+}
+
+/**
+ * Post one management action.
+ *
+ * The host's own error text is never echoed (the same rule the attach face
+ * follows): a credential backend's message can quote the value it was handed,
+ * and one rule with no exceptions is easier to keep. A body this half cannot
+ * read counts as a refusal, never as success.
+ */
+async function postManage(body: Record<string, unknown>): Promise<ManageAttempt> {
+  try {
+    const response = await fetch(MANAGE_PATH, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!response.ok) {
+      return { ok: false, status: response.status, error: manageErrorFor(response.status) }
+    }
+    const payload: unknown = await response.json().catch(() => undefined)
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+      return { ok: false, status: 0, error: MANAGE_FAILURE_UNKNOWN }
+    }
+    const record = payload as Record<string, unknown>
+    if (record.ok !== true) {
+      return { ok: false, status: 0, error: MANAGE_FAILURE_UNKNOWN }
+    }
+    const notice = text(record.notice)
+    return { ok: true, status: response.status, ...(notice === undefined ? {} : { notice }) }
+  } catch {
+    return { ok: false, status: 0, error: MANAGE_UNREACHABLE }
+  }
 }
 
 /** Read one span the editor handed over, when it really handed one. */
@@ -2727,6 +3127,10 @@ function SecretAttachCapsule(props: {
   const [busy, setBusy] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [tier, setTier] = React.useState<string | null>(null)
+  // The management flow's own state. The value a human types here lives in this
+  // one component and in the request it is submitted with, nowhere else.
+  const [editValue, setEditValue] = React.useState('')
+  const [editReveal, setEditReveal] = React.useState(false)
   React.useEffect(() => subscribeAttached(() => setSnap((previous: number) => previous + 1)), [])
   void snap
 
@@ -2750,6 +3154,15 @@ function SecretAttachCapsule(props: {
     void refreshHistory(sessionId)
     return undefined
   }, [sessionId, historyOpen])
+  // Opening the management face is what asks the host for it — and it is also
+  // what asks again after an action, because an action is what changes the
+  // answer. Same dependency discipline as the history read above.
+  const manageOpen = mode.kind === 'manage'
+  React.useEffect(() => {
+    if (!manageOpen) return undefined
+    void refreshManage(sessionId)
+    return undefined
+  }, [sessionId, manageOpen])
   // Requirement 3: the observer. This entry is the one that stays mounted for the
   // whole session (an empty face still renders a component), which is exactly why
   // it is where the composer is watched.
@@ -2911,57 +3324,143 @@ function SecretAttachCapsule(props: {
     }
   }
 
+  /**
+   * Run one management action and report exactly what the host said.
+   *
+   * A refusal leaves every face as it was and only shows the fixed sentence for
+   * that status: nothing here decides that an action "probably worked". On
+   * success the three lists this page caches are re-read from the host (it is
+   * the authority for what changed), and the route back is the management face.
+   */
+  async function runManage(body: Record<string, unknown>, report: string): Promise<void> {
+    if (busy) return
+    setBusy(true)
+    setError(null)
+    manageReport = null
+    try {
+      const attempt = await postManage({ sessionId, ...body })
+      if (!attempt.ok) {
+        setError(attempt.error ?? MANAGE_FAILURE_UNKNOWN)
+        return
+      }
+      manageReport = attempt.notice === undefined ? report : `${report}${attempt.notice}`
+      // The value this form held leaves the component here and is never kept.
+      setEditValue('')
+      setAttachMode({ kind: 'manage' })
+      await refreshManage(sessionId)
+      await refreshAttached(sessionId)
+      await refreshHistory(sessionId)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** The one action whose material a human supplies. */
+  async function submitEdit(variable: string, target: ManageTarget): Promise<void> {
+    if (busy) return
+    if (editValue.length === 0) {
+      setError(t('editNoValue'))
+      return
+    }
+    await runManage(
+      { action: 'value', variable, target, value: editValue },
+      target === 'store' ? t('reportValueStore') : t('reportValueSession'),
+    )
+  }
+
+  /** The three destructive questions, each with its own body on the wire. */
+  async function confirmDanger(variable: string, act: ManageDanger): Promise<void> {
+    if (busy) return
+    if (act === 'unbind') {
+      await runManage({ action: 'unbind', variable }, t('reportUnbind'))
+      return
+    }
+    if (act === 'delete') {
+      // `confirm:true` is what makes this the real deletion; the route refuses
+      // the action without it, so no client can trigger it by accident.
+      await runManage({ action: 'delete', variable, confirm: true }, t('reportDelete'))
+      return
+    }
+    await runManage({ action: 'scope', variable, to: 'session' }, t('reportScopeDown'))
+  }
+
+  /** The non-destructive direction of a scope change. */
+  async function scopeUp(variable: string): Promise<void> {
+    if (busy) return
+    await runManage({ action: 'scope', variable, to: 'persistent' }, t('reportScopeUp'))
+  }
+
+  /**
+   * The other direction, which is **not** destructive: this session's exposure
+   * becomes session-only while the credential-store record stays exactly where
+   * it is. It is a separate button from the deletion on purpose — the user
+   * ruled that neither direction may carry a hidden destructive side effect.
+   */
+  async function scopeDown(variable: string): Promise<void> {
+    if (busy) return
+    await runManage({ action: 'scope', variable, to: 'session' }, t('reportScopeDown'))
+  }
+
   // One header for every face of the box: the title names the face that is up,
-  // the link is the way into the history list (and back out of a single
-  // variable's own list), and the close button returns to the composer.
+  // the links are the ways between the management and history faces, and the
+  // close button returns to the composer.
   const headTitle =
     mode.kind === 'fill'
       ? t('fillTitle')
       : mode.kind === 'confirm'
         ? t('confirmTitle')
-        : mode.kind === 'history'
-          ? mode.variable === undefined
-            ? t('historyTitle')
-            : t('historyForVariable')
-          : t('detailTitle')
-  const headLink =
+        : mode.kind === 'manage'
+          ? t('manageTitle')
+          : mode.kind === 'edit'
+            ? mode.target === 'store'
+              ? t('editTitleStore')
+              : t('editTitleSession')
+            : mode.kind === 'danger'
+              ? mode.act === 'unbind'
+                ? t('dangerUnbindTitle')
+                : t('dangerDeleteTitle')
+              : mode.kind === 'history'
+                ? mode.variable === undefined
+                  ? t('historyTitle')
+                  : t('historyForVariable')
+                : t('detailTitle')
+  const link = (key: string, action: string, label: string, onClick: () => void): unknown =>
+    h('button', { type: 'button', className: A.link, 'data-action': action, key, onClick }, label)
+  const historyLink = (action = 'history'): unknown =>
+    link('history', action, t('historyLink'), () => {
+      manageReport = null
+      setAttachMode({ kind: 'history' })
+    })
+  const manageLink = (action = 'manage'): unknown =>
+    link('manage', action, t('manageLink'), () => {
+      manageReport = null
+      setAttachMode({ kind: 'manage' })
+    })
+  const headLinks: unknown[] =
     // The confirm face is a question, not a place: it offers its two answers and
-    // nothing else, so it carries no history link (a store-side pick may not even
+    // nothing else, so it carries no link out (a store-side pick may not even
     // have a variable this session can show a history for).
     mode.kind === 'confirm'
-      ? null
-      : mode.kind === 'history'
-      ? mode.variable === undefined
-        ? null
-        : h(
-            'button',
-            {
-              type: 'button',
-              className: A.link,
-              'data-action': 'history-all',
-              onClick: () => {
-                setAttachMode({ kind: 'history' })
-              },
-            },
-            t('historyAll'),
-          )
-      : h(
-          'button',
-          {
-            type: 'button',
-            className: A.link,
-            'data-action': 'history',
-            onClick: () => {
-              setAttachMode({ kind: 'history' })
-            },
-          },
-          t('historyLink'),
-        )
+      ? []
+      : mode.kind === 'manage' || mode.kind === 'edit' || mode.kind === 'danger'
+        // Inside the management flow the way back is history; "manage" itself
+        // would be a link to where the reader already is.
+        ? [historyLink()]
+        : mode.kind === 'history'
+          ? mode.variable === undefined
+            ? [manageLink()]
+            : [
+                link('history-all', 'history-all', t('historyAll'), () => {
+                  setAttachMode({ kind: 'history' })
+                }),
+                manageLink(),
+              ]
+          : [historyLink(), manageLink()]
   const head = h(
     'header',
     { className: A.head },
     h('span', { className: A.title }, headTitle),
-    headLink,
+    ...headLinks,
     h(
       'button',
       {
@@ -2972,6 +3471,7 @@ function SecretAttachCapsule(props: {
           // Closing any face abandons a standing confirm: nothing may register
           // after the question is gone from the screen.
           pendingPick = null
+          manageReport = null
           setAttachMode({ kind: 'idle' })
         },
       },
@@ -3202,6 +3702,277 @@ function SecretAttachCapsule(props: {
     )
   }
 
+  // The management face: both halves of every variable this session may manage,
+  // with only the actions the host proved are possible. "Unbind" and "delete"
+  // are separate buttons with separate wording and separate confirmation faces,
+  // because they are separate facts about the world.
+  if (mode.kind === 'manage') {
+    const rows = manageOf(sessionId)
+    const failed = manageFailed(sessionId)
+    // One row per variable. A row that has both halves is the session section's
+    // (its provenance line says "本会话 + 凭据库"), so the store section lists
+    // only what this session does not hold — never the same row twice.
+    const sessionRows = rows.filter((entry) => entry.source !== 'store')
+    const storeRows = rows.filter((entry) => entry.source === 'store')
+    const actionButton = (action: string, label: string, onClick: () => void): unknown =>
+      h(
+        'button',
+        { type: 'button', className: A.action, 'data-action': action, disabled: busy, onClick },
+        label,
+      )
+    const row = (entry: ManageEntry): unknown =>
+      h(
+        'li',
+        {
+          key: entry.variable,
+          className: A.histItem,
+          'data-secret-manage-row': entry.source,
+          // Which direction put this row in the session section: `attach` and
+          // `request` are different facts and the face must not merge them.
+          ...(entry.origin === undefined ? {} : { 'data-secret-manage-origin': entry.origin }),
+          'data-secret-manage-variable': entry.variable,
+        },
+        h(
+          'span',
+          { className: A.histEvent },
+          h('code', { className: A.code }, entry.variable),
+          ' ',
+          h('span', { className: A.rowValue }, entry.label),
+        ),
+        h('span', { className: A.histMeta }, describeManage(entry)),
+        h(
+          'div',
+          { className: A.actions },
+          entry.can.value
+            ? actionButton('manage-value', t('manageActValue'), () => {
+                setEditValue('')
+                setError(null)
+                setAttachMode({
+                  kind: 'edit',
+                  variable: entry.variable,
+                  target: entry.source === 'store' ? 'store' : 'session',
+                })
+              })
+            : null,
+          entry.can.scope
+            ? entry.scope === 'session'
+              ? actionButton('manage-scope-persist', t('manageActScopeUp'), () => void scopeUp(entry.variable))
+              : actionButton('manage-scope-session', t('manageActScopeDown'), () => void scopeDown(entry.variable))
+            : null,
+          entry.can.unbind
+            ? actionButton('manage-unbind', t('manageActUnbind'), () => {
+                setError(null)
+                setAttachMode({ kind: 'danger', variable: entry.variable, act: 'unbind' })
+              })
+            : null,
+          entry.can.delete
+            ? actionButton('manage-delete', t('manageActDelete'), () => {
+                setError(null)
+                setAttachMode({ kind: 'danger', variable: entry.variable, act: 'delete' })
+              })
+            : null,
+          entry.can.value || entry.can.scope || entry.can.unbind || entry.can.delete
+            ? null
+            : h('span', { className: A.notice }, t('manageNone')),
+        ),
+      )
+    const listFor = (items: readonly ManageEntry[]): unknown =>
+      h('ul', { className: A.histList, 'data-secret-manage-count': String(items.length) }, ...items.map(row))
+    return h(
+      'div',
+      {
+        className: A.box,
+        'data-secret-attach-capsule': 'manage',
+        role: 'group',
+        'aria-label': t('manageTitle'),
+      },
+      head,
+      h(
+        'div',
+        { className: `${A.body} ${A.detail}` },
+        // The two promises that make this face safe to use live in the picture,
+        // not in a footnote: nothing here shows a value, and a real delete is
+        // irreversible.
+        h('p', { className: A.notice, 'data-secret-manage-notice': 'value' }, t('manageNotice')),
+        manageReport === null ? null : h('p', { className: A.notice, 'data-kind': 'report', role: 'status' }, manageReport),
+        error === null ? null : h('p', { className: A.notice, 'data-kind': 'error', role: 'alert' }, error),
+        busy ? h('p', { className: A.notice }, t('busy')) : null,
+        failed
+          ? h('p', { className: A.notice, 'data-kind': 'error', role: 'status' }, t('manageUnavailable'))
+          : !manageRead(sessionId)
+            ? h('p', { className: A.notice, 'data-secret-manage-reading': 'true' }, t('manageReading'))
+            : rows.length === 0
+              ? h('p', { className: A.notice }, t('manageEmpty'))
+              : null,
+        sessionRows.length === 0 ? null : h('p', { className: A.sectionTitle }, t('manageSectionSession')),
+        sessionRows.length === 0 ? null : listFor(sessionRows),
+        storeRows.length === 0 ? null : h('p', { className: A.sectionTitle }, t('manageSectionStore')),
+        storeRows.length === 0 ? null : listFor(storeRows),
+        h('p', { className: A.foot }, `${t('footerLead')}${t('footerTail')}`),
+      ),
+    )
+  }
+
+  // The value face: one masked input, one show/hide, one write. The value lives
+  // in this component's state and in the single request it is submitted with.
+  if (mode.kind === 'edit') {
+    const target = mode.target
+    return h(
+      'div',
+      {
+        className: A.box,
+        'data-secret-attach-capsule': 'edit',
+        'data-secret-manage-edit': target,
+        role: 'group',
+        'aria-label': target === 'store' ? t('editTitleStore') : t('editTitleSession'),
+      },
+      head,
+      h(
+        'div',
+        { className: `${A.body} ${A.detail}` },
+        h(
+          'div',
+          { className: A.row },
+          h('span', { className: A.rowLabel }, t('variableLabel')),
+          h('code', { className: A.code }, mode.variable),
+        ),
+        h('p', { className: A.notice }, target === 'store' ? t('editHintStore') : t('editHintSession')),
+        h(
+          'div',
+          { className: A.field },
+          h('label', { className: A.label, htmlFor: 'dsh-secret-manage-value' }, t('editValueLabel')),
+          h(
+            'div',
+            { className: A.inputRow },
+            h('input', {
+              id: 'dsh-secret-manage-value',
+              className: A.input,
+              type: editReveal ? 'text' : 'password',
+              value: editValue,
+              placeholder: t('editValuePlaceholder'),
+              autoComplete: 'off',
+              spellCheck: false,
+              disabled: busy,
+              'aria-label': t('editValueLabel'),
+              onChange: (event: { target: { value: string } }) => setEditValue(event.target.value),
+            }),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: A.toggle,
+                'aria-pressed': editReveal,
+                disabled: busy,
+                onClick: () => setEditReveal(!editReveal),
+              },
+              editReveal ? t('hide') : t('show'),
+            ),
+          ),
+        ),
+        h(
+          'div',
+          { className: A.actions },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: A.action,
+              'data-action': 'manage-value-apply',
+              'data-kind': 'primary',
+              disabled: busy,
+              onClick: () => void submitEdit(mode.variable, target),
+            },
+            t('editApply'),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: A.link,
+              'data-action': 'manage-value-cancel',
+              disabled: busy,
+              onClick: () => {
+                // Cancelling must leave nothing behind: no request was made yet,
+                // and the value exists only in this component's state.
+                setEditValue('')
+                setError(null)
+                setAttachMode({ kind: 'manage' })
+              },
+            },
+            t('cancel'),
+          ),
+        ),
+        busy ? h('p', { className: A.notice }, t('busy')) : null,
+        error === null ? null : h('p', { className: A.notice, 'data-kind': 'error', role: 'alert' }, error),
+        h('p', { className: A.foot }, `${t('footerLead')}${t('footerTail')}`),
+      ),
+    )
+  }
+
+  // The danger face: one destructive question, its own wording, and a confirm
+  // button that names what it does. Cancelling runs nothing at all.
+  if (mode.kind === 'danger') {
+    const act = mode.act
+    const title = act === 'unbind' ? t('dangerUnbindTitle') : t('dangerDeleteTitle')
+    const body = act === 'unbind' ? t('dangerUnbindBody') : t('dangerDeleteBody')
+    const confirmLabel = act === 'unbind' ? t('dangerConfirmUnbind') : t('dangerConfirmDelete')
+    return h(
+      'div',
+      {
+        className: A.box,
+        'data-secret-attach-capsule': 'danger',
+        'data-secret-manage-danger': act,
+        role: 'group',
+        'aria-label': title,
+      },
+      head,
+      h(
+        'div',
+        { className: `${A.body} ${A.detail}` },
+        h(
+          'div',
+          { className: A.row },
+          h('span', { className: A.rowLabel }, t('variableLabel')),
+          h('code', { className: A.code }, mode.variable),
+        ),
+        h('p', { className: A.confirm }, body),
+        h(
+          'div',
+          { className: A.actions },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: A.action,
+              'data-action': `manage-danger-${act}`,
+              'data-kind': 'danger',
+              disabled: busy,
+              onClick: () => void confirmDanger(mode.variable, act),
+            },
+            confirmLabel,
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: A.link,
+              'data-action': 'manage-danger-cancel',
+              disabled: busy,
+              onClick: () => {
+                setError(null)
+                setAttachMode({ kind: 'manage' })
+              },
+            },
+            t('cancel'),
+          ),
+        ),
+        busy ? h('p', { className: A.notice }, t('busy')) : null,
+        error === null ? null : h('p', { className: A.notice, 'data-kind': 'error', role: 'alert' }, error),
+        h('p', { className: A.foot }, `${t('footerLead')}${t('footerTail')}`),
+      ),
+    )
+  }
+
   // The history face: every recorded transition of this session (or of one
   // variable), newest first, exactly as the host reported it. Nothing here is
   // filtered by liveness — a withdrawn or revoked record is part of the past and
@@ -3355,10 +4126,528 @@ function SecretAttachCapsule(props: {
           },
           t('historyForVariable'),
         ),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: A.link,
+            'data-action': 'manage-variable',
+            onClick: () => {
+              manageReport = null
+              setAttachMode({ kind: 'manage' })
+            },
+          },
+          t('manageLink'),
+        ),
       ),
       busy ? h('p', { className: A.notice }, t('busy')) : null,
       error === null ? null : h('p', { className: A.notice, 'data-kind': 'error', role: 'alert' }, error),
       h('p', { className: A.foot }, `${t('footerLead')}${t('footerTail')}`),
+    ),
+  )
+}
+
+// ---------------------------------------------------------------------------
+// The management card: the confirmation surface for one `secret_manage` call.
+//
+// It is a second card, keyed by its own tool name, so the request card's own
+// definition, state machine and persisted meta are untouched. The two are told
+// apart by the tool name on the durable `tool/call`, never by inspecting state:
+// a `secret_manage` call can only ever claim this card, and vice versa.
+//
+// The card renders variable names and metadata; when an action needs a value, a
+// human types it into this card's masked input, it is posted once, and it is
+// cleared. Nothing here can be asked for by the agent.
+// ---------------------------------------------------------------------------
+
+/** One management call, as the card reads it out of the durable tool call. */
+interface ManageCardRequest {
+  readonly action: string
+  readonly variable?: string
+  readonly to?: Scope
+  readonly target?: 'session' | 'store'
+  readonly reason: string
+}
+
+/** One settled management result, as the Host reported it. */
+interface ManageCardOutcome {
+  readonly decision: 'listed' | 'applied' | 'rejected' | 'ignored' | 'other'
+  readonly action?: string
+  readonly variable?: string
+  readonly scope?: Scope
+  readonly count?: number
+  readonly notice?: string
+  readonly reason?: string
+  readonly text?: string
+}
+
+/** The card's durable state: what was asked, and how it ended. */
+interface ManageCardData {
+  readonly callId: string
+  readonly request: ManageCardRequest | null
+  readonly requestUnreadable: boolean
+  readonly settled: boolean
+  readonly outcome: ManageCardOutcome | null
+  readonly failure: CardFailure | null
+}
+
+/** Read one management call's arguments. Anything unreadable is a refusal. */
+function parseManageCallRequest(argsRaw: unknown): ManageCardRequest | null {
+  if (typeof argsRaw !== 'string' || argsRaw.length === 0) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(argsRaw)
+  } catch {
+    return null
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
+  const raw = parsed as Record<string, unknown>
+  const action = text(raw.action)
+  const reason = text(raw.reason)
+  if (action === undefined || reason === undefined) return null
+  if (!['list', 'unbind', 'delete', 'scope', 'value'].includes(action)) return null
+  const variable = text(raw.variable)
+  const to = scopeOf(raw.to)
+  const target = raw.target === 'session' ? 'session' : raw.target === 'store' ? 'store' : undefined
+  return {
+    action,
+    ...(variable === undefined ? {} : { variable }),
+    ...(to === undefined ? {} : { to }),
+    ...(target === undefined ? {} : { target }),
+    reason,
+  }
+}
+
+/** Read the value-free settlement payload of one management call. */
+function readManageOutcome(meta: unknown): ManageCardOutcome | null {
+  if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return null
+  const raw = meta as Record<string, unknown>
+  if (raw.kind !== MANAGE_META_KIND) return null
+  const decision = raw.decision
+  if (
+    decision !== 'listed'
+    && decision !== 'applied'
+    && decision !== 'rejected'
+    && decision !== 'ignored'
+    && decision !== 'other'
+  ) {
+    return null
+  }
+  const action = text(raw.action)
+  const variable = text(raw.variable)
+  const scope = scopeOf(raw.scope)
+  const notice = text(raw.notice)
+  const reason = text(raw.reason)
+  const instruction = text(raw.text)
+  return {
+    decision,
+    ...(action === undefined ? {} : { action }),
+    ...(variable === undefined ? {} : { variable }),
+    ...(scope === undefined ? {} : { scope }),
+    ...(typeof raw.count === 'number' && Number.isFinite(raw.count) ? { count: raw.count } : {}),
+    ...(notice === undefined ? {} : { notice }),
+    ...(reason === undefined ? {} : { reason }),
+    ...(instruction === undefined ? {} : { text: instruction }),
+  }
+}
+
+/** Read one management entry this card may answer. */
+function readManagePending(raw: unknown): PendingEntry | null {
+  const entry = readEntry(raw)
+  if (entry === null) return null
+  // A request-direction interaction has no action, so this card refuses to
+  // claim it: two cards racing for one entry would show two different questions.
+  return entry.action === undefined ? null : entry
+}
+
+/** The management card definition: one node per `secret_manage` call. */
+const secretManageDefinition = {
+  kind: MANAGE_CARD_KIND,
+  target: 'chat',
+  match(event: { readonly type?: unknown; readonly data?: unknown }): { id: string; role: 'start' | 'update' } | null {
+    if (event.type === 'tool/call') {
+      const data = event.data as { name?: unknown; callId?: unknown } | undefined
+      if (data?.name !== MANAGE_TOOL_NAME || data.callId === undefined) return null
+      return { id: String(data.callId), role: 'start' }
+    }
+    if (event.type === 'tool/result') {
+      const data = event.data as { message?: { source?: { kind?: unknown; callId?: unknown } } } | undefined
+      const source = data?.message?.source
+      if (source?.kind !== 'tool' || source.callId === undefined) return null
+      return { id: String(source.callId), role: 'update' }
+    }
+    return null
+  },
+  start(_context: unknown, match: { readonly event: { readonly data?: unknown } }): ManageCardData {
+    const data = match.event.data as { callId?: unknown; arguments?: unknown } | undefined
+    const request = parseManageCallRequest(data?.arguments)
+    return {
+      callId: data?.callId === undefined ? '' : String(data.callId),
+      request,
+      requestUnreadable: request === null,
+      settled: false,
+      outcome: null,
+      failure: null,
+    }
+  },
+  update(context: { readonly state: ManageCardData }, match: { readonly event: unknown }): ManageCardData {
+    const event = match.event as { readonly type?: unknown; readonly data?: unknown }
+    if (event.type !== 'tool/result') return context.state
+    const data = event.data as { meta?: unknown } | undefined
+    const outcome = readManageOutcome(data?.meta)
+    return {
+      ...context.state,
+      settled: true,
+      outcome,
+      failure: outcome === null ? readFailure(event) : null,
+    }
+  },
+  buildViewNode(context: {
+    readonly key: string
+    readonly id: string
+    readonly state: ManageCardData | undefined
+    readonly start: { readonly event: { readonly seq?: unknown } } | undefined
+  }): Record<string, unknown> | null {
+    if (context.start === undefined) return null
+    const seq = context.start.event.seq
+    const data = context.state ?? {
+      callId: context.id,
+      request: null,
+      requestUnreadable: true,
+      settled: false,
+      outcome: null,
+      failure: null,
+    }
+    return {
+      key: context.key,
+      kind: MANAGE_CARD_KIND,
+      id: context.id,
+      target: 'chat',
+      anchorSeq: typeof seq === 'number' ? seq : 0,
+      location: SESSION_LOCATION,
+      visibility: 'visible',
+      data,
+    }
+  },
+}
+
+/** Replaces the generic Tool row for `secret_manage`: the card is the surface. */
+function HiddenSecretManageToolRow(): unknown {
+  return null
+}
+
+/** Narrow a rendered node's payload back to this card's durable state. */
+function asManageCardData(value: unknown): ManageCardData | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const raw = value as Record<string, unknown>
+  const callId = text(raw.callId)
+  if (callId === undefined) return null
+  return {
+    callId,
+    request: raw.request === null || raw.request === undefined ? null : (raw.request as ManageCardRequest),
+    requestUnreadable: raw.requestUnreadable === true,
+    settled: raw.settled === true,
+    outcome: raw.outcome === null || raw.outcome === undefined ? null : (raw.outcome as ManageCardOutcome),
+    failure: raw.failure === null || raw.failure === undefined ? null : (raw.failure as CardFailure),
+  }
+}
+
+/** What one management card calls the action it is confirming. */
+function manageActionTitle(request: ManageCardRequest, t: (key: string) => string): string {
+  if (request.action === 'unbind') return t('manageActUnbind')
+  if (request.action === 'delete') return t('manageActDelete')
+  if (request.action === 'value') {
+    return request.target === 'store' ? t('editTitleStore') : t('editTitleSession')
+  }
+  if (request.action === 'scope') {
+    return request.to === 'persistent' ? t('manageActScopeUp') : t('manageActScopeDown')
+  }
+  return t('manageTitle')
+}
+
+/**
+ * One card for one `secret_manage` call.
+ *
+ * It polls the same waiting-interaction endpoint the request card does, claims
+ * its own entry by call id (the Host states the action, so this card never
+ * guesses), and shows either the confirmation or the settled one-line result.
+ */
+function SecretManageCard(props: {
+  readonly node?: { readonly data?: unknown }
+  readonly sessionId?: unknown
+  readonly t?: unknown
+}): unknown {
+  const h = React.createElement
+  const t = attachT(props)
+  const data = asManageCardData(props.node === undefined ? null : props.node.data)
+  const sessionId = text(props.sessionId)
+  const callId = data === null ? '' : data.callId
+  const settled = data !== null && data.settled
+
+  const [snap, setSnap] = React.useState<StoreSnapshot>(snapshot())
+  React.useEffect(() => {
+    if (settled) return undefined
+    const listen = () => setSnap(snapshot())
+    poller.listeners.add(listen)
+    const release = acquire()
+    return () => {
+      poller.listeners.delete(listen)
+      release()
+    }
+  }, [settled])
+
+  const [value, setValue] = React.useState('')
+  const [reveal, setReveal] = React.useState(false)
+  const [busy, setBusy] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
+  const [submitted, setSubmitted] = React.useState(false)
+
+  // Only management interactions may answer this card: the request direction's
+  // entries carry no action, and showing one here would ask the wrong question.
+  const probe: PendingProbe | null =
+    snap.probe === null
+      ? null
+      : snap.probe.kind === 'ok'
+        ? {
+            kind: 'ok',
+            entries: snap.probe.entries
+              .map((raw) => readManagePending(raw))
+              .filter((candidate): candidate is PendingEntry => candidate !== null),
+          }
+        : { kind: 'unreachable' }
+  const resolved = nextPendingState(probe, { submitted }, { callId, sessionId })
+  const entry = resolved.entry
+  const request = data === null ? null : data.request
+  const outcome = data === null ? null : data.outcome
+  const failure = data === null ? null : data.failure
+  const answerable = !settled && entry !== null && !busy
+  const expectValue = entry?.expectValue === true || (request !== null && request.action === 'value')
+
+  async function submit(decision: 'approved' | 'rejected' | 'ignored' | 'other', textInstruction?: string): Promise<void> {
+    if (busy || settled || entry === null) return
+    setBusy(true)
+    setError(null)
+    const body: Record<string, unknown> = {
+      id: entry.id,
+      decision,
+      // The Host holds an approval to the value rule it set for this action;
+      // the card still sends the scope field an approval requires.
+      scope: entry.requestedScope ?? 'session',
+    }
+    if (decision === 'approved' && expectValue) body.value = value
+    if (decision === 'other') body.text = textInstruction ?? ''
+    try {
+      const response = await fetch(ANSWER_PATH, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const payload = (await response.json().catch(() => undefined)) as { ok?: boolean; error?: string } | undefined
+      if (payload?.ok === true) {
+        setValue('')
+        setSubmitted(true)
+        return
+      }
+      if (response.status === 409) {
+        setValue('')
+        setSubmitted(true)
+        setError(TEXT.statusConflict)
+        return
+      }
+      setError(payload?.error ?? `提交失败（HTTP ${String(response.status)}）`)
+    } catch {
+      setError('提交失败')
+    } finally {
+      setBusy(false)
+      // The value is never logged, echoed or retained after submission.
+    }
+  }
+
+  const title = request === null ? TEXT.unreadable : manageActionTitle(request, t)
+  const metaText = settled
+    ? failure !== null
+      ? `${TEXT.outcomeError}${TEXT.metaSeparator}${failure.code}`
+      : outcome === null
+        ? TEXT.unknownOutcome
+        : outcome.decision === 'applied'
+          ? `${outcome.action ?? ''}${outcome.scope === undefined ? '' : `${TEXT.metaSeparator}${outcome.scope === 'persistent' ? TEXT.persistent : TEXT.session}`}`
+          : outcome.decision === 'listed'
+            ? `列出 ${String(outcome.count ?? 0)} 条`
+            : outcome.decision === 'rejected'
+              ? TEXT.outcomeRejected
+              : outcome.decision === 'ignored'
+                ? TEXT.outcomeIgnored
+                : TEXT.outcomeOther
+    : resolved.status === 'linked'
+      ? TEXT.metaRunning
+      : resolved.status === 'unreachable'
+        ? TEXT.metaConnecting
+        : resolved.status === 'awaiting-result'
+          ? TEXT.metaSubmitted
+          : TEXT.metaPreparing
+  const statusLine =
+    settled || entry !== null
+      ? null
+      : resolved.status === 'lapsed'
+        ? TEXT.statusLapsed
+        : null
+  const failureText = failure === null ? null : (TEXT.failure[failure.code] ?? `授权未完成（${failure.code}）。`)
+  const notice = outcome?.notice ?? null
+  const reason = request === null ? TEXT.unreadable : request.reason
+
+  return h(
+    'div',
+    { className: C.root, 'data-secret-manage-card': request?.action ?? 'unknown' },
+    h(
+      'div',
+      { className: C.head },
+      h('span', { className: C.glyph, 'aria-hidden': true }, '🔐'),
+      h('span', { className: C.title }, title),
+      h('span', { className: metaText === '' ? C.metaMuted : C.meta }, metaText),
+    ),
+    h(
+      'div',
+      { className: C.body },
+      h(
+        'div',
+        { className: C.field },
+        h('span', { className: C.fieldLabel }, TEXT.reasonLabel),
+        h('p', { className: C.reason }, reason),
+      ),
+      request === null || request.variable === undefined
+        ? null
+        : h(
+            'div',
+            { className: C.field },
+            h('span', { className: C.fieldLabel }, '变量名'),
+            h('code', { className: C.code }, request.variable),
+          ),
+      // The management card's own rule, said out loud: no value here can be
+      // asked for by the agent, and one is only ever typed by the human.
+      h('p', { className: C.notice }, '值只能由你在下面这个掩码框里输入；Agent 拿不到它，也不会看到它。'),
+      // U2: making an existing session-held value durable must say exactly what
+      // it writes, for which variable, at which scope — and it must not turn
+      // into a field that asks the human to retype (or reveals) the value.
+      request !== null && request.action === 'scope' && request.to === 'persistent'
+        ? h(
+            'div',
+            { className: C.field, 'data-secret-manage-scope-up': 'true' },
+            h('p', { className: C.notice }, t('manageScopeUpLead')),
+            h('span', { className: C.fieldLabel }, t('manageScopeUpCurrent')),
+            h(
+              'div',
+              { className: C.inputRow },
+              h('input', {
+                className: C.input,
+                // Masked and disabled: the value is never rendered here, and the
+                // human is not asked for it again — the Host writes the copy this
+                // session already holds.
+                type: 'password',
+                value: '',
+                readOnly: true,
+                disabled: true,
+                autoComplete: 'off',
+                spellCheck: false,
+                'aria-label': t('manageScopeUpCurrent'),
+                placeholder: '••••••••',
+              }),
+            ),
+          )
+        : null,
+      // Deleting says what it deletes and what survives it: the session copy
+      // keeps working, at session scope.
+      request !== null && request.action === 'delete'
+        ? h('p', { className: C.notice, 'data-secret-manage-delete': 'true' }, t('manageDeleteLead'))
+        : null,
+      expectValue && !settled
+        ? h(
+            'div',
+            { className: C.field },
+            h('span', { className: C.fieldLabel }, '新密钥内容'),
+            h(
+              'div',
+              { className: C.inputRow },
+              h('input', {
+                className: C.input,
+                type: reveal ? 'text' : 'password',
+                value,
+                placeholder: '粘贴新的密钥…',
+                autoComplete: 'off',
+                spellCheck: false,
+                disabled: busy || !answerable,
+                'aria-label': '新密钥内容',
+                onChange: (event: { target: { value: string } }) => setValue(event.target.value),
+              }),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: C.toggle,
+                  'aria-pressed': reveal,
+                  disabled: busy || !answerable,
+                  onClick: () => setReveal(!reveal),
+                },
+                reveal ? '隐藏' : '显示',
+              ),
+            ),
+          )
+        : null,
+      statusLine === null ? null : h('p', { className: C.notice }, statusLine),
+      notice === null ? null : h('p', { className: C.notice }, `注意：${notice}`),
+      failureText === null ? null : h('p', { className: C.notice }, failureText),
+      error === null ? null : h('p', { className: C.notice, role: 'alert' }, error),
+      settled
+        ? null
+        : h(
+            'div',
+            { className: C.actions },
+            expectValue
+              ? h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: C.btn,
+                    'data-kind': 'approve',
+                    disabled: !answerable || value.length === 0,
+                    onClick: () => void submit('approved'),
+                  },
+                  '确认并写入',
+                )
+              : h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: C.btn,
+                    'data-kind': 'approve',
+                    disabled: !answerable,
+                    onClick: () => void submit('approved'),
+                  },
+                  '确认',
+                ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: C.btn,
+                disabled: !answerable,
+                onClick: () => void submit('ignored'),
+              },
+              '稍后再说',
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: C.btn,
+                'data-kind': 'reject',
+                disabled: !answerable,
+                onClick: () => void submit('rejected'),
+              },
+              '拒绝',
+            ),
+          ),
+      h('p', { className: C.foot }, '这个卡片只显示变量名与元数据；值不会进入对话或日志。'),
     ),
   )
 }
@@ -3670,8 +4959,12 @@ type SecretRequestCardData = CardData
 declare module '@deepseek-ai/dsh-client-ui-chat/client' {
   interface ChatNodeDataMap {
     'secret-request': SecretRequestCardData
+    'sr-manage': SecretManageCardData
   }
 }
+
+/** The management card's payload, declared against the same node map. */
+type SecretManageCardData = ManageCardData
 
 /** Bound at factory time from the browser module table. */
 let React: ReactLike
@@ -3788,6 +5081,46 @@ const ATTACH_SEAM = Object.freeze({
 
 ;(globalThis as unknown as { __cordisSecretAttach?: unknown }).__cordisSecretAttach = ATTACH_SEAM
 
+/**
+ * The management surface's own read-only seam.
+ *
+ * A third seam rather than more keys on either of the two above, for the reason
+ * the second one gives: both of those are accepted, asserted contracts, and the
+ * card's key set is asserted exactly by two test files. This one exposes the new
+ * surface's pure logic and its definition. Frozen, stateless and value-free: the
+ * management list it can reach holds names, scopes and the Host's own `can`
+ * facts, never a value.
+ */
+const MANAGE_SEAM = Object.freeze({
+  version: 1,
+  MANAGE_PATH,
+  MANAGE_TOOL_NAME,
+  MANAGE_CARD_KIND,
+  MANAGE_META_KIND,
+  MANAGE_FAILURE,
+  MANAGE_FAILURE_UNKNOWN,
+  MANAGE_UNREACHABLE,
+  readManageEntry,
+  readManageList,
+  readManagePending,
+  readManageOutcome,
+  parseManageCallRequest,
+  asManageCardData,
+  manageActionTitle,
+  describeManage,
+  refreshManage,
+  manageOf,
+  manageFailed,
+  manageRead,
+  manageErrorFor,
+  postManage,
+  secretManageDefinition,
+  SecretManageCard,
+  HiddenSecretManageToolRow,
+})
+
+;(globalThis as unknown as { __cordisSecretManage?: unknown }).__cordisSecretManage = MANAGE_SEAM
+
 const loader = (globalThis as unknown as { __ModuleLoader__?: ModuleLoaderTarget }).__ModuleLoader__
 
 loader?.load({
@@ -3808,6 +5141,11 @@ loader?.load({
         // Replace the generic Tool row for this call so exactly one face shows.
         ctx.slots.inject('tool.call.toolview', () =>
           ctx.slots.register({ name: 'tool.call.toolview', key: TOOL_NAME }, HiddenSecretToolRow),
+        )
+        // The management surface's own tool-row placeholder: appended beside the
+        // request direction's own, which is untouched.
+        ctx.slots.inject('tool.call.toolview', () =>
+          ctx.slots.register({ name: 'tool.call.toolview', key: MANAGE_TOOL_NAME }, HiddenSecretManageToolRow),
         )
 
         // The reverse direction's entry button: the same list-slot shape the
@@ -3844,6 +5182,13 @@ loader?.load({
         ctx.uiConversation.events.register(secretAttachChipDefinition)
         ctx.slots.inject('conversation.chat.node', () =>
           ctx.slots.register({ name: 'conversation.chat.node', key: CHIP_KIND }, SecretAttachChipRow),
+        )
+        // Round 5: the management card, appended after everything above so each
+        // earlier registration keeps its identity, its key and its order. The two
+        // cards can never claim each other's call: each matches one tool name.
+        ctx.uiConversation.events.register(secretManageDefinition)
+        ctx.slots.inject('conversation.chat.node', () =>
+          ctx.slots.register({ name: 'conversation.chat.node', key: MANAGE_CARD_KIND }, SecretManageCard),
         )
         // Requirement 1 / O1: answer the transcript capsule's own open request.
         // The harness renders that capsule as a file reference and opens it
@@ -3899,8 +5244,7 @@ loader?.load({
           scoped.effect?.(() => () => {
             sessionsScope = null
           })
-        })
-      },
+        })      },
     }
   },
 })

@@ -10,6 +10,7 @@ import {
   isExposedEnvVar,
   RECORD_SCOPE,
   recordKey,
+  validateManage,
   validateRequest,
 } from './naming.ts'
 import {
@@ -19,7 +20,17 @@ import {
   type Scheduler,
   type WaitOutcome,
 } from './pending.ts'
-import { availableView, historyView, parseAdopt, parseAnswer, parseAttach, parseRelease } from './protocol.ts'
+import {
+  availableView,
+  historyView,
+  manageView,
+  parseAdopt,
+  parseAnswer,
+  parseAttach,
+  parseManage,
+  parseRelease,
+  type ManageWireAction,
+} from './protocol.ts'
 import { redactSecrets } from './redact.ts'
 import type {
   ModalAnswer,
@@ -32,6 +43,10 @@ import type {
   SecretHistoryEvent,
   SecretHistorySource,
   SecretHistoryView,
+  SecretManageChange,
+  SecretManageEntry,
+  SecretManageResult,
+  SecretManageTarget,
   SecretRequestInput,
   SecretRequestResult,
   SecretScope,
@@ -87,6 +102,29 @@ export interface CredentialsPort {
    * read-back, answers undefined.
    */
   readRecord?(key: string): Promise<CredentialRecordRead | undefined>
+  /**
+   * Remove one reference's value from the provider-managed source.
+   *
+   * Optional on the same terms as enumeration: a store without a removal face
+   * answers `false`, and the management surface then reports that it could not
+   * delete anything rather than claiming it did. Removing an absent reference
+   * is a no-op at the seam.
+   *
+   * @returns whether the store offered (and performed) the removal.
+   */
+  unset?(ref: string): Promise<boolean>
+  /**
+   * Remove one stored record; removing an absent record is a no-op.
+   *
+   * This is the second half of a real deletion: a value lives in the reference
+   * space and its authorization marker in the record space, and the two key
+   * grammars are disjoint, so neither call can stand in for the other.
+   *
+   * @returns whether the store offered (and performed) the removal.
+   */
+  deleteRecord?(key: string): Promise<boolean>
+  /** Presence and writability facts for one record; never its value. */
+  describeRecord?(key: string): Promise<{ configured: boolean; kind?: string; writable: boolean } | undefined>
 }
 
 /** What one authorization attempt needs from its flow. */
@@ -97,6 +135,16 @@ export interface AuthorizationAttemptInput {
   readonly label: string
   /** Whether the dialog collected a value that must be written to the store. */
   readonly valueNeeded: boolean
+  /**
+   * A value this session already holds, written into the store by the flow.
+   *
+   * Used when the human consents to making an existing session-held value
+   * durable: the value never has to be typed again, but it is still written
+   * inside the attempt and before the commit — the same order the prompt path
+   * runs in, so the "may be stored even though the attempt failed" caveat keeps
+   * its shape. Ignored while `valueNeeded` is true.
+   */
+  readonly preloaded?: string
   /** Collect the human's decision from the dialog (runs inside the flow). */
   answer(): Promise<ModalAnswer>
   /** Write the entered value through the credentials service. */
@@ -190,6 +238,58 @@ export type AdoptOutcome =
     }
   | { readonly ok: false; readonly status: number; readonly error: string }
 
+/** The result of one info-box management submission, as the route reports it. */
+export type ManageOutcome =
+  | {
+      readonly ok: true
+      readonly action: ManageWireAction
+      readonly variable: string
+      /** The scope in force after the action. */
+      readonly scope: SecretScope
+      readonly changed: SecretManageChange
+      readonly notice?: string
+    }
+  | { readonly ok: false; readonly status: number; readonly error: string }
+
+/** How one management action's target currently stands, as the Host itself verified it. */
+interface ManageFacts {
+  readonly variable: string
+  readonly name: string
+  readonly label: string
+  readonly scope: SecretScope
+  readonly state: SecretAttachState | 'stored'
+  /** This session holds it (a staged entry, or a live grant). */
+  readonly hasSession: boolean
+  /** The credential store holds a durable record for it. */
+  readonly hasStore: boolean
+  /** This session's own copy of the material, when it really holds one. */
+  readonly sessionValue?: string
+}
+
+/** What one management action asked for, once validated. */
+interface ManageIntent {
+  readonly action: ManageWireAction
+  readonly to?: SecretScope
+  readonly target?: SecretManageTarget
+  /** The value a human typed, only ever present for `action:'value'`. */
+  readonly value?: string
+}
+
+/** What one executed management action did. */
+type ManageApplied =
+  | {
+      readonly ok: true
+      readonly scope: SecretScope
+      readonly changed: SecretManageChange
+      readonly notice?: string
+    }
+  | { readonly ok: false; readonly status: number; readonly error: string }
+
+/** How one durable-registration attempt ended. */
+type PersistOutcome =
+  | { readonly ok: true; readonly confirmed: boolean; readonly notice?: string }
+  | { readonly ok: false; readonly status: number; readonly error: string }
+
 /**
  * The value-free facts one durable marker carries.
  *
@@ -230,6 +330,35 @@ const STORE_READ_FAILED_MESSAGE = '凭据库读取失败；细节已省略'
  * and only our own wording is reported.
  */
 const ATTACH_STORE_FAILED_MESSAGE = '凭据库写入失败；细节已省略，本次附加未登记'
+
+/**
+ * The three fixed, value-free failures the management surface can produce.
+ *
+ * Same discipline as the read and write above, and for a sharper reason here:
+ * the store's `unset` refuses by *throwing* (it will not write a reference the
+ * launching environment shadows), and that thrown text names the shell the user
+ * should fix. It is not ours to forward, and classification by string matching
+ * would be a guess, so one wording that covers both causes without asserting
+ * which one it was is used instead — the surface tells the human what is known.
+ */
+const STORE_DELETE_REFUSED_MESSAGE =
+  '未能删除凭据库里的值（可能由启动 dsh 的环境只读提供，或凭据库写入失败）。本次未删除任何东西。'
+const STORE_DELETE_RECORD_FAILED_MESSAGE =
+  '值已删除，但授权标记记录未能删除（可再次执行真删以清理它）。'
+const STORE_DELETE_UNSUPPORTED_MESSAGE = '当前凭据库实现不提供删除能力，本次未删除任何东西。'
+const STORE_MANAGE_WRITE_FAILED_MESSAGE =
+  '凭据库写入失败（上游细节已省略）。本次未改变作用域，也没有写入任何值。'
+
+/**
+ * The fixed notice one un-confirmed durable registration reports.
+ *
+ * Wording deliberately does not claim "nothing was written": the seam writes
+ * the value before it commits the authorization record, so a failed attempt can
+ * leave a value in the store that simply carries no record for this action.
+ * This is the same caveat the request direction already documents (O1).
+ */
+const PERSIST_UNCONFIRMED_NOTICE =
+  '未能完成持久化登记的确认：本次未改变作用域；若刚才的值已进入凭据库，它将不带本次授权记录。'
 
 /**
  * Run one credential-store read, collapsing every upstream failure into this
@@ -302,7 +431,11 @@ export class SecretService {
     if (request === undefined) {
       return { ok: false, status: 409, error: 'this authorization request is no longer waiting' }
     }
-    const parsed = parseAnswer(raw, !request.alreadyConfigured)
+    // A management interaction states whether its approval must carry a value
+    // (a `value` action always does, a `delete` never does). The request
+    // direction states nothing and keeps its own rule, so its contract is
+    // unchanged.
+    const parsed = parseAnswer(raw, request.expectValue ?? !request.alreadyConfigured)
     if (!parsed.ok) return { ok: false, status: 400, error: parsed.error }
     if (!this.pending.settle(id, parsed.answer)) {
       return { ok: false, status: 409, error: 'this authorization request was already answered' }
@@ -673,6 +806,695 @@ export class SecretService {
   }
 
   /**
+   * Every secret the management surface may show this session.
+   *
+   * Unlike {@link available}, which answers "what may I use here" and therefore
+   * collapses a variable that is both session-side and durable into the session
+   * row, this answers "what can be managed, and how": the two sides are reported
+   * as one row with both facts, and `can` says which actions the Host proved are
+   * possible right now. A client never derives those booleans itself, so it can
+   * never offer an action that would only fail.
+   *
+   * "Usable in this session" means both directions that put a record here: the
+   * attach direction (`staged`/`bound`) and the ask direction (a live grant the
+   * human approved through `secret_request`). Each row carries the direction it
+   * came from in `origin`, so the two are never conflated, and at most one row
+   * ever describes one variable.
+   */
+  async manageList(sessionId: string): Promise<readonly SecretManageEntry[]> {
+    const session = this.deps.sessionById(sessionId)
+    const storeSide = await this.storedEntries()
+    const durable = new Set(storeSide.map((entry) => entry.variable))
+    const rows: SecretManageEntry[] = []
+    if (session !== undefined) {
+      const sessionSide = [...this.attachedViews(sessionId)].sort(
+        (left, right) =>
+          (left.state === right.state ? 0 : left.state === 'bound' ? -1 : 1)
+          || left.variable.localeCompare(right.variable),
+      )
+      for (const view of sessionSide) {
+        const hasStore = durable.has(view.variable)
+        rows.push({
+          variable: view.variable,
+          name: view.name,
+          label: view.label,
+          scope: view.scope,
+          state: view.state,
+          source: hasStore ? 'both' : 'session',
+          origin: 'attach',
+          can: { unbind: true, delete: hasStore, scope: true, value: true },
+        })
+      }
+      rows.push(...this.requestViews(session, sessionId, durable, rows))
+    }
+    for (const stored of storeSide) {
+      if (rows.some((row) => row.variable === stored.variable)) continue
+      rows.push({
+        variable: stored.variable,
+        name: stored.name,
+        label: stored.label,
+        scope: 'persistent',
+        state: 'stored',
+        source: 'store',
+        // A store-only row has no session-side record, so only the two actions
+        // whose subject is the record itself are offered. "Re-scope" and
+        // "unbind" would have nothing to act on here, and offering them would
+        // teach the human that the buttons sometimes lie. No `origin` either:
+        // there is no session-side direction to report.
+        can: { unbind: false, delete: true, scope: false, value: true },
+      })
+    }
+    return rows
+  }
+
+  /**
+   * The session-side rows that come from the ask direction.
+   *
+   * `attachedViews` only ever describes the attach direction, so a variable the
+   * human authorized through `secret_request` is usable (it is injected into
+   * this session's shells) while being invisible to the management list — which
+   * is exactly the gap the user's ruling closed. A grant with a tool call behind
+   * it is the ask direction's own record; a grant the attach direction created
+   * carries no `callId` and is already reported as its `staged`/`bound` row.
+   *
+   * One variable is still one row: a variable already covered keeps its attach
+   * row, so the list never describes the same variable twice.
+   */
+  private requestViews(
+    session: GrantSessionLike,
+    sessionId: string,
+    durable: ReadonlySet<string>,
+    covered: readonly SecretManageEntry[],
+  ): readonly SecretManageEntry[] {
+    const seen = new Set(covered.map((row) => row.variable))
+    const views: SecretManageEntry[] = []
+    for (const name of [...this.grants.validNames(session)].sort((left, right) => left.localeCompare(right))) {
+      const lookup = this.grants.resolve(session, name)
+      const grant = lookup.code === 'ok' ? lookup.grant : undefined
+      if (grant === undefined || grant.callId === undefined) continue
+      if (seen.has(grant.envVar)) continue
+      seen.add(grant.envVar)
+      const hasStore = durable.has(grant.envVar)
+      views.push({
+        variable: grant.envVar,
+        name: grant.name,
+        // No attach metadata exists for this direction, so the last recorded
+        // label is the honest one; the variable name is the last resort.
+        label: this.history.latest(sessionId, grant.envVar)?.label ?? grant.envVar,
+        scope: grant.scope,
+        state: 'authorized',
+        source: hasStore ? 'both' : 'session',
+        origin: 'request',
+        can: { unbind: true, delete: hasStore, scope: true, value: true },
+      })
+    }
+    return views
+  }
+
+  /**
+   * Run one management submission from the info box.
+   *
+   * The human's click *is* the confirmation (the page only offers the action
+   * after the Host said it was possible, and the destructive one behind a second
+   * click whose body says so), so no dialog is opened here. Nothing durable
+   * happens before this method is called with a body the human composed.
+   *
+   * @param raw - parsed JSON body of the manage request.
+   */
+  async manage(raw: unknown): Promise<ManageOutcome> {
+    const parsed = parseManage(raw)
+    if (!parsed.ok) return { ok: false, status: 400, error: parsed.error }
+    const input = parsed.value
+    const session = this.deps.sessionById(input.sessionId)
+    if (session === undefined) {
+      return { ok: false, status: 404, error: 'manage: 找不到该会话，本次未做任何改动' }
+    }
+    const facts = await this.factsFor(session, input.variable)
+    if (facts === undefined) {
+      return {
+        ok: false,
+        status: 404,
+        error: `manage: 本会话与凭据库里都没有 ${input.variable}，本次未做任何改动`,
+      }
+    }
+    const applied = await this.perform(facts, session, {
+      action: input.action,
+      ...(input.to === undefined ? {} : { to: input.to }),
+      ...(input.target === undefined ? {} : { target: input.target }),
+      ...(input.value === undefined ? {} : { value: input.value }),
+    })
+    if (!applied.ok) return applied
+    return {
+      ok: true,
+      action: input.action,
+      variable: input.variable,
+      scope: applied.scope,
+      changed: applied.changed,
+      ...(applied.notice === undefined ? {} : { notice: applied.notice }),
+    }
+  }
+
+  /**
+   * Run one `secret_manage` call.
+   *
+   * `list` is read-only and answers without a human, so a delegated child may
+   * ask it — though what it gets back is always *its own* session's facts, and
+   * always with the reachability caveat below: `can` describes what a row
+   * supports, not what a child may run. Every other action changes something, so
+   * it needs a human answerer and therefore the live root, exactly like
+   * `secret_request`.
+   *
+   * @param raw - model arguments, validated here.
+   * @param caller - agent, tool-call identity, and cancellation.
+   */
+  async manageRequest(raw: unknown, caller: SecretCaller): Promise<SecretManageResult> {
+    const validated = validateManage(raw)
+    if (!validated.ok) throw new SecretFailure('BAD_REQUEST', validated.error)
+    const input = validated.value
+
+    const callerClass = this.deps.classifyCaller(caller.agent)
+    const session = this.deps.sessionOf(caller.agent)
+    if (input.action === 'list') {
+      if (callerClass === 'not-live') throw callerFailure(callerClass)
+      if (session === undefined) throw noSessionFailure('secret_manage')
+      const entries = await this.manageList(String(session.id))
+      return {
+        decision: 'listed',
+        entries: entries.map((entry) => manageView(entry)),
+        ...(callerClass === 'delegated' ? { notice: DELEGATED_LIST_NOTICE } : {}),
+      }
+    }
+    if (callerClass !== 'live-root') throw callerFailure(callerClass)
+    if (session === undefined) throw noSessionFailure('secret_manage')
+
+    const variable = input.variable
+    const facts = await this.factsFor(session, variable)
+    if (facts === undefined) {
+      throw new SecretFailure(
+        'NOT_FOUND',
+        `secret_manage: 本会话与凭据库里都没有 ${variable}（变量名必须与现有条目完全一致；可先用 action:"list" 列出）。未执行任何动作。`,
+      )
+    }
+
+    // A re-scope to the scope already in force changes nothing, so it is
+    // answered without asking a human to confirm a no-op.
+    if (input.action === 'scope' && input.to === facts.scope) {
+      return {
+        decision: 'applied',
+        action: 'scope',
+        variable,
+        scope: facts.scope,
+        changed: { session: false, store: false },
+        notice: '该变量已经是这个作用域，未做任何改动。',
+      }
+    }
+    const refusal = this.refuseBeforeAsking(facts, input)
+    if (refusal !== undefined) throw refusal
+
+    const id = this.deps.newId()
+    const pending = this.pending.add(
+      {
+        id,
+        callId: caller.callId,
+        sessionId: String(session.id),
+        name: facts.name,
+        envVar: variable,
+        label: facts.label,
+        reason: input.reason,
+        requestedScope: input.to ?? facts.scope,
+        alreadyConfigured: facts.hasStore,
+        createdAt: this.deps.now(),
+        action: input.action,
+        ...(input.target === undefined ? {} : { target: input.target }),
+        ...(input.to === undefined ? {} : { to: input.to }),
+        // Only a value change needs the human to type something. A re-scope to
+        // persistent writes the value this session already holds, which the
+        // confirmation card says out loud; nothing there asks for it again.
+        expectValue: input.action === 'value',
+      },
+      this.deps.config.maxPendingRequests,
+    )
+    if (pending === undefined) {
+      throw new SecretFailure(
+        'TOO_MANY_PENDING',
+        `secret_manage: 已有 ${String(this.deps.config.maxPendingRequests)} 个授权请求在等待人工确认，请先处理它们再重试。`,
+      )
+    }
+
+    try {
+      const outcome = await this.pending.wait(id, {
+        signal: caller.signal,
+        timeoutMs: this.deps.config.requestTimeoutMs,
+        schedule: this.deps.schedule,
+      })
+      if (outcome.kind === 'timeout') {
+        throw new SecretFailure(
+          'TIMEOUT',
+          `secret_manage: 等待人工确认超过 ${String(this.deps.config.requestTimeoutMs)}ms 未获答复（可能没有打开可交互的 Web 界面）。未执行任何动作，持久状态未改变。`,
+        )
+      }
+      const answer = outcome.answer
+      if (answer.decision !== 'approved') return mapNonApproved(answer)
+      const typed = answer.value
+      if (input.action === 'value' && (typed === undefined || typed.length === 0)) {
+        throw new SecretFailure('NO_VALUE', 'secret_manage: 未获得任何值，已放弃本次改值；未做任何改动。')
+      }
+      const applied = await this.perform(facts, session, {
+        action: input.action,
+        ...(input.to === undefined ? {} : { to: input.to }),
+        ...(input.target === undefined ? {} : { target: input.target }),
+        ...(typed === undefined ? {} : { value: typed }),
+      })
+      if (!applied.ok) {
+        throw new SecretFailure(
+          applied.status === 404 ? 'NOT_FOUND' : 'MANAGE_FAILED',
+          applied.error,
+        )
+      }
+      return {
+        decision: 'applied',
+        action: input.action,
+        variable,
+        scope: applied.scope,
+        changed: applied.changed,
+        ...(applied.notice === undefined ? {} : { notice: applied.notice }),
+      }
+    } finally {
+      this.pending.remove(id)
+    }
+  }
+
+  /**
+   * The honest pre-dialog refusals: a management action whose target cannot
+   * support it fails before a human is ever asked, so nobody is shown a
+   * question whose only possible answer is "this cannot work".
+   */
+  private refuseBeforeAsking(facts: ManageFacts, input: ManageIntent): SecretFailure | undefined {
+    if (input.action === 'delete' && !facts.hasStore) {
+      return new SecretFailure(
+        'NOT_FOUND',
+        `secret_manage: 凭据库里没有 ${facts.variable} 的持久记录，未删除任何东西（"list" 的 can.delete 会告诉你哪些变量能真删）。`,
+      )
+    }
+    if (input.action === 'value' && input.target === 'store' && !facts.hasStore) {
+      return new SecretFailure(
+        'STORE_EMPTY',
+        `secret_manage: 凭据库里没有 ${facts.variable} 的持久记录，无法改库里的值；请改用 scope:"persistent" 让本会话这份值持久化，或重新授权。`,
+      )
+    }
+    if ((input.action === 'unbind' || input.action === 'scope' || input.target === 'session')
+      && !facts.hasSession) {
+      return new SecretFailure(
+        'NOT_FOUND',
+        `secret_manage: 本会话没有 ${facts.variable}（它只在凭据库里）。解绑与改作用域都作用于本会话的这份记录。`,
+      )
+    }
+    return undefined
+  }
+
+  /** The current state of one variable, as the Host itself verified it. */
+  private async factsFor(session: GrantSessionLike, variable: string): Promise<ManageFacts | undefined> {
+    const sessionId = String(session.id)
+    const staged = this.deps.attachments.get(sessionId, variable)
+    const grant = this.liveGrant(session, variable)
+    const stored = (await this.storedEntries()).find((entry) => entry.variable === variable)
+    if (staged === undefined && grant === undefined && stored === undefined) return undefined
+    if (staged !== undefined) {
+      return {
+        variable,
+        name: staged.name,
+        label: staged.label,
+        scope: staged.scope,
+        state: 'staged',
+        hasSession: true,
+        hasStore: stored !== undefined,
+        sessionValue: staged.value,
+      }
+    }
+    if (grant !== undefined) {
+      return {
+        variable,
+        name: grant.name,
+        label: this.attached.get(sessionId)?.get(variable)?.label ?? variable,
+        scope: grant.scope,
+        state: 'bound',
+        hasSession: true,
+        hasStore: stored !== undefined,
+        sessionValue: grant.value,
+      }
+    }
+    return {
+      variable,
+      name: stored?.name ?? variable,
+      label: stored?.label ?? variable,
+      scope: 'persistent',
+      state: 'stored',
+      hasSession: false,
+      hasStore: true,
+    }
+  }
+
+  /** Run one already-authorized management action. */
+  private async perform(
+    facts: ManageFacts,
+    session: GrantSessionLike,
+    intent: ManageIntent,
+  ): Promise<ManageApplied> {
+    const sessionId = String(session.id)
+    if (intent.action === 'unbind') {
+      if (!facts.hasSession) {
+        return { ok: false, status: 404, error: `manage: 本会话没有 ${facts.variable}，无法解绑。` }
+      }
+      if (facts.state === 'staged') {
+        // The staged half is the existing release path on purpose: one removal,
+        // one history event (`discarded`), one set of tests.
+        const released = this.release({ sessionId, variable: facts.variable, reason: 'discarded' })
+        if (!released.ok) return { ok: false, status: released.status, error: released.error }
+        return {
+          ok: true,
+          scope: facts.scope,
+          changed: { session: released.released, store: false },
+          ...(released.released ? {} : { notice: '本会话没有这条暂存记录，未做任何改动。' }),
+        }
+      }
+      const dropped = this.grants.unbind(sessionId, facts.variable)
+      if (dropped === undefined) {
+        return {
+          ok: true,
+          scope: facts.scope,
+          changed: { session: false, store: false },
+          notice: '这条授权已经不在有效期内（锚点已失效），未做任何改动。',
+        }
+      }
+      // The bound meta is dropped with the exposure, so `attachedViews` cannot
+      // later observe a missing grant and report a second, spurious `revoked`.
+      this.attached.get(sessionId)?.delete(facts.variable)
+      this.note(sessionId, 'unbound', facts.variable, {
+        name: facts.name,
+        label: facts.label,
+        scope: dropped.scope,
+        source: 'manage',
+        anchorSeq: dropped.anchorSeq,
+      })
+      return { ok: true, scope: dropped.scope, changed: { session: true, store: false } }
+    }
+
+    if (intent.action === 'delete') {
+      if (!facts.hasStore) {
+        return {
+          ok: false,
+          status: 404,
+          error: `manage: 凭据库里没有 ${facts.variable} 的持久记录，本次未删除任何东西。`,
+        }
+      }
+      const removed = await this.deleteStore(facts)
+      if (!removed.ok) return removed
+      // The durable half is gone, so this session's exposure is session-scoped
+      // now. Saying so is the only honest report: the value it injects is still
+      // the one it held, but nothing on disk backs it any more.
+      const downgraded = this.downgradeSession(facts, session)
+      this.note(sessionId, 'deleted', facts.variable, {
+        name: facts.name,
+        label: facts.label,
+        scope: 'persistent',
+        source: 'manage',
+      })
+      return {
+        ok: true,
+        scope: 'session',
+        changed: { session: downgraded, store: true },
+        ...(downgraded
+          ? { notice: '凭据库里的记录已删除；本会话仍持有该变量，作用域已如实降为仅本次会话。' }
+          : { notice: '凭据库里的记录已删除。' }),
+      }
+    }
+
+    if (intent.action === 'scope') {
+      if (!facts.hasSession) {
+        return {
+          ok: false,
+          status: 409,
+          error: `manage: 本会话没有 ${facts.variable}，改作用域要先有本会话的这份记录。`,
+        }
+      }
+      if (intent.to === 'persistent') {
+        if (facts.scope === 'persistent') {
+          return {
+            ok: true,
+            scope: 'persistent',
+            changed: { session: false, store: false },
+            notice: '这个变量已经是持久作用域，未做任何改动。',
+          }
+        }
+        if (facts.sessionValue === undefined) {
+          return { ok: false, status: 409, error: 'manage: 本会话已不再持有该变量的值，无法转为持久。' }
+        }
+        const written = await this.persistDurable(facts, facts.sessionValue)
+        if (!written.ok) return written
+        if (!written.confirmed) {
+          // The human consented and the value may be on disk, but the durable
+          // registration was not confirmed, so the scope is *not* reported as
+          // changed. This is the request direction's own O1 caveat, reused.
+          return {
+            ok: true,
+            scope: facts.scope,
+            changed: { session: false, store: false },
+            notice: PERSIST_UNCONFIRMED_NOTICE,
+          }
+        }
+        const upgraded = this.upgradeSession(facts, session)
+        this.note(sessionId, 'scope-changed', facts.variable, {
+          name: facts.name,
+          label: facts.label,
+          scope: 'persistent',
+          source: 'manage',
+        })
+        return {
+          ok: true,
+          scope: 'persistent',
+          changed: { session: upgraded, store: true },
+          ...(written.notice === undefined ? {} : { notice: written.notice }),
+        }
+      }
+      // to === 'session': this session's exposure becomes session-scoped, and
+      // the credential-store record is **kept**. The two are separate facts, and
+      // the surface offers them as two separate buttons: "only make it session"
+      // (this branch, nothing durable touched) and "stop being durable and
+      // delete the record" (the `delete` action, which is the one that removes
+      // it). No action here may carry a destructive side effect the human did
+      // not name.
+      if (facts.scope !== 'persistent') {
+        return {
+          ok: true,
+          scope: 'session',
+          changed: { session: false, store: false },
+          notice: '这个变量本来就是仅本次会话有效，未做任何改动。',
+        }
+      }
+      const downgraded = this.downgradeSession(facts, session)
+      this.note(sessionId, 'scope-changed', facts.variable, {
+        name: facts.name,
+        label: facts.label,
+        scope: 'session',
+        source: 'manage',
+      })
+      return {
+        ok: true,
+        scope: 'session',
+        changed: { session: downgraded, store: false },
+        notice: facts.hasStore
+          ? '本会话这份已改为仅本次会话；凭据库里的记录仍在（要一并删除请用「不再持久，并从库中删除」）。'
+          : undefined,
+      }
+    }
+
+    // intent.action === 'value'
+    const typed = intent.value
+    if (typed === undefined || typed.length === 0) {
+      return { ok: false, status: 400, error: 'manage: 改值需要一个由人类输入的值。' }
+    }
+    if (intent.target === 'store') {
+      if (!facts.hasStore) {
+        return {
+          ok: false,
+          status: 404,
+          error: `manage: 凭据库里没有 ${facts.variable} 的持久记录，无法改库里的值。`,
+        }
+      }
+      const written = await this.persistDurable(facts, typed)
+      if (!written.ok) return written
+      const synced = this.replaceSessionValue(facts, session, typed)
+      this.note(sessionId, 'updated', facts.variable, {
+        name: facts.name,
+        label: facts.label,
+        scope: 'persistent',
+        source: 'manage',
+      })
+      return {
+        ok: true,
+        scope: 'persistent',
+        changed: { session: synced, store: written.confirmed },
+        ...(written.notice === undefined ? {} : { notice: written.notice }),
+      }
+    }
+    const replaced = this.replaceSessionValue(facts, session, typed)
+    if (!replaced) {
+      return {
+        ok: false,
+        status: 404,
+        error: `manage: 本会话没有 ${facts.variable}，无法改本会话这份值（可改用 target:"store"）。`,
+      }
+    }
+    this.note(sessionId, 'updated', facts.variable, {
+      name: facts.name,
+      label: facts.label,
+      scope: facts.scope,
+      source: 'manage',
+    })
+    return { ok: true, scope: facts.scope, changed: { session: true, store: false } }
+  }
+
+  /**
+   * Remove one durable record: the value first, then its marker.
+   *
+   * Order matters. `unset` is the step that can refuse (the store will not write
+   * a reference the launching environment supplies), and a refusal there leaves
+   * the record untouched, so the outcome is "nothing was deleted" rather than a
+   * half-state. A failure of the second call is reported as exactly that: the
+   * value is gone and the marker remains, which the human can retry.
+   */
+  private async deleteStore(facts: ManageFacts): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+    const unset = this.deps.credentials.unset
+    const remove = this.deps.credentials.deleteRecord
+    if (typeof unset !== 'function' || typeof remove !== 'function') {
+      return { ok: false, status: 501, error: STORE_DELETE_UNSUPPORTED_MESSAGE }
+    }
+    try {
+      await unset.call(this.deps.credentials, facts.variable)
+    } catch {
+      // The backend's own text can name the shell that shadows the reference;
+      // it is not ours to forward, and the fixed wording covers both causes
+      // without asserting which one it was.
+      return { ok: false, status: 500, error: STORE_DELETE_REFUSED_MESSAGE }
+    }
+    try {
+      await remove.call(this.deps.credentials, recordKey(facts.name))
+    } catch {
+      return { ok: false, status: 500, error: STORE_DELETE_RECORD_FAILED_MESSAGE }
+    }
+    return { ok: true }
+  }
+
+  /**
+   * Make this session's held value durable through the authorization seam.
+   *
+   * The seam is used for exactly what it is for — a durable record that is
+   * observed to exist after the attempt — and its refusal to settle an attempt
+   * that removed the record is why no deletion path can come through here.
+   */
+  private async persistDurable(facts: ManageFacts, value: string): Promise<PersistOutcome> {
+    const attempt = await this.deps.authorization.attempt({
+      key: recordKey(facts.name),
+      label: facts.label,
+      valueNeeded: false,
+      preloaded: value,
+      // The human consented on the surface that called this (a card's approved
+      // answer, or the info box's own confirmed click), so the flow's question
+      // is already answered.
+      answer: async () => ({ decision: 'approved', scope: 'persistent' }),
+      persist: async (entered) => {
+        await this.deps.credentials.set(facts.variable, entered)
+      },
+      marker: () => ({
+        version: 1,
+        envVar: facts.variable,
+        name: facts.name,
+        scope: 'persistent',
+        authorizedAt: this.deps.now(),
+      }),
+    })
+    if (attempt.status === 'authorized') return { ok: true, confirmed: true }
+    if (attempt.status === 'escaped') {
+      // Only a human refusal or a scope override escapes, and neither can come
+      // back here: the confirmation already happened on our own surface.
+      return { ok: false, status: 409, error: 'manage: 人工确认未通过（已拒绝或改成了另一个作用域），本次未改变持久状态。' }
+    }
+    if (attempt.status === 'cancelled') {
+      return { ok: false, status: 409, error: 'manage: 授权尝试在完成前被取消，本次未改变持久状态。' }
+    }
+    // The value may already be in the store — the seam writes before it commits
+    // — so this is reported as an unconfirmed registration rather than as a
+    // clean failure, exactly as the request direction reports it (O1).
+    return { ok: true, confirmed: false, notice: PERSIST_UNCONFIRMED_NOTICE }
+  }
+
+  /** Replace this session's own copy of one variable's material. */
+  private replaceSessionValue(facts: ManageFacts, session: GrantSessionLike, value: string): boolean {
+    const sessionId = String(session.id)
+    if (facts.state === 'staged') {
+      return this.deps.attachments.reValue(sessionId, facts.variable, value)
+    }
+    if (facts.state === 'bound') {
+      const grant = this.liveGrant(session, facts.variable)
+      if (grant === undefined) return false
+      // The anchor, the variable name and the scope are all untouched: this is
+      // a change of material, not a new authorization, so rewind still revokes
+      // it and the markers already in messages still name the same variable.
+      this.grants.put({ ...grant, value, authorizedAt: this.deps.now() })
+      return true
+    }
+    return false
+  }
+
+  /** Record this session's exposure as durable, after the store confirmed it. */
+  private upgradeSession(facts: ManageFacts, session: GrantSessionLike): boolean {
+    const sessionId = String(session.id)
+    if (facts.state === 'staged') {
+      const changed = this.deps.attachments.reScope(sessionId, facts.variable, 'persistent')
+      const known = this.attached.get(sessionId)
+      const meta = known?.get(facts.variable)
+      if (known !== undefined && meta !== undefined && meta.scope !== 'persistent') {
+        known.set(facts.variable, { ...meta, scope: 'persistent' })
+      }
+      return changed || meta !== undefined
+    }
+    const grant = this.liveGrant(session, facts.variable)
+    if (grant === undefined) return false
+    if (grant.scope !== 'persistent') this.grants.put({ ...grant, scope: 'persistent' })
+    const known = this.attached.get(sessionId)
+    const meta = known?.get(facts.variable)
+    if (known !== undefined && meta !== undefined && meta.scope !== 'persistent') {
+      known.set(facts.variable, { ...meta, scope: 'persistent' })
+    }
+    return grant.scope !== 'persistent' || meta !== undefined
+  }
+
+  /**
+   * Mark this session's exposure as session-scoped after its durable half went
+   * away. The value stays where it was (in P3/P4, in memory); what changes is
+   * the truth about where the material lives.
+   */
+  private downgradeSession(facts: ManageFacts, session: GrantSessionLike): boolean {
+    const sessionId = String(session.id)
+    let changed = false
+    if (facts.state === 'staged') changed = this.deps.attachments.reScope(sessionId, facts.variable, 'session')
+    if (facts.state === 'bound') {
+      const grant = this.liveGrant(session, facts.variable)
+      if (grant !== undefined && grant.scope !== 'session') {
+        this.grants.put({ ...grant, scope: 'session' })
+        changed = true
+      }
+    }
+    const known = this.attached.get(sessionId)
+    const meta = known?.get(facts.variable)
+    if (known !== undefined && meta !== undefined && meta.scope !== 'session') {
+      known.set(facts.variable, { ...meta, scope: 'session' })
+      changed = true
+    }
+    return changed
+  }
+
+  /**
    * Record one lifecycle transition, inheriting what the transition cannot know.
    *
    * A TTL expiry or a revoked anchor reports no facts of its own — by the time
@@ -988,13 +1810,27 @@ export class SecretService {
       ? undefined
       : revocation.code === 'revoked-anchor'
         ? '上一次授权所锚定的事件已不在当前会话表面上（会话回退/重写，或该事件被压缩覆盖），因此已失效并被本次重新授权覆盖。'
-        : '上一次授权已不再属于本会话（会话分叉或结束），本次重新授权覆盖了它。'
+        : revocation.code === 'revoked-unbound'
+          ? '上一次授权已被解除（从本会话移除），因此已失效；本次重新授权覆盖了它。'
+          : '上一次授权已不再属于本会话（会话分叉或结束），本次重新授权覆盖了它。'
     const notices = [notice, extraNotice].filter(
       (value): value is string => value !== undefined && value.length > 0,
     )
     return approvedResult(plan, context.envVar, notices.length === 0 ? undefined : notices.join('\n'))
   }
 }
+
+/**
+ * The value-free caveat a delegated caller's listing carries.
+ *
+ * `can` describes what a *row* supports — the same fact the human's info box
+ * reads — not what the caller may run: every write action needs a human
+ * answerer and therefore the live root. Saying so in the result is what keeps
+ * the per-row capability line from reading as an offer the child cannot take
+ * up (the rendering appends this notice verbatim).
+ */
+const DELEGATED_LIST_NOTICE =
+  '你是被委派的子代理：上面每一行的动作是「这一行支持什么」，不是「你可以执行什么」——unbind/delete/scope/value 只对活跃的会话根代理开放，你调用任何一个都会得到 DELEGATED_CALLER，不会有任何对话框出现。需要写操作时请让主会话（会话根代理）执行。'
 
 /** The structured, value-free failure one caller class produces. */
 export function callerFailure(callerClass: Exclude<CallerClass, 'live-root'>): SecretFailure {
@@ -1007,6 +1843,20 @@ export function callerFailure(callerClass: Exclude<CallerClass, 'live-root'>): S
   return new SecretFailure(
     'DELEGATED_CALLER',
     'secret_request: 只有活跃的会话根代理拥有可回答的人类；被委派的子代理（subagent）没有人工回答者，因此这里不会等待，也不会有人回答。请让父会话/主会话调用 secret_request，再把返回的变量名交给子代理使用。',
+  )
+}
+
+/**
+ * The one structured failure a missing session produces, per tool.
+ *
+ * The wording names the tool that was called, so a reader never has to guess
+ * which surface refused, and it is fixed rather than assembled from anything a
+ * caller supplied.
+ */
+export function noSessionFailure(tool: string): SecretFailure {
+  return new SecretFailure(
+    'NO_SESSION',
+    `${tool}: 找不到该 agent 的活跃会话，无法把这次操作锚定到可回答的人类；请在会话根代理中重试。`,
   )
 }
 

@@ -15,7 +15,7 @@ import { HistoryStore } from './history.ts'
 import { installAttachBinding, noteSourcesOn, type AttachNoteReader } from './inject.ts'
 import { registerSecretRoutes } from './routes.ts'
 import { SecretService } from './service.ts'
-import { defineSecretRequestTool } from './tool.ts'
+import { defineSecretManageTool, defineSecretRequestTool } from './tool.ts'
 
 export const name = 'cordis-plugin-secret'
 
@@ -114,4 +114,8 @@ export function apply(ctx: Context, config: SecretConfig): void {
 
   registerSecretRoutes(ctx, service)
   ctx.tools.register(defineSecretRequestTool(service, config))
+  // The management surface is a second tool: the request tool's schema, result,
+  // card and persisted meta are a frozen contract, and changing an existing
+  // secret is a different question from asking for a new one.
+  ctx.tools.register(defineSecretManageTool(service, config))
 }

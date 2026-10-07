@@ -61,6 +61,8 @@ export type GrantVerdictCode =
   | 'revoked-not-own'
   /** The anchoring event left the model-visible surface (rewind / edit-and-retry). */
   | 'revoked-anchor'
+  /** A human withdrew this session's exposure deliberately (unbind). */
+  | 'revoked-unbound'
 
 /** Result of one grant lookup. */
 export interface GrantLookup {
@@ -170,6 +172,28 @@ export class GrantStore {
   /** The revocation recorded for one session and name, if any. */
   revocationFor(sessionId: string, name: string): RevocationNote | undefined {
     return this.revocations.get(pairKey(sessionId, name))
+  }
+
+  /**
+   * Withdraw one session's exposure of one variable, deliberately.
+   *
+   * This is the one removal a human asks for by name (the info box's unbind, or
+   * the agent's `unbind` action), so it is recorded as its own revocation code
+   * rather than being confused with an anchor that left the surface: the next
+   * `secret_request` for the same variable then explains *this* reason.
+   *
+   * Nothing durable is touched here — the value in the credential store, if any,
+   * is somebody else's fact and outlives this session's exposure.
+   *
+   * @returns the grant that was dropped, or undefined when this session held none.
+   */
+  unbind(sessionId: string, envVar: string): Grant | undefined {
+    for (const [key, grant] of [...this.grants]) {
+      if (grant.sessionId !== sessionId || grant.envVar !== envVar) continue
+      this.dropKey(key, grant, 'revoked-unbound')
+      return grant
+    }
+    return undefined
   }
 
   /** Number of live grants (diagnostics and tests). */

@@ -1,5 +1,5 @@
 import { pendingView } from './protocol.ts'
-import type { ModalAnswer, PendingView, SecretScope } from './types.ts'
+import type { ModalAnswer, PendingView, SecretManageAction, SecretManageTarget, SecretScope } from './types.ts'
 
 /** One dialog interaction waiting for a human. Never carries a secret value. */
 export interface PendingRequest {
@@ -16,6 +16,18 @@ export interface PendingRequest {
   readonly requestedScope: SecretScope
   readonly alreadyConfigured: boolean
   readonly createdAt: number
+  /**
+   * Present only for a `secret_manage` interaction: which action is waiting.
+   *
+   * The request direction leaves these out; a reader that knows only the
+   * request shape therefore cannot mistake a management confirmation for a new
+   * secret request, and an approval's value requirement comes from
+   * `expectValue` instead of being inferred.
+   */
+  readonly action?: Exclude<SecretManageAction, 'list'>
+  readonly target?: SecretManageTarget
+  readonly to?: SecretScope
+  readonly expectValue?: boolean
   /** The submitted decision once the human answered. */
   answer?: ModalAnswer
 }

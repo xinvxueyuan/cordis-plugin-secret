@@ -5,6 +5,9 @@ import type {
   SecretAttachInput,
   SecretAvailableEntry,
   SecretHistoryEntry,
+  SecretManageAction,
+  SecretManageEntry,
+  SecretManageTarget,
   SecretScope,
 } from './types.ts'
 
@@ -103,6 +106,11 @@ export function pendingView(request: {
   readonly envVar: string
   readonly alreadyConfigured: boolean
   readonly createdAt: number
+  /** Present only for a management interaction; see `PendingView`. */
+  readonly action?: Exclude<SecretManageAction, 'list'>
+  readonly target?: SecretManageTarget
+  readonly to?: SecretScope
+  readonly expectValue?: boolean
 }): PendingView {
   return {
     id: request.id,
@@ -116,6 +124,10 @@ export function pendingView(request: {
     variable: request.envVar,
     alreadyConfigured: request.alreadyConfigured,
     createdAt: request.createdAt,
+    ...(request.action === undefined ? {} : { action: request.action }),
+    ...(request.target === undefined ? {} : { target: request.target }),
+    ...(request.to === undefined ? {} : { to: request.to }),
+    ...(request.expectValue === undefined ? {} : { expectValue: request.expectValue }),
   }
 }
 
@@ -287,6 +299,148 @@ export function availableView(entry: SecretAvailableEntry): SecretAvailableEntry
 export function attachedSessionId(raw: unknown): string | undefined {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
   return trimmedString((raw as Record<string, unknown>).sessionId)
+}
+
+/** The four management actions that change something (never `list`). */
+export type ManageWireAction = Exclude<SecretManageAction, 'list'>
+
+const MANAGE_WIRE_ACTIONS: readonly ManageWireAction[] = ['unbind', 'delete', 'scope', 'value']
+
+/** One validated management submission from the info box. */
+export interface ManageRequestValue {
+  readonly sessionId: string
+  readonly action: ManageWireAction
+  readonly variable: string
+  /** Present only for `scope`. */
+  readonly to?: SecretScope
+  /** Present only for `value`. */
+  readonly target?: SecretManageTarget
+  /** Present only for `value`: the value the human typed into the masked input. */
+  readonly value?: string
+  /** True exactly for `delete`, whose whole point is an irreversible removal. */
+  readonly confirm: boolean
+}
+
+/** Why one management submission was refused, or the validated intent. */
+export type ManageValidation =
+  | { readonly ok: true; readonly value: ManageRequestValue }
+  | { readonly ok: false; readonly error: string }
+
+/**
+ * Validate one info-box management submission field by field.
+ *
+ * The per-action field rules are the mechanism that keeps the two deletion
+ * tiers apart instead of relying on wording: `unbind` refuses a `confirm` (it
+ * needs none, and accepting one would suggest it is dangerous), `delete`
+ * refuses the request without it, `value` is the only action that may carry a
+ * value at all, and an action that carries a field it has no use for is
+ * refused rather than quietly ignored.
+ */
+export function parseManage(raw: unknown): ManageValidation {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ok: false, error: 'manage must be a JSON object' }
+  }
+  const record = raw as Record<string, unknown>
+  const sessionId = trimmedString(record.sessionId)
+  if (sessionId === undefined) return { ok: false, error: 'manage.sessionId is required' }
+
+  const action = record.action
+  if (typeof action !== 'string' || !(MANAGE_WIRE_ACTIONS as readonly string[]).includes(action)) {
+    return {
+      ok: false,
+      error: 'manage.action must be "unbind", "delete", "scope" or "value" (the list is a GET)',
+    }
+  }
+  const kind = action as ManageWireAction
+
+  const variable = trimmedString(record.variable)
+  if (variable === undefined) return { ok: false, error: 'manage.variable is required' }
+  if (!isExposedEnvVar(variable)) {
+    return { ok: false, error: 'manage.variable must look like DSH_SECRET_OPENAI' }
+  }
+
+  const hasValueField = record.value !== undefined
+  if (kind !== 'value' && hasValueField) {
+    return { ok: false, error: `manage.value is only accepted for the "value" action, not "${kind}"` }
+  }
+  let value: string | undefined
+  if (kind === 'value') {
+    value = typeof record.value === 'string' ? record.value : undefined
+    if (value === undefined || value.length === 0) {
+      return { ok: false, error: 'manage.value is required for the "value" action' }
+    }
+    if (value.length > MAX_VALUE) {
+      return { ok: false, error: `manage.value must be at most ${String(MAX_VALUE)} characters` }
+    }
+  }
+
+  const hasToField = record.to !== undefined
+  if (kind !== 'scope' && hasToField) {
+    return { ok: false, error: `manage.to is only accepted for the "scope" action, not "${kind}"` }
+  }
+  let to: SecretScope | undefined
+  if (kind === 'scope') {
+    if (!isSecretScope(record.to)) {
+      return { ok: false, error: 'manage.to must be "session" or "persistent"' }
+    }
+    to = record.to
+  }
+
+  const hasTargetField = record.target !== undefined
+  if (kind !== 'value' && hasTargetField) {
+    return { ok: false, error: `manage.target is only accepted for the "value" action, not "${kind}"` }
+  }
+  let target: SecretManageTarget | undefined
+  if (kind === 'value') {
+    if (record.target !== 'session' && record.target !== 'store') {
+      return { ok: false, error: 'manage.target must be "session" or "store"' }
+    }
+    target = record.target
+  }
+
+  const hasConfirmField = record.confirm !== undefined
+  if (kind !== 'delete' && hasConfirmField) {
+    return { ok: false, error: `manage.confirm is only meaningful for the "delete" action, not "${kind}"` }
+  }
+  const confirm = kind === 'delete' && record.confirm === true
+  if (kind === 'delete' && !confirm) {
+    return {
+      ok: false,
+      error: 'manage.confirm must be true: deleting the credential-store record is irreversible',
+    }
+  }
+
+  return {
+    ok: true,
+    value: {
+      sessionId,
+      action: kind,
+      variable,
+      ...(to === undefined ? {} : { to }),
+      ...(target === undefined ? {} : { target }),
+      ...(value === undefined ? {} : { value }),
+      confirm,
+    },
+  }
+}
+
+/** One management row as the wire carries it: rebuilt field by field. */
+export function manageView(entry: SecretManageEntry): SecretManageEntry {
+  return {
+    variable: entry.variable,
+    name: entry.name,
+    label: entry.label,
+    scope: entry.scope,
+    state: entry.state,
+    source: entry.source,
+    ...(entry.origin === undefined ? {} : { origin: entry.origin }),
+    can: {
+      unbind: entry.can.unbind === true,
+      delete: entry.can.delete === true,
+      scope: entry.can.scope === true,
+      value: entry.can.value === true,
+    },
+  }
 }
 
 /** JSON response helper: no-store, JSON, and never an echoed value. */

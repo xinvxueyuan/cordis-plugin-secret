@@ -1,4 +1,4 @@
-import type { SecretRequestInput, SecretScope } from './types.ts'
+import type { SecretManageAction, SecretManageTarget, SecretRequestInput, SecretScope } from './types.ts'
 
 /** Every exposed variable starts with this prefix. */
 export const SECRET_PREFIX = 'DSH_SECRET_'
@@ -201,6 +201,122 @@ export function validateRequest(raw: unknown): RequestValidation {
       scope: record.scope,
       ...(description === undefined ? {} : { description }),
       ...(envVar === undefined ? {} : { envVar }),
+    },
+  }
+}
+
+/**
+ * One validated `secret_manage` call.
+ *
+ * A discriminated union rather than one shape with optional fields: the `list`
+ * arm has no variable to misuse and every other arm has to have one, so the
+ * service cannot accidentally treat a listing as a change.
+ */
+export type ManageRequestInput =
+  | { readonly action: 'list'; readonly reason: string }
+  | {
+      readonly action: Exclude<SecretManageAction, 'list'>
+      readonly variable: string
+      /** Present exactly for `scope`. */
+      readonly to?: SecretScope
+      /** Present exactly for `value`. */
+      readonly target?: SecretManageTarget
+      readonly reason: string
+    }
+
+/** Why one candidate management request is rejected, or the validated input. */
+export type ManageRequestValidation =
+  | { readonly ok: true; readonly value: ManageRequestInput }
+  | { readonly ok: false; readonly error: string }
+
+const MANAGE_ACTIONS: readonly string[] = ['list', 'unbind', 'delete', 'scope', 'value']
+
+/**
+ * Validate one `secret_manage` call.
+ *
+ * The schema already rejects malformed arguments, but this is the single owner
+ * of the contract for every caller (the tests drive it too), and it is where
+ * the one structural promise is enforced rather than merely documented: **there
+ * is no field a value could travel in**. A call that carries one is refused
+ * with a message that says why, instead of being quietly ignored.
+ */
+export function validateManage(raw: unknown): ManageRequestValidation {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ok: false, error: 'secret_manage: arguments must be an object' }
+  }
+  const record = raw as Record<string, unknown>
+
+  const action = nonEmptyString(record.action)
+  if (action === undefined || !MANAGE_ACTIONS.includes(action)) {
+    return {
+      ok: false,
+      error: 'secret_manage: action is required and must be "list", "unbind", "delete", "scope" or "value"',
+    }
+  }
+
+  if (record.value !== undefined) {
+    return {
+      ok: false,
+      error: 'secret_manage: this tool never carries a value; a human types it into the confirmation surface',
+    }
+  }
+
+  const reason = nonEmptyString(record.reason)
+  if (reason === undefined) {
+    return { ok: false, error: 'secret_manage: reason is required and must be a non-empty string' }
+  }
+
+  const rawVariable = record.variable
+  const variable = rawVariable === undefined ? undefined : nonEmptyString(rawVariable)
+  if (action === 'list') {
+    if (rawVariable !== undefined) {
+      return { ok: false, error: 'secret_manage: the "list" action takes no variable' }
+    }
+    return { ok: true, value: { action: 'list', reason } }
+  }
+  if (variable === undefined) {
+    return { ok: false, error: `secret_manage: variable is required for the "${action}" action` }
+  }
+  if (!isExposedEnvVar(variable)) {
+    return {
+      ok: false,
+      error: `secret_manage: variable "${variable}" must look like DSH_SECRET_OPENAI`,
+    }
+  }
+  const kind = action as Exclude<SecretManageAction, 'list'>
+
+  const hasTo = record.to !== undefined
+  if (kind !== 'scope' && hasTo) {
+    return { ok: false, error: `secret_manage: "to" is only accepted for the "scope" action, not "${kind}"` }
+  }
+  let to: SecretScope | undefined
+  if (kind === 'scope') {
+    if (!isSecretScope(record.to)) {
+      return { ok: false, error: 'secret_manage: "to" is required for the "scope" action and must be "session" or "persistent"' }
+    }
+    to = record.to
+  }
+
+  const hasTarget = record.target !== undefined
+  if (kind !== 'value' && hasTarget) {
+    return { ok: false, error: `secret_manage: "target" is only accepted for the "value" action, not "${kind}"` }
+  }
+  let target: SecretManageTarget | undefined
+  if (kind === 'value') {
+    if (record.target !== 'session' && record.target !== 'store') {
+      return { ok: false, error: 'secret_manage: "target" is required for the "value" action and must be "session" or "store"' }
+    }
+    target = record.target
+  }
+
+  return {
+    ok: true,
+    value: {
+      action: kind,
+      variable,
+      ...(to === undefined ? {} : { to }),
+      ...(target === undefined ? {} : { target }),
+      reason,
     },
   }
 }

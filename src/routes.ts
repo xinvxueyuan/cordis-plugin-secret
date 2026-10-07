@@ -1,5 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis'
-import { attachedSessionId, jsonResponse, sessionIdQuery } from './protocol.ts'
+import { attachedSessionId, jsonResponse, manageView, sessionIdQuery } from './protocol.ts'
 import type { SecretService } from './service.ts'
 
 /** Exact `/api` route the dialog polls for waiting interactions. */
@@ -18,6 +18,15 @@ export const HISTORY_PATH = '/api/secret.history'
 export const AVAILABLE_PATH = '/api/secret.available'
 /** Exact `/api` route one durably stored secret is registered for a session on. */
 export const ADOPT_PATH = '/api/secret.adopt'
+/**
+ * Exact `/api` route the management surface reads and writes.
+ *
+ * One path, two methods: GET lists (value-free), POST performs one action. The
+ * body of the POST carries the action's own name in a closed enum, which is what
+ * keeps "unbind" and "delete" apart on the wire as firmly as they are apart in
+ * the interface — there is no shared field and no default.
+ */
+export const MANAGE_PATH = '/api/secret.manage'
 
 /**
  * Mount this plugin's authenticated routes on the shared API channel.
@@ -141,6 +150,43 @@ export function registerSecretRoutes(ctx: Context, service: SecretService): void
           const outcome = service.answer(body)
           return outcome.ok
             ? jsonResponse({ ok: true })
+            : jsonResponse({ ok: false, error: outcome.error }, outcome.status)
+        },
+      }),
+      ctx.connection.fetch.register({
+        path: MANAGE_PATH,
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          const sessionId = sessionIdQuery({ sessionId: new URL(request.url).searchParams.get('sessionId') })
+          if (sessionId === undefined) {
+            return jsonResponse({ ok: false, error: 'manage.sessionId is required' }, 400)
+          }
+          const entries = await service.manageList(sessionId)
+          return jsonResponse({ ok: true, entries: entries.map((entry) => manageView(entry)) })
+        },
+      }),
+      ctx.connection.fetch.register({
+        path: MANAGE_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          let body: unknown
+          try {
+            body = await request.json()
+          } catch {
+            return jsonResponse({ ok: false, error: 'manage body must be JSON' }, 400)
+          }
+          const outcome = await service.manage(body)
+          return outcome.ok
+            ? jsonResponse({
+                ok: true,
+                action: outcome.action,
+                variable: outcome.variable,
+                scope: outcome.scope,
+                changed: outcome.changed,
+                ...(outcome.notice === undefined ? {} : { notice: outcome.notice }),
+              })
             : jsonResponse({ ok: false, error: outcome.error }, outcome.status)
         },
       }),
