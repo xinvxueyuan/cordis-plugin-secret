@@ -53,7 +53,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.client.json",
     "prepublishOnly": "npm run build",
-    "test": "node --test test/unit.test.ts test/register.test.ts test/client-card.test.ts test/attach.test.ts test/attach-wiring.test.ts test/client-attach.test.ts test/history.test.ts",
+    "test": "node --test test/unit.test.ts test/register.test.ts test/real-connection.test.ts test/client-card.test.ts test/attach.test.ts test/attach-wiring.test.ts test/client-attach.test.ts test/history.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json && tsc --noEmit -p tsconfig.test.json"
   },
   "repository": {

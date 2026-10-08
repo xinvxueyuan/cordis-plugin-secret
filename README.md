@@ -472,7 +472,7 @@ if ($env:DSH_SECRET_OPENAI) { "present length=$($env:DSH_SECRET_OPENAI.Length)" 
 
 ```sh
 npm run typecheck   # tsc：Host 半（Node）+ Client 半（DOM），erasableSyntaxOnly，兼容 Node 原生类型剥离
-npm test            # node --test 七个文件：
+npm test            # node --test 八个文件：
                     #   test/unit.test.ts         参数校验、变量名推导、decision 映射、session/persistent 路由、
                     #                             四类返回都不含值、锚点撤销、fork 不继承、压缩不误撤销（含真实表面折叠）、
                     #                             子代理失败关闭、超时、O1（已答复但落库失败 ⇒ 降级 session 并如实回报）、
@@ -481,8 +481,16 @@ npm test            # node --test 七个文件：
                     #   test/register.test.ts      用真实 apply + 假 Context 走完整链路：工具/路由/session-disposed 注册、
                     #                             Config 校验、tool→卡片→shellEnv 的值交付、回退与会话结束后的取回消失、
                     #                             persistent 经 authorization seam 落库且标记不含值、409 冲突、
-                    #                             0.4.0 管理面（工具/两条路由/五条路径/降级两按钮/真删两档）、
+                    #                             0.4.0 管理面（一个工具/一条路由两种方法/五条路径/降级两按钮/真删两档）、
                     #                             管理列表两个方向（`origin`：人工附加 + Agent 索要）与委派子代理的可达性注意
+                    #   test/real-connection.test.ts 挂**真实** `@deepseek-ai/dsh-client-connection` 的
+                    #                             `HostConnectionService` + 真实 cordis Context + 真实 `apply()`：
+                    #                             断言 fiber `ACTIVE`（不是 `FAILED`）、真实注册表的 9 条精确路径各注册
+                    #                             一次、`/api/secret.manage` 单次注册同时拥有 GET+POST、两个工具的
+                    #                             schema 都在；并带正对照——同一精确路径二次注册时真实注册表抛出
+                    #                             现场同一条 `exact Fetch route ... is already registered`。
+                    #                             （0.4.0 的发布级缺陷正是从这里漏过去的：其余用例用的是假注册表，
+                    #                             它不实施「精确路径唯一」，而且曾把两次注册钉成期望值。）
                     #   test/client-card.test.ts   以 __ModuleLoader__ + 假 React 加载浏览器产物：节点在 tool/call 即存在且
                     #                             无 Turn 坐标、结算态来自 meta、注册面恰好两处（无 shell.overlay/composer）、
                     #                             假过期四态（不可达/未列出/已提交）、表单控件齐备、明文不越出掩码输入
