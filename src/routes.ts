@@ -153,24 +153,30 @@ export function registerSecretRoutes(ctx: Context, service: SecretService): void
             : jsonResponse({ ok: false, error: outcome.error }, outcome.status)
         },
       }),
+      // One *registration* per exact path. The real registry keys its table by
+      // pathname alone and ignores `methods` when it decides whether a path is
+      // taken, so a second `register()` for the same path throws
+      // 'connection: exact Fetch route "..." is already registered' and takes
+      // the whole plugin entry down with it
+      // (`@deepseek-ai/dsh-client-connection/lib/index.js:625-639`, throw at
+      // `:633`). Both methods are declared here and dispatched below, exactly
+      // the way that registry's own handler selects a route
+      // (`route.methods.has(request.method)`, `:617`).
       ctx.connection.fetch.register({
         path: MANAGE_PATH,
-        methods: ['GET'],
+        methods: ['GET', 'POST'],
         requestBody: 'buffered',
         fetch: async (request) => {
-          const sessionId = sessionIdQuery({ sessionId: new URL(request.url).searchParams.get('sessionId') })
-          if (sessionId === undefined) {
-            return jsonResponse({ ok: false, error: 'manage.sessionId is required' }, 400)
+          // Only GET and POST reach this handler (the registry routes anything
+          // else to the channel's fallback), so "not POST" is the read.
+          if (request.method !== 'POST') {
+            const sessionId = sessionIdQuery({ sessionId: new URL(request.url).searchParams.get('sessionId') })
+            if (sessionId === undefined) {
+              return jsonResponse({ ok: false, error: 'manage.sessionId is required' }, 400)
+            }
+            const entries = await service.manageList(sessionId)
+            return jsonResponse({ ok: true, entries: entries.map((entry) => manageView(entry)) })
           }
-          const entries = await service.manageList(sessionId)
-          return jsonResponse({ ok: true, entries: entries.map((entry) => manageView(entry)) })
-        },
-      }),
-      ctx.connection.fetch.register({
-        path: MANAGE_PATH,
-        methods: ['POST'],
-        requestBody: 'buffered',
-        fetch: async (request) => {
           let body: unknown
           try {
             body = await request.json()

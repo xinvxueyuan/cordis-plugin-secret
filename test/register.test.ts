@@ -83,6 +83,39 @@ interface RouteRegistration {
   fetch: (request: never) => Promise<Response>
 }
 
+/**
+ * Whether this harness's fake `connection.fetch` registry enforces the real
+ * registry's rules.
+ *
+ * The fake registry used by every other test only *records* registrations, so a
+ * second registration for the same exact path passes here and throws in the
+ * field. `strictFetch` closes that gap for the one test that is about the
+ * registry's own contract, replicating the real implementation:
+ *
+ * - the table is keyed by pathname alone, and a second registration for a path
+ *   that is already there throws
+ *   ``connection: exact Fetch route "<path>" is already registered``
+ *   (`@deepseek-ai/dsh-client-connection/lib/index.js:625-639`; the `fetch`
+ *   getter that hands out `register` is at `:581-584` — the user's field stack
+ *   named `:583` — and the throw is at `:633`; the `methods` a route was
+ *   registered with are irrelevant to it) — that is the error the field
+ *   reported when 0.4.0 was mounted;
+ * - a route declaring no methods, or repeating one, is refused
+ *   (`:758-762`, `assertFetchRoute`).
+ *
+ * Not replicated: `endpointFromPath('/api', path)` path-shape validation
+ * (`:759`), because every path this plugin registers is a literal constant of
+ * the form the validator accepts.
+ */
+interface HarnessOptions {
+  readonly strictFetch?: boolean
+}
+
+/** The real registry's duplicate-path error, verbatim (`.../index.js:633`). */
+function alreadyRegistered(path: string): Error {
+  return new Error(`connection: exact Fetch route ${JSON.stringify(path)} is already registered`)
+}
+
 /** One captured `shellEnv` contributor declaration. */
 interface Contributor {
   name: string
@@ -142,7 +175,8 @@ const unloaded = new WeakSet<Harness>()
  * an `authorization` seam that drives the registered flow the way the real seam
  * does (prompt + commit, then `begin` resolves with a status).
  */
-function buildContext(main: FakeSession): Harness {
+function buildContext(main: FakeSession, options: HarnessOptions = {}): Harness {
+  const strictFetch = options.strictFetch === true
   const tools: Harness['tools'] = []
   const routes: RouteRegistration[] = []
   const contributors: Contributor[] = []
@@ -182,6 +216,13 @@ function buildContext(main: FakeSession): Harness {
     connection: {
       fetch: {
         register(route: RouteRegistration) {
+          if (strictFetch) {
+            if (route.methods.length === 0) throw new Error(`connection: exact Fetch route ${JSON.stringify(route.path)} declares no methods`)
+            if (new Set(route.methods).size !== route.methods.length) {
+              throw new Error(`connection: exact Fetch route ${JSON.stringify(route.path)} repeats a method`)
+            }
+            if (routes.some((existing) => existing.path === route.path)) throw alreadyRegistered(route.path)
+          }
           routes.push(route)
           return () => undefined
         },
@@ -306,20 +347,38 @@ function applyPlugin(harness: Harness, config: unknown = Config({})): void {
   apply(harness.ctx as never, config as never)
 }
 
+/**
+ * Find the plugin's one registration for an exact path, failing loudly.
+ *
+ * A path is registered once (`methods` carries every method it owns), because
+ * the real registry keys its table by pathname alone; the method the caller is
+ * about to use is passed on the request, the way the real dispatcher does.
+ */
+function routeFor(harness: Harness, path: string, method: 'GET' | 'POST'): RouteRegistration {
+  const route = harness.routes.find((candidate) => candidate.path === path)
+  assert.notEqual(route, undefined, `the ${path} route was never registered`)
+  const found = route as RouteRegistration
+  assert.equal(found.methods.includes(method), true, `${path} does not own ${method}`)
+  return found
+}
+
 /** Read the dialog's pending list through the plugin's own GET route. */
 async function pendingPayload(harness: Harness): Promise<{ requests?: { id: string; variable?: string }[] }> {
-  const route = harness.routes.find((candidate) => candidate.path === PENDING_PATH)
-  assert.notEqual(route, undefined, 'the pending route was never registered')
-  const response = await (route as RouteRegistration).fetch(undefined as never)
+  const response = await routeFor(harness, PENDING_PATH, 'GET').fetch({
+    method: 'GET',
+    url: `http://local${PENDING_PATH}`,
+  } as never)
   assert.equal(response.status, 200)
   return (await response.json()) as { requests?: { id: string; variable?: string }[] }
 }
 
 /** Submit one decision through the plugin's own POST route. */
 async function submit(harness: Harness, body: unknown): Promise<{ status: number; body: { ok?: boolean; error?: string } }> {
-  const route = harness.routes.find((candidate) => candidate.path === ANSWER_PATH)
-  assert.notEqual(route, undefined, 'the answer route was never registered')
-  const response = await (route as RouteRegistration).fetch({ json: async () => body } as never)
+  const response = await routeFor(harness, ANSWER_PATH, 'POST').fetch({
+    method: 'POST',
+    url: `http://local${ANSWER_PATH}`,
+    json: async () => body,
+  } as never)
   return { status: response.status, body: (await response.json()) as { ok?: boolean; error?: string } }
 }
 
@@ -386,9 +445,11 @@ async function postManage(
   harness: Harness,
   body: unknown,
 ): Promise<{ status: number; body: { ok?: boolean; error?: string; changed?: { session?: boolean; store?: boolean }; notice?: string } }> {
-  const route = harness.routes.find((candidate) => candidate.path === MANAGE_PATH && candidate.methods.includes('POST'))
-  assert.notEqual(route, undefined, 'the manage POST route was never registered')
-  const response = await (route as RouteRegistration).fetch({ json: async () => body } as never)
+  const response = await routeFor(harness, MANAGE_PATH, 'POST').fetch({
+    method: 'POST',
+    url: `http://local${MANAGE_PATH}`,
+    json: async () => body,
+  } as never)
   return { status: response.status, body: (await response.json()) as never }
 }
 
@@ -405,17 +466,19 @@ async function manageList(harness: Harness, sessionId: string): Promise<{
     label?: string
   }[]
 }> {
-  const route = harness.routes.find((candidate) => candidate.path === MANAGE_PATH && candidate.methods.includes('GET'))
-  assert.notEqual(route, undefined, 'the manage GET route was never registered')
-  const response = await (route as RouteRegistration).fetch({ url: `http://local${MANAGE_PATH}?sessionId=${sessionId}` } as never)
+  const response = await routeFor(harness, MANAGE_PATH, 'GET').fetch({
+    method: 'GET',
+    url: `http://local${MANAGE_PATH}?sessionId=${sessionId}`,
+  } as never)
   return (await response.json()) as never
 }
 
 /** Read one session's history through the plugin's own GET route. */
 async function historyFor(harness: Harness, sessionId: string): Promise<{ entries?: { event: string; variable: string; source: string; scope: string }[] }> {
-  const route = harness.routes.find((candidate) => candidate.path === HISTORY_PATH)
-  assert.notEqual(route, undefined, 'the history route was never registered')
-  const response = await (route as RouteRegistration).fetch({ url: `http://local${HISTORY_PATH}?sessionId=${sessionId}` } as never)
+  const response = await routeFor(harness, HISTORY_PATH, 'GET').fetch({
+    method: 'GET',
+    url: `http://local${HISTORY_PATH}?sessionId=${sessionId}`,
+  } as never)
   return (await response.json()) as never
 }
 
@@ -424,9 +487,9 @@ async function historyFor(harness: Harness, sessionId: string): Promise<{ entrie
  * entry), so a management action has a session-side record to act on.
  */
 async function postAttach(harness: Harness, session: FakeSession, body: Record<string, unknown>): Promise<void> {
-  const route = harness.routes.find((candidate) => candidate.path === ATTACH_PATH)
-  assert.notEqual(route, undefined, 'the attach route was never registered')
-  const response = await (route as RouteRegistration).fetch({
+  const response = await routeFor(harness, ATTACH_PATH, 'POST').fetch({
+    method: 'POST',
+    url: `http://local${ATTACH_PATH}`,
     json: async () => ({ sessionId: session.id, ...body }),
   } as never)
   assert.equal(response.status, 200)
@@ -515,10 +578,16 @@ test('plugin metadata, Config defaults and apply wiring', () => {
   }
   // Round 4 appended three routes to the five the previous rounds pinned:
   // the history flow, the `@` menu's available list, and the adopt write. Round
-  // 5 appends the management surface: one path, two methods. The original five
-  // are unchanged, in the same order; this list is the original assertion
-  // extended by the new entries. (Disclosed change: the expectation grew by the
-  // two `manage` rows below; no prior row was altered or removed.)
+  // 5 appends the management surface as **one** registration owning both
+  // methods. The original five are unchanged, in the same order.
+  //
+  // Disclosed change (t9, the 0.4.0 release blocker): this list used to end with
+  // TWO rows for `MANAGE_PATH` — `['GET']` and `['POST']` — because the plugin
+  // really did register that exact path twice. The real registry keys its table
+  // by pathname alone, so the second registration threw and the whole entry
+  // failed to activate in the field; this fake registry accepted it, and this
+  // assertion then pinned the broken shape as expected. The two rows are now one
+  // row with both methods. No other row was altered or removed.
   assert.deepEqual(registered, [
     { path: PENDING_PATH, methods: ['GET'] },
     { path: ATTACHED_PATH, methods: ['GET'] },
@@ -528,8 +597,7 @@ test('plugin metadata, Config defaults and apply wiring', () => {
     { path: AVAILABLE_PATH, methods: ['GET'] },
     { path: ADOPT_PATH, methods: ['POST'] },
     { path: ANSWER_PATH, methods: ['POST'] },
-    { path: MANAGE_PATH, methods: ['GET'] },
-    { path: MANAGE_PATH, methods: ['POST'] },
+    { path: MANAGE_PATH, methods: ['GET', 'POST'] },
   ])
   assert.equal(harness.listeners.get('session/disposed')?.length, 1)
   assert.equal(harness.contributors.length, 0, 'no variable is declared before the first approval')
@@ -1344,5 +1412,127 @@ test('the actions an ask-direction row offers really work on it', async () => {
   assert.equal(after.entries?.[0]?.source, 'store')
   assert.equal(after.entries?.[0]?.origin, undefined)
   assert.equal(after.entries?.[0]?.can.unbind, false)
+  unload(harness)
+})
+
+// ---------------------------------------------------------------------------
+// The registry's own contract: the 0.4.0 release blocker.
+//
+// In the field the whole plugin entry failed to activate with
+//   connection: exact Fetch route "/api/secret.manage" is already registered
+// because that path was registered twice, once for GET and once for POST, while
+// the real registry keys its table by pathname alone and therefore ignores
+// `methods` when it decides whether a path is taken
+// (`@deepseek-ai/dsh-client-connection/lib/index.js:625-639`, throw at `:633`).
+//
+// Every harness in this file used to *record* registrations without enforcing
+// that rule, so no amount of behaviour coverage could see the duplicate. The
+// registry below enforces it, which is what makes the test able to fail on the
+// broken shape.
+// ---------------------------------------------------------------------------
+
+test('the strict registry refuses a duplicate exact path, as the real one does', () => {
+  const harness = buildContext(sessionWithCall('call-1'), { strictFetch: true })
+  const registry = (harness.ctx as {
+    connection: { fetch: { register: (route: RouteRegistration) => unknown } }
+  }).connection.fetch
+  const route: RouteRegistration = {
+    path: '/api/secret.test',
+    methods: ['GET'],
+    requestBody: 'buffered',
+    fetch: () => Promise.resolve(new Response('ok')),
+  }
+  registry.register(route)
+  // Same exact path, different methods: still refused. This is the rule the
+  // 0.4.0 duplicate slipped past every lenient fake registry.
+  assert.throws(
+    () => registry.register({ ...route, methods: ['POST'] }),
+    /exact Fetch route "\/api\/secret\.test" is already registered/u,
+  )
+  // `assertFetchRoute` (`:758-762`) is replicated too, so the fake cannot pass
+  // a shape the real registry would reject before it even looks at the table.
+  assert.throws(
+    () => registry.register({ ...route, path: '/api/secret.again', methods: ['GET', 'GET'] }),
+    /repeats a method/u,
+  )
+  assert.throws(
+    () => registry.register({ ...route, path: '/api/secret.empty', methods: [] }),
+    /declares no methods/u,
+  )
+})
+
+test('every exact Fetch path is registered once, and the manage path owns both methods', async () => {
+  const session = sessionWithCall('call-1')
+  // Strict: a second registration for one exact path throws inside `apply`,
+  // exactly where the field threw.
+  const harness = buildContext(session, { strictFetch: true })
+  applyPlugin(harness)
+
+  const paths = harness.routes.map((route) => route.path)
+  assert.equal(new Set(paths).size, paths.length, 'no exact path may be registered twice')
+
+  // The whole table, path × methods — the evidence this fix has to carry.
+  assert.deepEqual(
+    harness.routes.map((route) => `${route.path} ${[...route.methods].join('+')}`).sort(),
+    [
+      `${PENDING_PATH} GET`,
+      `${ATTACHED_PATH} GET`,
+      `${HISTORY_PATH} GET`,
+      `${AVAILABLE_PATH} GET`,
+      `${ATTACH_PATH} POST`,
+      `${RELEASE_PATH} POST`,
+      `${ANSWER_PATH} POST`,
+      `${ADOPT_PATH} POST`,
+      `${MANAGE_PATH} GET+POST`,
+    ].sort(),
+  )
+
+  // One registration, dispatched by the request method: the read answers here…
+  const manage = routeFor(harness, MANAGE_PATH, 'GET')
+  assert.equal(manage.requestBody, 'buffered')
+  const read = await manage.fetch({
+    method: 'GET',
+    url: `http://local${MANAGE_PATH}?sessionId=${session.id}`,
+  } as never)
+  assert.equal(read.status, 200)
+  assert.deepEqual(((await read.json()) as { entries?: unknown[] }).entries, [])
+  // …and the read keeps its own refusal when the query is incomplete.
+  const noSession = await manage.fetch({ method: 'GET', url: `http://local${MANAGE_PATH}` } as never)
+  assert.equal(noSession.status, 400)
+  assert.equal(((await noSession.json()) as { error?: string }).error, 'manage.sessionId is required')
+
+  // …and the *same* registration performs an action for POST, through the same
+  // service the separate route used, with the same rules.
+  harness.records.set('cordis-plugin-secret/openai', {
+    version: 1,
+    envVar: ENV_VAR,
+    name: 'openai',
+    scope: 'persistent',
+    authorizedAt: 1,
+  })
+  const unconfirmed = await manage.fetch({
+    method: 'POST',
+    url: `http://local${MANAGE_PATH}`,
+    json: async () => ({ sessionId: session.id, action: 'delete', variable: ENV_VAR }),
+  } as never)
+  assert.equal(unconfirmed.status, 400, 'the POST half keeps the confirmation rule')
+  assert.deepEqual(harness.deleteCalls, [], 'and a refused POST writes nothing')
+  const malformed = await manage.fetch({
+    method: 'POST',
+    url: `http://local${MANAGE_PATH}`,
+    json: async () => {
+      throw new Error('not json')
+    },
+  } as never)
+  assert.equal(malformed.status, 400)
+  assert.equal(((await malformed.json()) as { error?: string }).error, 'manage body must be JSON')
+  // And the POST half really runs: the two-step delete completes through it.
+  const confirmed = await manage.fetch({
+    method: 'POST',
+    url: `http://local${MANAGE_PATH}`,
+    json: async () => ({ sessionId: session.id, action: 'delete', variable: ENV_VAR, confirm: true }),
+  } as never)
+  assert.equal(confirmed.status, 200)
+  assert.deepEqual(harness.deleteCalls, ['cordis-plugin-secret/openai'])
   unload(harness)
 })

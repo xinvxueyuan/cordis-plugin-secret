@@ -1,6 +1,6 @@
 {
   "name": "@xinvxueyuan/cordis-plugin-secret",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Cordis (DeepSeek Harness) plugin: secrets travel between a human and the agent in both directions — the agent asks, or the human attaches one to their own message — and the agent only ever receives an opaque session-scoped variable name (DSH_SECRET_*), never the value",
   "type": "module",
   "main": "lib/index.js",

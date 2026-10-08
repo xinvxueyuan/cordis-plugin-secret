@@ -480,7 +480,7 @@ toggle(附密钥) ──┬─→ fill ──(提交)──→ detail
 | `src/types.ts` | `SecretHistoryEvent` 增 4 个成员；`SecretHistorySource` 增 `'manage'`；新增 `SecretManageAction`/`SecretManageEntry`/`SecretManageCan`/`SecretManageResult`/`SecretManageMeta`（沿用「对象类型别名而非 interface」的手法让结果结构上是 JSON 值，`:38-61` 的注释）；`PendingView` 增可选 `action`/`target`/`expectValue`/`can` |
 | `src/protocol.ts` | `pendingView` 透传 4 个新字段（`:94-120`）；新增 `parseManage`（用户侧 POST 的逐字段校验，含 `confirm:true` 与 `MAX_VALUE` 复用）与 `manageView(entry)`（白名单重建，同 `historyView`/`availableView` `:260-284`）；`parseAnswer` 不改 |
 | `src/tool.ts` | 新增 `defineSecretManageTool(service, config)`（`renderResult` 自己的措辞 + 自己的 `presentationMeta` kind `secret-manage`）；`defineSecretRequestTool` **一字不改** |
-| `src/routes.ts` | 两条新路由（GET/POST 同路径）；既有 8 条不动 |
+| `src/routes.ts` | 一个精确路径 `/api/secret.manage`、**单次注册**、`methods:['GET','POST']` 按 `request.method` 内部分派（GET = 列表，POST = 执行一个动作）；既有 8 条不动。**t9 事故更正（2026-10-08，用户实机）**：本节原先写「两条新路由（GET/POST 同路径）」，实现时按字面**注册了两次**，而真实注册表按**精确路径**建键、与 `methods` 无关（`@deepseek-ai/dsh-client-connection/lib/index.js:625-639`，抛错在 `:633`），于是第二次注册抛 `exact Fetch route "/api/secret.manage" is already registered`，0.4.0 在实机上**整个插件条目不激活**（`dsh: warning: 1 entry did not activate`）。修法 = 合并为一次注册；回归测试 = 实施该规则的严格注册表（`test/register.test.ts`），它在修复前的形态上以同一条错误失败 |
 | `src/index.ts` | 注册第二个工具（`:116` 旁）；其余装配不变 |
 | `src/config.ts` | **不改**（复用 `requestTimeoutMs`/`maxPendingRequests`/`maxAvailableEntries`） |
 | `src/naming.ts` | **不改**（`recordKey`/`isExposedEnvVar`/`isCredentialName` 全部复用） |
@@ -502,7 +502,7 @@ toggle(附密钥) ──┬─→ fill ──(提交)──→ detail
 | 文件 | 新增覆盖 |
 |---|---|
 | `test/unit.test.ts` | `parseManage` 的逐字段真值表（缺 `confirm` → 400；`delete` 带值 → 400 或忽略；`value` 超长 → 400）；`GrantStore.unbind` 只影响目标变量且留下 `revoked-unbound`；`AttachStore.reScope` 不改值/不改 TTL |
-| `test/register.test.ts` | 两条新路由被捕获（路径/方法/`requestBody:'buffered'`）——沿用既有捕获点 `:140-153`（`tools.register` `:141`、`connection.fetch.register` `:148`）；`secret_manage` 出现在 `tools` 里且 schema 属性名集合 = `{action, variable, to, target, reason}`；**四个动作在无人类答复时一律不产生持久写**（N4）；`unbind` 前后 `credentials` 的写调用计数 = 0（N5，可复用 `:175-190` 的事件计数手法）；`delete` 的调用序列恰好是 `unset` → `deleteRecord`；`unset` 抛错时 `deleteRecord` **未被调用**（R4）；`scope→persistent` 经真 seam 并产生 `set` + `modifyRecord` |
+| `test/register.test.ts` | **一条**新路由（`/api/secret.manage`，`methods:['GET','POST']`；「两条」的说法见 §5.1 的 t9 更正）被捕获（路径/方法/`requestBody:'buffered'`）——沿用既有捕获点 `:140-153`（`tools.register` `:141`、`connection.fetch.register` `:148`）；`secret_manage` 出现在 `tools` 里且 schema 属性名集合 = `{action, variable, to, target, reason}`；**四个动作在无人类答复时一律不产生持久写**（N4）；`unbind` 前后 `credentials` 的写调用计数 = 0（N5，可复用 `:175-190` 的事件计数手法）；`delete` 的调用序列恰好是 `unset` → `deleteRecord`；`unset` 抛错时 `deleteRecord` **未被调用**（R4）；`scope→persistent` 经真 seam 并产生 `set` + `modifyRecord` |
 | `test/attach.test.ts` | 历史 4 类新事件的写入点（`updated`/`scope-changed`/`unbound`/`deleted`）与 `source:'manage'`；`deleted` 之后会话侧 `scope` 变 `session`。**注意（本轮实测的覆盖缺口）**：现在**没有任何 Host 侧测试断言历史事件的写入点** —— `test/register.test.ts` 只到路由注册（`:341`）与一句注释（`:333-335`），`:482` 就是文件末尾；`test/attach.test.ts`/`test/unit.test.ts` 只在配置里出现 `maxHistoryPerSession`。因此 t2 必须**新建** `test/history.test.ts` 承载新事件，并把既有 7 类事件也补上（这是「A 段可机器证明」的一部分，不是可选） |
 | `test/client-card.test.ts` | 管理卡的 `match`/`start`/`update`/`buildViewNode` 与既有卡互不干扰（同名 `tool/call` 只归一张卡） |
 | `test/client-attach.test.ts` | 管理面三个纯函数/字典/新事件的同键集断言（沿用 `:972` 的手法）；`__cordisSecretClient` 键集**仍然不变**（回归护栏）；`__cordisSecretManage` 键集白名单；管理列表与卡片 data 的哨兵扫描（N1）；掩码输入在取消/提交后本地 state 为空 |
@@ -652,6 +652,8 @@ npm --prefix projects/cordis-plugin-secret run build 后 git status 只允许出
 
 另：管理列表的「本会话可用」分区在第二轮已补上另一个方向（见 U5）；`available()`（`@` 菜单）**不变**——菜单的职责是"把一枚密钥登记到某条消息"，与会话内已注入的授权是两件事，本裁定只针对管理列表。
 
+**t9 发布级缺陷与修缮（2026-10-08，用户实机报错后）：** 0.4.0 在实机上**整个插件条目不激活**——`dsh: warning: 1 entry did not activate` + `secret (@xinvxueyuan/cordis-plugin-secret): Error: connection: exact Fetch route "/api/secret.manage" is already registered`（栈指向 `lib/routes.js` 的 `registerSecretRoutes`）。根因就是把本表「两条新路由（GET/POST 同路径）」按字面实现成**两次 `register()`**，而真实注册表按**精确路径**建键、与 `methods` 无关（`@deepseek-ai/dsh-client-connection/lib/index.js:625-639`，抛错在 `:633`）。**三道质量门都没抓到的原因**：它们的 harness 用的是自造 connection 假注册表，而假表**不实施"精确路径唯一"规则**，`test/register.test.ts` 里那条 `assert.deepEqual(registered, …)` 甚至把**两次注册**当作期望值钉住了。修缮：`src/routes.ts` 合并为一次注册（`methods:['GET','POST']`，按 `request.method` 分派，GET/POST 行为不变）；`test/register.test.ts` 新增**严格注册表**（复刻上述规则：重复精确路径抛同一条错误、空方法/重复方法拒绝）与两条回归用例，其中一条在修复前的形态上**以现场同一条错误失败**（已实测留存），另一条断言 9 个精确路径各一次且 `/api/secret.manage` 同时拥有 GET/POST；那条钉住重复注册的既有断言按事实更新（10 行 → 9 行，仅 `manage` 两行合并为一行，无其它行改动，已在用例注释里逐条披露）。
+
 **R5 已知限制（质量门 r2／t7 报出；0.4.0 已发布，本轮只做文档记录、不返工）：** `manageList`（`src/service.ts:848` 起）在两方向重叠时会把「问方向」的事实藏起来——同一变量若**既有一条人工附加记录（`staged`/`bound`）又有一份经 `secret_request` 的活跃会话授权**，附加行先入行，`requestViews` 的 `seen`（`:889-896`）随即跳过该变量，于是列表只回一行 `{state:'staged', origin:'attach', source:'session'}`，而这枚变量其实**已被授权、可注入**；问方向的授权只在本会话**历史**（`authorized` / 来源 `request`）里可见。**复现两步**：附上某变量但不发送 → 再对同名变量 `secret_request` 并批准（此时历史里 `authorized:request` 与 `staged:attach` 并存，列表只报附加那一面）。口径如上 U5：列表的既定边界是**一个变量只占一行**，重叠时该行报**人工附加那一面**（`origin='attach'`）。影响范围**仅**人类管理列表在重叠场景下**低估可用性、方向不完整**：**不泄漏任何值**、**不误报可执行动作**（该行 `can.*` 仍为真、`unbind` 仍能撤掉本会话暴露），**安全不变量与权限边界未受影响**。t7 的处置建议是 low、非阻塞、**不让 0.4.0 发布返工**，故仅记入 README 的「0.4.0 四条已知限制」，代码留待发布后单独立项。
 
 ---
@@ -659,7 +661,7 @@ npm --prefix projects/cordis-plugin-secret run build 后 git status 只允许出
 ## 9. 由本定案直接决定的 t2 实施顺序
 
 1. **Host 地基（先绿纯逻辑）**：`src/adapters.ts` 的 3 个新方法 + `preloaded`；`src/types.ts` 的新类型与两个联合扩容；`src/protocol.ts` 的 `parseManage`/`manageView`/`pendingView` 透传；`GrantStore.unbind` + `revoked-unbound`；`AttachStore.reScope`。→ A1/A2 的纯逻辑部分先绿。
-2. **Host 执行器与路由**：`SecretService.manageList` / `manage` / `manageAction` + 四个执行器 + `answer()` 的一行改动；`src/routes.ts` 两条新路由；`src/index.ts` 注册第二个工具。→ A2（尤其 N4/N5 与两步删除）/A3 全绿。
+2. **Host 执行器与路由**：`SecretService.manageList` / `manage` / `manageAction` + 四个执行器 + `answer()` 的一行改动；`src/routes.ts` 一条新路由（`methods:['GET','POST']`，见 §5.1 的 t9 更正）；`src/index.ts` 注册第二个工具。→ A2（尤其 N4/N5 与两步删除）/A3 全绿。
 3. **Client 纯函数与字典**：`readManageList`/`readManageEntry`/`manageCan`/`describeManage`、`postManage`/`refreshManage`、`HISTORY_EVENTS`/`HISTORY_LABEL`/两本字典、新常量。→ A4 的纯函数部分先绿。
 4. **Client 三个面**：`manage`/`edit`/`danger` + 头部第二个链接 + `detail` 面的「管理」按钮。→ A4.4 绿。
 5. **Client 管理卡**：`secretManageDefinition` + `SecretManageCard` + `HiddenSecretManageToolRow` + 两处注册。→ A4.2/A4.3 绿。
