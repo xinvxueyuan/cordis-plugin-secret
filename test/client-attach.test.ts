@@ -1923,3 +1923,126 @@ test('the management face shows both session-side directions and labels each one
   )
   reset()
 })
+
+// ---------------------------------------------------------------------------
+// The user's security report: keys typed into this plugin were being autofilled
+// and captured by the browser and by password managers. Every field that can
+// hold a secret must therefore be un-fillable and un-savable — a property of the
+// rendered props, which is exactly what these two tests pin. (Whether a given
+// browser or extension still offers something can only be seen in a real
+// browser; that part is listed as needing a human, never claimed here.)
+// ---------------------------------------------------------------------------
+
+/** The bag every field that can hold a secret must carry (`src/client/entry.ts`). */
+const SECRET_FIELD_BAG: Record<string, unknown> = {
+  autoComplete: 'new-password',
+  autoCorrect: 'off',
+  autoCapitalize: 'off',
+  spellCheck: false,
+  'data-1p-ignore': 'true',
+  'data-lpignore': 'true',
+  'data-bwignore': 'true',
+  'data-form-type': 'other',
+  'data-protonpass-ignore': 'true',
+}
+
+/** Assert the suppression bag, and that no `name` gives a manager a handle. */
+function assertSuppressed(field: Element | undefined, where: string): void {
+  assert.notEqual(field, undefined, `${where}: no field rendered`)
+  const props = (field as Element).props
+  // Report every gap at once: a partial bag is exactly the regression this test
+  // exists to catch, so the failure must name all of what is missing.
+  const missing = Object.entries(SECRET_FIELD_BAG)
+    .filter(([key, value]) => props[key] !== value)
+    .map(([key, value]) => `${key}=${JSON.stringify(props[key] ?? null)} (want ${JSON.stringify(value)})`)
+  assert.deepEqual(missing, [], `${where}: suppression attributes missing or wrong`)
+  const named = Object.keys(props).filter((key) => key.toLowerCase() === 'name')
+  assert.deepEqual(named, [], `${where}: a secret field must carry no name attribute`)
+}
+
+/** The bag plus the read-only-until-focus guard, with the release exercised. */
+function assertSecretField(field: Element | undefined, where: string): void {
+  assertSuppressed(field, where)
+  const props = (field as Element).props
+  assert.equal(props.readOnly, true, `${where}: must start read-only so autofill skips it on load`)
+  const onFocus = props.onFocus as ((event: unknown) => void) | undefined
+  assert.equal(typeof onFocus, 'function', `${where}: must release the read-only guard on focus`)
+  const node = { readOnly: true }
+  onFocus?.({ currentTarget: node })
+  assert.equal(node.readOnly, false, `${where}: focus must release the read-only guard`)
+}
+
+test('every capsule and card field that can hold a secret is un-fillable and un-savable', () => {
+  reset()
+  // The capsule's fill face: the credential key, the label, and the value.
+  api.setAttachMode({ kind: 'fill' })
+  const fill = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+  const fillFields = elements(fill).filter(
+    (element) => element.type === 'input' && (element.props.type === 'text' || element.props.type === 'password'),
+  )
+  assert.equal(fillFields.length, 3, 'the fill face owns key, label and value fields')
+  for (const field of fillFields) assertSuppressed(field, `fill ${String(field.props.id)}`)
+  // Only the value field is a secret, and it is the one that starts masked and
+  // carries the read-only guard; the key and label are identifiers.
+  const fillValue = fillFields.find((field) => field.props.id === 'dsh-secret-attach-value')
+  assert.equal(fillValue?.props.type, 'password', 'the secret field starts masked')
+  assertSecretField(fillValue, 'fill value')
+  for (const field of fillFields.filter((candidate) => candidate.props.id !== 'dsh-secret-attach-value')) {
+    assert.equal(field.props.readOnly, undefined, `${String(field.props.id)} is an identifier, not a secret`)
+  }
+
+  // The capsule's change-value face.
+  reset()
+  api.setAttachMode({ kind: 'edit', variable: ENV_VAR, target: 'session' })
+  const edit = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+  const editFields = elements(edit).filter(
+    (element) => element.type === 'input' && (element.props.type === 'text' || element.props.type === 'password'),
+  )
+  assert.equal(editFields.length, 1)
+  assert.equal(editFields[0]?.props.type, 'password', 'the change-value field starts masked')
+  assertSecretField(editFields[0], 'manage edit value')
+
+  // The management card: the field the human types a new secret into, and the
+  // value-free masked copy it displays for a scope upgrade.
+  const manageCard = MANAGE.SecretManageCard as (props: unknown) => unknown
+  const typedCard = manageCard({
+    node: {
+      data: {
+        callId: 'call-manage-1',
+        request: { action: 'value', target: 'session' },
+        requestUnreadable: false,
+        settled: false,
+        outcome: null,
+        failure: null,
+      },
+    },
+    sessionId: SESSION_ID,
+  })
+  const typedFields = elements(typedCard).filter(
+    (element) => element.type === 'input' && (element.props.type === 'text' || element.props.type === 'password'),
+  )
+  assert.equal(typedFields.length, 1, 'one field to type the new secret into')
+  assertSecretField(typedFields[0], 'manage card value')
+
+  const scopeCard = manageCard({
+    node: {
+      data: {
+        callId: 'call-manage-2',
+        request: { action: 'scope', to: 'persistent' },
+        requestUnreadable: false,
+        settled: false,
+        outcome: null,
+        failure: null,
+      },
+    },
+    sessionId: SESSION_ID,
+  })
+  const scopeFields = elements(scopeCard).filter(
+    (element) => element.type === 'input' && element.props.type === 'password',
+  )
+  assert.equal(scopeFields.length, 1, 'the scope upgrade shows one masked display field')
+  assertSuppressed(scopeFields[0], 'manage card scope display')
+  assert.equal(scopeFields[0]?.props.value, '', 'the display field holds no value')
+  assert.equal(scopeFields[0]?.props.disabled, true, 'and it is not editable')
+  reset()
+})

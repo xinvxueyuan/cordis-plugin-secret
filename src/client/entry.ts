@@ -756,6 +756,95 @@ function HiddenSecretToolRow(): unknown {
   return null
 }
 
+/**
+ * The attribute bag every text/password field this plugin renders carries.
+ *
+ * The fields that receive a secret value are why it exists: a browser or a
+ * password-manager extension must never autofill one, offer to save one, or
+ * remember what was typed into one. No single attribute does that, so this is a
+ * deliberately redundant set, one layer per line of defence:
+ *
+ * - `autocomplete="new-password"`: the one hint the HTML spec has for exactly
+ *   this case — MDN's "How to turn off form autocompletion" documents it for
+ *   "a user [who] can specify a new password for another person" and records
+ *   that plain `off` is *ignored* by modern browsers for login-like fields.
+ * - **no `name` attribute**: MDN's own fallback advice when a browser keeps
+ *   suggesting is to change the field's `name`; a field with no name and no
+ *   owning form is not something a browser can key a credential on.
+ * - **no `<form>` and no submit button anywhere in this plugin's UI**: those are
+ *   the conditions MDN lists for a browser to offer autocompletion or to build a
+ *   login out of the fields. The capsule and the cards are plain `div`s and
+ *   every button in them is `type="button"`.
+ * - the vendor ignore attributes, each named by its own vendor:
+ *   `data-1p-ignore` (1Password: "use the `data-1p-ignore` or `data-op-ignore`
+ *   attribute to tell 1Password it should ignore the field"), `data-lpignore`
+ *   (LastPass), `data-bwignore` (Bitwarden), `data-form-type="other"`
+ *   (Dashlane) and `data-protonpass-ignore` (Proton Pass — the only one of the
+ *   five whose vendor documentation we could not reach, kept because an extra
+ *   attribute costs nothing while a missed one costs a copied key).
+ * - `spellcheck=false`, `autocorrect="off"`, `autocapitalize="off"`: a secret is
+ *   an opaque string, so it must not be sent to a spell service or silently
+ *   rewritten.
+ *
+ * The masked state keeps `type="password"` on purpose. The alternative, a text
+ * field obfuscated with `-webkit-text-security`, is non-standard — MDN marks it
+ * "not standardized … we do not recommend using non-standard features in
+ * production … limited browser support" — so a browser that ignores it would
+ * render the key in clear text, a worse failure than the capture this bag
+ * closes. Masking stays with the browser's own password field; suppression
+ * stays with the attributes above.
+ *
+ * One trade-off is recorded rather than hidden: on a `new-password` field
+ * Chromium may offer to *generate* a password. That offer neither autofills a
+ * stored credential nor reads the field, and ignoring it is harmless.
+ */
+const SECRET_FIELD_SUPPRESSION = {
+  autoComplete: 'new-password',
+  autoCorrect: 'off',
+  autoCapitalize: 'off',
+  spellCheck: false,
+  'data-1p-ignore': 'true',
+  'data-lpignore': 'true',
+  'data-bwignore': 'true',
+  'data-form-type': 'other',
+  'data-protonpass-ignore': 'true',
+} as const
+
+/**
+ * The second layer for a field that can hold a secret: it starts `readOnly` and
+ * is released the moment it is focused.
+ *
+ * Autofill primes fields on load, before the human has done anything, and a
+ * read-only field is not a fill candidate for that pass. Nothing is lost: a
+ * field cannot be typed into without being focused first, and the focus handler
+ * here is what makes it editable again. This is why the guard is a pair of
+ * props rather than a `readOnly: true` on its own (which would make the field
+ * unusable).
+ */
+function secretFieldGuards(): { readOnly: true; onFocus: (event: unknown) => void } {
+  return {
+    readOnly: true,
+    onFocus: (event: unknown) => {
+      const node = event as { currentTarget?: { readOnly?: boolean }; target?: { readOnly?: boolean } }
+      const field = node.currentTarget ?? node.target
+      if (field !== undefined && field !== null) field.readOnly = false
+    },
+  }
+}
+
+/**
+ * The hygiene subset for a free-text box that can hold no secret (the card's
+ * "other instruction" field): no spelling service, no autocorrection, and no
+ * autocomplete — but not the password-manager ignore attributes, because there
+ * is no credential here for a manager to capture.
+ */
+const PLAIN_TEXT_HYGIENE = {
+  autoComplete: 'off',
+  autoCorrect: 'off',
+  autoCapitalize: 'off',
+  spellCheck: false,
+} as const
+
 /** One card for one `secret_request` call, drawn in the conversation flow. */
 function SecretRequestCard(props: {
   readonly node?: { readonly data?: unknown }
@@ -986,13 +1075,13 @@ function SecretRequestCard(props: {
           'div',
           { className: C.inputRow },
           h('input', {
+            ...SECRET_FIELD_SUPPRESSION,
+            ...secretFieldGuards(),
             id: valueId,
             className: C.input,
             type: reveal ? 'text' : 'password',
             value,
             placeholder: TEXT.valuePlaceholder,
-            autoComplete: 'off',
-            spellCheck: false,
             disabled: !answerable,
             'aria-label': TEXT.valueLabel,
             onChange: (event: { target: { value: string } }) => setValue(event.target.value),
@@ -1021,6 +1110,7 @@ function SecretRequestCard(props: {
           { key: 'other', className: C.field },
           h('label', { className: C.fieldLabel, htmlFor: `dsh-secret-other-${callId}` }, TEXT.otherLabel),
           h('textarea', {
+            ...PLAIN_TEXT_HYGIENE,
             id: `dsh-secret-other-${callId}`,
             className: C.textarea,
             value: otherText,
@@ -3511,13 +3601,12 @@ function SecretAttachCapsule(props: {
           { className: A.field },
           h('label', { className: A.label, htmlFor: 'dsh-secret-attach-key' }, t('keyLabel')),
           h('input', {
+            ...SECRET_FIELD_SUPPRESSION,
             id: 'dsh-secret-attach-key',
             className: A.input,
             type: 'text',
             value: key,
             placeholder: t('keyPlaceholder'),
-            autoComplete: 'off',
-            spellCheck: false,
             disabled: busy,
             onChange: (event: { target: { value: string } }) => setKey(event.target.value),
           }),
@@ -3528,12 +3617,12 @@ function SecretAttachCapsule(props: {
           { className: A.field },
           h('label', { className: A.label, htmlFor: 'dsh-secret-attach-label' }, t('labelLabel')),
           h('input', {
+            ...SECRET_FIELD_SUPPRESSION,
             id: 'dsh-secret-attach-label',
             className: A.input,
             type: 'text',
             value: label,
             placeholder: t('labelPlaceholder'),
-            autoComplete: 'off',
             disabled: busy,
             onChange: (event: { target: { value: string } }) => setLabel(event.target.value),
           }),
@@ -3546,13 +3635,13 @@ function SecretAttachCapsule(props: {
             'div',
             { className: A.inputRow },
             h('input', {
+              ...SECRET_FIELD_SUPPRESSION,
+              ...secretFieldGuards(),
               id: 'dsh-secret-attach-value',
               className: A.input,
               type: reveal ? 'text' : 'password',
               value,
               placeholder: t('valuePlaceholder'),
-              autoComplete: 'off',
-              spellCheck: false,
               disabled: busy,
               'aria-label': t('valueLabel'),
               onChange: (event: { target: { value: string } }) => setValue(event.target.value),
@@ -3845,13 +3934,13 @@ function SecretAttachCapsule(props: {
             'div',
             { className: A.inputRow },
             h('input', {
+              ...SECRET_FIELD_SUPPRESSION,
+              ...secretFieldGuards(),
               id: 'dsh-secret-manage-value',
               className: A.input,
               type: editReveal ? 'text' : 'password',
               value: editValue,
               placeholder: t('editValuePlaceholder'),
-              autoComplete: 'off',
-              spellCheck: false,
               disabled: busy,
               'aria-label': t('editValueLabel'),
               onChange: (event: { target: { value: string } }) => setEditValue(event.target.value),
@@ -4539,6 +4628,7 @@ function SecretManageCard(props: {
               'div',
               { className: C.inputRow },
               h('input', {
+                ...SECRET_FIELD_SUPPRESSION,
                 className: C.input,
                 // Masked and disabled: the value is never rendered here, and the
                 // human is not asked for it again — the Host writes the copy this
@@ -4547,8 +4637,6 @@ function SecretManageCard(props: {
                 value: '',
                 readOnly: true,
                 disabled: true,
-                autoComplete: 'off',
-                spellCheck: false,
                 'aria-label': t('manageScopeUpCurrent'),
                 placeholder: '••••••••',
               }),
@@ -4569,12 +4657,12 @@ function SecretManageCard(props: {
               'div',
               { className: C.inputRow },
               h('input', {
+                ...SECRET_FIELD_SUPPRESSION,
+                ...secretFieldGuards(),
                 className: C.input,
                 type: reveal ? 'text' : 'password',
                 value,
                 placeholder: '粘贴新的密钥…',
-                autoComplete: 'off',
-                spellCheck: false,
                 disabled: busy || !answerable,
                 'aria-label': '新密钥内容',
                 onChange: (event: { target: { value: string } }) => setValue(event.target.value),

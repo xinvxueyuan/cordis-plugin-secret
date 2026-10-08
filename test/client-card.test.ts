@@ -486,6 +486,80 @@ test('the raw value never leaves the input the human typed it into', () => {
   assert.equal(JSON.stringify({ ...typed[0]?.props, value: undefined }).includes(SECRET), false)
 })
 
+// ---- the field itself must not be captureable --------------------------------
+/**
+ * The suppression bag every field that can hold a secret must carry, byte for
+ * byte as `src/client/entry.ts` declares it. A regression here is a security
+ * regression: the user reported the key being autofilled and captured by a
+ * password manager, and no single attribute closes that.
+ */
+const SECRET_FIELD_BAG: Record<string, unknown> = {
+  autoComplete: 'new-password',
+  autoCorrect: 'off',
+  autoCapitalize: 'off',
+  spellCheck: false,
+  'data-1p-ignore': 'true',
+  'data-lpignore': 'true',
+  'data-bwignore': 'true',
+  'data-form-type': 'other',
+  'data-protonpass-ignore': 'true',
+}
+
+/**
+ * Assert one secret-holding field is un-fillable, un-savable and starts
+ * read-only, with the focus handler that releases it.
+ */
+function assertSecretField(field: Element | undefined, where: string): void {
+  assert.notEqual(field, undefined, `${where}: no field rendered`)
+  const props = (field as Element).props
+  // Report every gap at once: a partial bag is exactly the regression this test
+  // exists to catch, so the failure must name all of what is missing.
+  const missing = Object.entries(SECRET_FIELD_BAG)
+    .filter(([key, value]) => props[key] !== value)
+    .map(([key, value]) => `${key}=${JSON.stringify(props[key] ?? null)} (want ${JSON.stringify(value)})`)
+  assert.deepEqual(missing, [], `${where}: suppression attributes missing or wrong`)
+  const named = Object.keys(props).filter((key) => key.toLowerCase() === 'name')
+  assert.deepEqual(named, [], `${where}: a secret field must carry no name attribute`)
+  assert.equal(props.readOnly, true, `${where}: must start read-only so autofill skips it on load`)
+  const onFocus = props.onFocus as ((event: unknown) => void) | undefined
+  assert.equal(typeof onFocus, 'function', `${where}: must release the read-only guard on focus`)
+  const node = { readOnly: true }
+  onFocus?.({ currentTarget: node })
+  assert.equal(node.readOnly, false, `${where}: focus must release the read-only guard`)
+}
+
+test('the card’s secret field cannot be autofilled or captured by a password manager', () => {
+  const tree = renderer.render(CARD_COMPONENT, cardProps())
+  const fields = elements(tree).filter(
+    (element) => element.type === 'input' && element.props.type === 'password',
+  )
+  assert.equal(fields.length, 1, 'the answering form owns exactly one secret field')
+  assertSecretField(fields[0], 'request card value')
+
+  // The free-text instruction box can hold no secret, so it takes the hygiene
+  // subset (no spell service, no autocorrection) and not the manager bag. The
+  // box lives behind the "other" action; an earlier test may already have opened
+  // it, and this renderer keeps one component instance, so open it only if the
+  // first render does not show it.
+  if (elements(tree).every((element) => element.type !== 'textarea')) {
+    const other = byLabel(tree, '其他') as Element
+    ;(other.props.onClick as (() => void) | undefined)?.()
+  }
+  const opened = renderer.render(CARD_COMPONENT, cardProps())
+  const textareas = elements(opened).filter((element) => element.type === 'textarea')
+  assert.equal(textareas.length, 1, 'the instruction box is on screen')
+  for (const [key, value] of Object.entries({
+    autoComplete: 'off',
+    autoCorrect: 'off',
+    autoCapitalize: 'off',
+    spellCheck: false,
+  })) {
+    assert.equal(textareas[0]?.props[key], value, `instruction box: ${key} must be ${String(value)}`)
+  }
+  // The instruction is prose, never a secret: the sentinel never reaches it.
+  assert.equal(JSON.stringify(textareas[0]?.props).includes(SECRET), false)
+})
+
 test('the test seam is frozen, stateless and free of secret material', () => {
   assert.equal(Object.isFrozen(seam), true)
   const keys = Object.keys(seam).sort()
