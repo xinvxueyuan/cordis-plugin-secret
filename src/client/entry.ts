@@ -833,6 +833,34 @@ function secretFieldGuards(): { readOnly: true; onFocus: (event: unknown) => voi
 }
 
 /**
+ * The same bag for the two **identifier** fields (the credential key and the
+ * title), with one deliberate difference: `autocomplete="off"` instead of
+ * `new-password`.
+ *
+ * The first-hand reason is the Chrome team's own Autofill guide: for a field
+ * whose value is unique every time and can never be reused — its example is a
+ * one-time code, and the credential key and title are the same shape of value —
+ * it says to use `autocomplete="off"`, because "the value is different every
+ * time, and the browser should not save the value or offer autofill options".
+ * The same page records the limit that makes `off` the wrong token for the four
+ * *secret* fields: "even with `autocomplete="off"`, the browser will still offer
+ * password autofill options so that these password management tools keep
+ * working" — a `type="password"` field keeps its credential UI, which is why
+ * those four keep `new-password`.
+ *
+ * `new-password` on a plain text field is not a "do not autofill" hint at all: it
+ * is the sign-up hint that tells Chrome to offer *generating* a password, which
+ * is exactly the kind of noise the user reported on these two fields.
+ *
+ * @see https://web.dev/learn/forms/autofill (Learn Forms: Autofill)
+ * @see https://developer.mozilla.org/en-US/docs/Web/Security/Practical_implementation_guides/Turning_off_form_autocompletion
+ */
+const IDENTIFIER_FIELD_SUPPRESSION = {
+  ...SECRET_FIELD_SUPPRESSION,
+  autoComplete: 'off',
+} as const
+
+/**
  * The hygiene subset for a free-text box that can hold no secret (the card's
  * "other instruction" field): no spelling service, no autocorrection, and no
  * autocomplete — but not the password-manager ignore attributes, because there
@@ -1642,6 +1670,9 @@ const A = {
   close: `${AP}_close`,
   body: `${AP}_body`,
   field: `${AP}_field`,
+  // A `<label>` that wraps the visible caption and the control, so the control
+  // needs no `id` and the caption no `for`: implicit association.
+  fieldGroup: `${AP}_fieldGroup`,
   label: `${AP}_label`,
   input: `${AP}_input`,
   inputRow: `${AP}_inputRow`,
@@ -1687,6 +1718,7 @@ const ATTACH_CSS = `
 .${A.close}:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .${A.body}{flex-direction:column;gap:8px;display:flex;min-width:0}
 .${A.field}{flex-direction:column;gap:6px;display:flex;min-width:0}
+.${A.fieldGroup}{flex-direction:column;gap:6px;display:flex;min-width:0}
 .${A.label}{color:var(--dsw-alias-label-caption);font-size:12px;line-height:18px}
 .${A.inputRow}{align-items:center;gap:8px;display:flex}
 .${A.input}{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-label-primary);flex:auto;font:inherit;font-size:13px;height:32px;min-width:0;outline:none;padding:0 10px}
@@ -3599,33 +3631,52 @@ function SecretAttachCapsule(props: {
         h(
           'div',
           { className: A.field },
-          h('label', { className: A.label, htmlFor: 'dsh-secret-attach-key' }, t('keyLabel')),
-          h('input', {
-            ...SECRET_FIELD_SUPPRESSION,
-            id: 'dsh-secret-attach-key',
-            className: A.input,
-            type: 'text',
-            value: key,
-            placeholder: t('keyPlaceholder'),
-            disabled: busy,
-            onChange: (event: { target: { value: string } }) => setKey(event.target.value),
-          }),
+          // Implicit label association: the caption and the control live inside
+          // one `<label>`, so the control carries no `id` and the caption no
+          // `for`. Chrome's own Autofill guide says the browser stores and fills
+          // a field by its `name` attribute and, in some browsers, its `id`, so
+          // the stable identity is exactly what has to go; MDN documents the
+          // nested form as the equivalent association ("the `for` and `id`
+          // attributes are not needed because the association is implicit"), and
+          // `aria-label` carries the same text as an explicit accessible name for
+          // the assistive technologies that do not implement implicit labels.
+          h(
+            'label',
+            { className: A.fieldGroup },
+            h('span', { className: A.label }, t('keyLabel')),
+            h('input', {
+              ...IDENTIFIER_FIELD_SUPPRESSION,
+              ...secretFieldGuards(),
+              className: A.input,
+              type: 'text',
+              value: key,
+              placeholder: t('keyPlaceholder'),
+              disabled: busy,
+              'aria-label': t('keyLabel'),
+              onChange: (event: { target: { value: string } }) => setKey(event.target.value),
+            }),
+          ),
           h('span', { className: A.optionHint }, t('keyHint')),
         ),
         h(
           'div',
           { className: A.field },
-          h('label', { className: A.label, htmlFor: 'dsh-secret-attach-label' }, t('labelLabel')),
-          h('input', {
-            ...SECRET_FIELD_SUPPRESSION,
-            id: 'dsh-secret-attach-label',
-            className: A.input,
-            type: 'text',
-            value: label,
-            placeholder: t('labelPlaceholder'),
-            disabled: busy,
-            onChange: (event: { target: { value: string } }) => setLabel(event.target.value),
-          }),
+          h(
+            'label',
+            { className: A.fieldGroup },
+            h('span', { className: A.label }, t('labelLabel')),
+            h('input', {
+              ...IDENTIFIER_FIELD_SUPPRESSION,
+              ...secretFieldGuards(),
+              className: A.input,
+              type: 'text',
+              value: label,
+              placeholder: t('labelPlaceholder'),
+              disabled: busy,
+              'aria-label': t('labelLabel'),
+              onChange: (event: { target: { value: string } }) => setLabel(event.target.value),
+            }),
+          ),
         ),
         h(
           'div',

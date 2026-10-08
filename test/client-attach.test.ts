@@ -1981,14 +1981,21 @@ test('every capsule and card field that can hold a secret is un-fillable and un-
     (element) => element.type === 'input' && (element.props.type === 'text' || element.props.type === 'password'),
   )
   assert.equal(fillFields.length, 3, 'the fill face owns key, label and value fields')
-  for (const field of fillFields) assertSuppressed(field, `fill ${String(field.props.id)}`)
-  // Only the value field is a secret, and it is the one that starts masked and
-  // carries the read-only guard; the key and label are identifiers.
-  const fillValue = fillFields.find((field) => field.props.id === 'dsh-secret-attach-value')
-  assert.equal(fillValue?.props.type, 'password', 'the secret field starts masked')
-  assertSecretField(fillValue, 'fill value')
-  for (const field of fillFields.filter((candidate) => candidate.props.id !== 'dsh-secret-attach-value')) {
-    assert.equal(field.props.readOnly, undefined, `${String(field.props.id)} is an identifier, not a secret`)
+  // The fill face deliberately mixes the two bags: the masked value field is the
+  // one that holds a secret and takes the secret bag (with `new-password`), while
+  // the two unmasked identifier fields take the identifier bag (with `off`,
+  // asserted in detail by the identifier test below).
+  // Disclosed change (t19): the two identifier fields no longer carry an `id`,
+  // so the fields are told apart by their masked state rather than by id.
+  const secretFields = fillFields.filter((field) => field.props.type === 'password')
+  assert.equal(secretFields.length, 1, 'exactly one masked secret field in the fill face')
+  for (const [index, field] of secretFields.entries()) assertSecretField(field, `fill secret ${String(index)}`)
+  const identifierFields = fillFields.filter((candidate) => candidate.props.type !== 'password')
+  assert.equal(identifierFields.length, 2, 'the credential key and the title are not masked')
+  for (const [index, field] of identifierFields.entries()) {
+    assert.equal(field.props.readOnly, true, `identifier ${String(index)} still starts read-only (t19)`)
+    assert.equal(field.props.autoComplete, 'off', `identifier ${String(index)} uses the identifier bag (t19)`)
+    assert.equal(field.props.id, undefined, `identifier ${String(index)} carries no id (t19)`)
   }
 
   // The capsule's change-value face.
@@ -2044,5 +2051,122 @@ test('every capsule and card field that can hold a secret is un-fillable and un-
   assertSuppressed(scopeFields[0], 'manage card scope display')
   assert.equal(scopeFields[0]?.props.value, '', 'the display field holds no value')
   assert.equal(scopeFields[0]?.props.disabled, true, 'and it is not editable')
+  reset()
+})
+
+// ---------------------------------------------------------------------------
+// t19: the credential key and the title are **identifier** fields, and they
+// still offered browser autofill after t15's bag. Two first-hand reasons, both
+// from the Chrome team's Autofill guide and MDN: `new-password` is the sign-up
+// hint (Chrome suggests *generating* a password), not a "do not autofill" hint —
+// for a value that is unique every time the guide says to use
+// `autocomplete="off"`; and a stable `id` is one of the things Chrome records a
+// field by. So the two fields switch to `off`, lose their `id`/`for` pair in
+// favour of implicit label nesting, and keep the vendor ignore marks and the
+// read-only-until-focus guard. Whether a given browser really stops offering
+// suggestions is a real-browser question; the props are what a test can pin.
+// ---------------------------------------------------------------------------
+
+/** The bag the two identifier fields must carry: t15's bag with `off`. */
+const IDENTIFIER_FIELD_BAG: Record<string, unknown> = {
+  ...SECRET_FIELD_BAG,
+  autoComplete: 'off',
+}
+
+/** The parent of one element, so a nested-label association can be asserted. */
+function parentOf(root: unknown, target: Element): Element | undefined {
+  const walk = (node: unknown, parent: Element | undefined): Element | undefined => {
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const hit = walk(child, parent)
+        if (hit !== undefined) return hit
+      }
+      return undefined
+    }
+    if (typeof node !== 'object' || node === null) return undefined
+    const element = node as Element
+    if (element === target) return parent
+    return walk(element.props.children, element)
+  }
+  return walk(root, undefined)
+}
+
+test('the credential key and the title stop offering autofill without losing their label', () => {
+  reset()
+  api.setAttachMode({ kind: 'fill' })
+  const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+  const identifiers = elements(tree).filter(
+    (element) => element.type === 'input' && element.props.type === 'text',
+  )
+  assert.equal(identifiers.length, 2, 'the credential key and the title are the fill face’s text fields')
+
+  for (const [index, field] of identifiers.entries()) {
+    const where = `identifier ${String(index)}`
+    // Every gap is reported at once, so a failure names the whole shape that is
+    // missing rather than only the first thing checked.
+    const violations: string[] = []
+    // (a) `off`: the value the Chrome team's Autofill guide gives for a field
+    // whose value is unique every time, and never `new-password` (that would ask
+    // Chrome to offer generating a password).
+    for (const [key, value] of Object.entries(IDENTIFIER_FIELD_BAG)) {
+      if (field.props[key] !== value) {
+        violations.push(`${key}=${JSON.stringify(field.props[key] ?? null)} (want ${JSON.stringify(value)})`)
+      }
+    }
+    // (c) the vendor ignore marks are part of that bag; named here too, so a
+    // future edit of the bag cannot quietly drop one.
+    for (const key of ['data-1p-ignore', 'data-lpignore', 'data-bwignore', 'data-form-type', 'data-protonpass-ignore']) {
+      if (field.props[key] === undefined) violations.push(`${key} is missing`)
+    }
+    // (b) nothing stable for autofill or an extension to key the field on.
+    if (field.props.id !== undefined) violations.push(`id=${JSON.stringify(field.props.id)} (must be absent)`)
+    if (field.props.name !== undefined) violations.push(`name=${JSON.stringify(field.props.name)} (must be absent)`)
+    // (d) read-only until focus, the same pair the secret fields use — the cost
+    // is one focus before typing, which a click or Tab already performs.
+    if (field.props.readOnly !== true) violations.push('readOnly is not set')
+    const onFocus = field.props.onFocus as ((event: unknown) => void) | undefined
+    if (typeof onFocus !== 'function') violations.push('no onFocus to release the guard')
+    else {
+      const node = { readOnly: true }
+      onFocus({ currentTarget: node })
+      if (node.readOnly !== false) violations.push('onFocus does not release the guard')
+    }
+    // Unmasked on purpose: an identifier is meant to be read back.
+    if (field.props.type !== 'text') violations.push(`type=${JSON.stringify(field.props.type)} (want "text")`)
+    assert.deepEqual(violations, [], `${where}: suppression shape missing or wrong`)
+  }
+
+  // (a11y) the visible caption stays programmatically associated: the control is
+  // nested in its `<label>` (implicit association, which MDN documents as the
+  // equivalent of `for`/`id`), and the same text is on the control as an explicit
+  // `aria-label`, so the accessible name survives where implicit labels are not
+  // implemented.
+  for (const [index, field] of identifiers.entries()) {
+    const label = parentOf(tree, field)
+    assert.equal(label?.type, 'label', `identifier ${String(index)} must sit inside its <label>`)
+    const caption = index === 0 ? api.ATTACH_ZH.keyLabel : api.ATTACH_ZH.labelLabel
+    assert.equal(visibleText(label), caption, 'the label element holds exactly the visible caption')
+    assert.equal(field.props['aria-label'], caption, 'and the control carries it as its accessible name')
+  }
+  // No tab order or focusability was traded away.
+  for (const field of identifiers) {
+    assert.equal(field.props.tabIndex, undefined, 'no tabindex was introduced')
+    assert.equal(field.props.disabled, false, 'the field is focusable while idle')
+  }
+
+  // The secret value field keeps its explicit `for`/`id` association on purpose:
+  // MDN recommends explicit association for maximum assistive-technology
+  // compatibility, and its browser-side credential path is already closed by
+  // `new-password` plus the vendor ignore marks.
+  const valueField = elements(tree).find(
+    (element) => element.type === 'input' && element.props.type === 'password',
+  )
+  assert.equal(valueField?.props.id, 'dsh-secret-attach-value')
+  assert.equal(
+    elements(tree).some(
+      (element) => element.type === 'label' && element.props.htmlFor === 'dsh-secret-attach-value',
+    ),
+    true,
+  )
   reset()
 })
