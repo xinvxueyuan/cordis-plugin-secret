@@ -209,7 +209,7 @@ Harness 的公开面 `InputActions` **故意不含**引用插入（`Command-styl
 
 ### 自己复测（活体，约 3 分钟）
 
-> **先重启。** dsh 在进程启动时加载插件的 `lib/` 构建，所以**发布 0.2.1 之后必须重启 `dsh web`** 才会加载修复后的产物；重启前的活体复测仍会复现 0.2.0 的现象（`staged` 不变 `bound`、shell 里没有变量），那是预期，不是修复失败。同理，**发布 0.3.0 之后也必须重启 `dsh web`** 才会加载四项增强的产物——重启前看不到消息旁的旁挂胶囊、信息框里的「历史记录」区、草稿移除后的自动撤销，`@` 菜单也不会有新分组，这些都属预期（下面是这四项各自的复测方式）。**发布 0.4.0 之后同样必须重启 `dsh web`** 才会加载管理面——重启前 `secret_manage` 工具不会出现在工具列表里，信息框里也没有五条管理路径，历史里不会有 `updated`/`scope-changed`/`unbound`/`deleted` 四类事件；活体上仍是 `0.3.0` 的四个方向，这属预期，不是发布失败。
+> **先重启。** dsh 在进程启动时加载插件的 `lib/` 构建，所以**发布 0.2.1 之后必须重启 `dsh web`** 才会加载修复后的产物；重启前的活体复测仍会复现 0.2.0 的现象（`staged` 不变 `bound`、shell 里没有变量），那是预期，不是修复失败。同理，**发布 0.3.0 之后也必须重启 `dsh web`** 才会加载四项增强的产物——重启前看不到消息旁的旁挂胶囊、信息框里的「历史记录」区、草稿移除后的自动撤销，`@` 菜单也不会有新分组，这些都属预期（下面是这四项各自的复测方式）。**发布 0.4.0 之后同样必须重启 `dsh web`** 才会加载管理面——重启前 `secret_manage` 工具不会出现在工具列表里，信息框里也没有五条管理路径，历史里不会有 `updated`/`scope-changed`/`unbound`/`deleted` 四类事件；活体上仍是 `0.3.0` 的四个方向，这属预期，不是发布失败。**0.4.0 是个例外**：它虽然在 GitHub Release 与 GitHub Packages 上发了，但在真实运行时**整个插件条目不激活**（`dsh: warning: 1 entry did not activate`，见下面「0.4.0 的发布级缺陷与 0.4.1 修复」），所以重启也换不来可用的管理面；**必须重启到 0.4.1**。
 
 1. 在输入区点「附加密钥」按钮 → 胶囊里填名称（如 `openai`）与值，作用域保持默认「仅本次会话」→ 插入 → 输入框出现 `@DSH_SECRET_OPENAI` 胶囊。
 2. **发送前**：在同一浏览器（同源、带签名 cookie）打开 `GET /api/secret.attached?sessionId=$DSH_SESSION_ID` → 该条的 `state` 必须是 `"staged"`，且此刻 shell 里没有这个变量（未发送永不注入）。
@@ -407,13 +407,15 @@ if ($env:DSH_SECRET_OPENAI) { "present length=$($env:DSH_SECRET_OPENAI.Length)" 
 
 **不可恢复性与副作用（逐字告知）**：引用空间的值被原子重写掉（`writeFileAtomic` + 0600），**没有任何副本**，也无法从会话日志反推（日志里只有变量名）；记录空间的标记一并删除，因此**其它会话再也 adopt 不到它**。想再用同一变量，只能重新走 `secret_request` 或重新附加，**重新输入新值**。删除后刷新页面，「管理」面（每次都向 Host 现问）里该行消失，历史里多一条 `deleted`（仅本进程内可见）。若某个会话此前已把它绑到某条消息上，那个会话的内存副本仍在，直到消息回退或会话结束。
 
-### 怎么复测 0.4.0（先重启 `dsh web`）
+### 怎么复测 0.4.1（先重启 `dsh web`）
+
+0. **重启后先看启动日志**（这是 0.4.0 缺陷的判据，也是本版修复的判据）：`dsh` 的启动输出里**不应再有** `warning: 1 entry did not activate`，也不应再出现 `secret (@xinvxueyuan/cordis-plugin-secret): Error: connection: exact Fetch route "/api/secret.manage" is already registered`；工具列表里应当有 `secret_manage`，管理面可用。（0.4.0 在实机上正是这条 warning；`lib/routes.js` 里 `/api/secret.manage` 现在只注册一次、`methods` 是 `['GET','POST']`，可以离线核对。）
 
 1. **自动化（不需要浏览器，约 6 秒，自然退出，无需清场）**：
    ```sh
    npm run typecheck && npm test
    ```
-   共 7 个测试文件 / 122 个用例。管理面在 `test/register.test.ts`：两个工具的参数集（逐字断言没有 `value`）、`list`/`unbind`/`delete`/`scope`/`value` 五个动作、五条人类侧路径、降级两个按钮（文案与线上动作都不同）、真删两档（缺 `confirm` 零副作用）、列表两个方向的 `origin` 与委派子代理的可达性注意（含根代理的正对照）；四类新历史事件在 `test/history.test.ts`。`npm test` 若挂住，按仓库红线处理：**先查泄漏**（本插件自己的 teardown/定时器），临时排障才用 `node --test --test-force-exit`，**不得按进程名清场**。
+   共 7 个测试文件 / 124 个用例。管理面在 `test/register.test.ts`：两个工具的参数集（逐字断言没有 `value`）、`list`/`unbind`/`delete`/`scope`/`value` 五个动作、五条人类侧路径、降级两个按钮（文案与线上动作都不同）、真删两档（缺 `confirm` 零副作用）、列表两个方向的 `origin` 与委派子代理的可达性注意（含根代理的正对照）；**0.4.1 起还有实施真实注册表规则的严格注册表**——它断言 9 条精确路径各注册一次、`/api/secret.manage` 一行两方法，并在修复前的形态上以**同一条** `already registered` 错误失败（这就是 0.4.0 漏网的那个门）。四类新历史事件在 `test/history.test.ts`。`npm test` 若挂住，按仓库红线处理：**先查泄漏**（本插件自己的 teardown/定时器），临时排障才用 `node --test --test-force-exit`，**不得按进程名清场**。
 2. **活体（需真人；管理面每次都向 Host 现问，改完刷新即可再核对）**：按上面「人类侧信息框（五条路径）」逐条点一遍——列举（两个分区读得清）、改值（掩码框）、改作用域（两个降级按钮各点一次，核对其后果不同）、解绑（凭据库不动）、真删（两次点击）。断言点是上面「需真人确认」列出的那些：不可用的动作不出现；改值后活体 shell 里真的是新值；`scope → persistent` 真的写库；真删后该行从库侧分区消失、会话侧作用域如实变「仅本次会话」、历史多一条 `deleted`、其它三条外来记录一字未动；子代理调 `list` 不挂起、调四个写动作得到结构化 `DELEGATED_CALLER`（无对话框）。
 3. **旧版对照**：`git stash` 或 checkout `v0.3.0` 后 `git diff v0.3.0 -- src test` 可看到本轮的全部改动面；`.credentials.yaml` 的基线（大小与 SHA256）应在复测前后逐字节不变。
 
@@ -561,19 +563,41 @@ npm stage approve <stage-id>                       # 需要 2FA
 判断该版本是否已存在于目标 registry，已存在就跳过发布（并在 Step Summary 写明"该版本已存在，跳过发布"），
 因此对已发布版本重推 tag 不会产生必然失败的公开红叉。其它检查错误（网络、鉴权、registry 故障）仍会让 job 失败。
 
-**registry 现状（截至本文）**：npmjs 上已上线 `0.0.0-stage`、`0.1.0`、`0.2.0`、`0.2.1`、`0.3.0`（`dist-tags.latest = 0.3.0`，说明 `0.3.0` 的 stage 已由维护者用 2FA 批准）；`0.4.0` 已由 CI 放入 stage 队列（stage id `dd9ef8e8-866b-498d-a8f5-8ee33e32f62f`，shasum `22dfadfc613695018adfd5ee09eb8b71b1ba9edc`，provenance 已发布到 Sigstore 透明度日志 `logIndex=3133868807`），等维护者用 2FA 批准（`npm stage approve dd9ef8e8-866b-498d-a8f5-8ee33e32f62f`）后才上线——**批准只能由人来做**，发布流程不登录 npm、不处理任何令牌、不代做需要 2FA 的动作。GitHub Packages 上 `0.1.0`/`0.2.0`/`0.2.1`/`0.3.0`/`0.4.0` 都在（那里由 CI 直接发布，不经人工批准；`0.4.0` 的包版本 id `1351737947`，上一个 `0.3.0` 的是 `1346087280`）。
+**registry 现状（截至本文）**：npmjs 上已上线 `0.0.0-stage`、`0.1.0`、`0.2.0`、`0.2.1`、`0.3.0`（`dist-tags.latest = 0.3.0`）。`0.4.0` 与 `0.4.1` 都已由 CI 放入 stage 队列、**都还没被批准**：`0.4.0` 的 stage id `dd9ef8e8-866b-498d-a8f5-8ee33e32f62f`（shasum `22dfadfc613695018adfd5ee09eb8b71b1ba9edc`）**不建议批准**（该制品有启动缺陷，见「0.4.0 的发布级缺陷与 0.4.1 修复」），`0.4.1` 的 stage id `22abf7a3-606b-4ee4-a1f9-5e84b557d6d0`（shasum `9b64a832abad45123ec96b3c2eec398c4b7377dd`，provenance 已发布到 Sigstore 透明度日志 `logIndex=3142251804`）才是要批准的那个：`npm stage approve 22abf7a3-606b-4ee4-a1f9-5e84b557d6d0`。已经躺在队列里的 0.4.0 可以显式丢弃：`npm stage reject dd9ef8e8-866b-498d-a8f5-8ee33e32f62f`（本机 npm CLI 12.2.0 的 `npm stage` 确实有 `reject` 子命令，帮助文本：「Reject a staged package, removing it from the registry」，可用 `--otp <otp>`）——**批准与丢弃都需要登录 + 2FA，只能由人来做**；本发布流程不登录 npm、不读取或处理任何用户令牌、不代做任何需要 2FA 的动作。GitHub Packages 上 `0.1.0`/`0.2.0`/`0.2.1`/`0.3.0`/`0.4.1` 都在（`0.4.1` 的包版本 id `1354170442`，上一个可用版本 `0.3.0` 的是 `1346087280`），另有**不可用**的 `0.4.0`（包版本 id `1351737947`）——GitHub Packages 由 CI 直接发布、不经人工批准，所以撤不回，只能靠 Release notes 的警告与本文说明。
 
 同一份包也会发布到 **GitHub Packages**（`npm.pkg.github.com`，`github-packages` job，用内置 `GITHUB_TOKEN`），
 使包在仓库页面上可见、可被 `@xinvxueyuan:registry=https://npm.pkg.github.com` 的消费者安装。
 
-`publish.yml` 的两个发布 job 在日志里都打印了同一份包的 `shasum`（sha1）`22dfadfc613695018adfd5ee09eb8b71b1ba9edc`
-与 `integrity` `sha512-N2aBH5qpKPZPl…==`；对 Release 的 tgz 逐字节计算，得到的正是这两个值（`sha1` 与 `sha512` 都相同），
-所以 npm stage 队列里与 GitHub Packages 上的那份，就是 Release 的那 260287 B（未做的一步是：从 `npm.pkg.github.com`
-下载回来再逐字节比对——那需要认证，本文没有做，如实标注）。
+`publish.yml` 的两个发布 job 在日志里都打印了同一份包的 `shasum`（sha1）与 `integrity`（sha512）；
+对 Release 的 tgz 逐字节计算，得到的正是同一对值，所以 npm stage 队列里与 GitHub Packages 上的那份，就是 Release 的那份字节
+（未做的一步是：从 `npm.pkg.github.com` 下载回来再逐字节比对——那需要认证，本文没有做，如实标注）：
+
+- `0.4.0`：`shasum 22dfadfc613695018adfd5ee09eb8b71b1ba9edc`、`integrity sha512-N2aBH5qpKPZPl…==` ↔ Release tgz 260287 B、sha256 `4612be9c…`；
+- `0.4.1`：`shasum 9b64a832abad45123ec96b3c2eec398c4b7377dd`、`integrity sha512-yyBWKC1zH6vHZ…==` ↔ Release tgz 262988 B、sha256 `46286a2e…`。
+
+### 0.4.0 的发布级缺陷与 0.4.1 修复（如实）
+
+**缺陷（0.4.0 在真实运行时不可用）**：`/api/secret.manage` 被**注册了两次**（GET 一次、POST 一次），而真实的 connection 注册表按**精确路径**建名、与 `methods` 无关（`@deepseek-ai/dsh-client-connection/lib/index.js:625-639`，抛错在 `:633`）。第二次注册在**装配时**抛
+`connection: exact Fetch route "/api/secret.manage" is already registered`；失败的 fiber 连同它的 effects 一起被回滚，于是**整个插件条目不激活**（`dsh: warning: 1 entry did not activate`）：两个工具都不注册、九条路由都不在，管理面在实机上完全不可用。**根因一句话**：把设计文档里「两条新路由（GET/POST 同路径）」按字面实现成了两次 `register()`。
+
+**为什么三道质量门没抓到**：它们的 harness 用的是自造 connection 假注册表，假表**不实施「精确路径唯一」规则**；`test/register.test.ts` 里那条 `assert.deepEqual(registered, …)` 甚至把「两次注册」当作期望值钉住了。
+
+**修复（0.4.1）**：`src/routes.ts` 合并为**一次注册**（`methods:['GET','POST']`，按 `request.method` 分派；GET/POST 两个分支的行为逐字不变），并新增**实施真实注册表规则的严格注册表**与两条回归用例——它在修复前的形态上以**同一条错误**失败（实测留存），修复后通过；那条钉住重复注册的断言按事实更新为 9 条精确路径（只有 manage 两行合并成一行）。产物层的对照：0.4.0 的 `lib/routes.js` 里 `fetch.register(` 10 次、`path: MANAGE_PATH` 2 次、manage 分别是 `methods:['GET']` 与 `methods:['POST']`；0.4.1 是 9 次、1 次、`methods:['GET','POST']` 一行。
+
+**已发布但不可用的制品范围（如实）**：
+
+- **GitHub Release 上 `v0.4.0` 存在**：tag 对象 `05942e0bba94b717b61cb0896ddf74eb2025dc9f` → commit `26bd420`，三附件（tgz 260287 B sha256 `4612be9c…`、`SHA256SUMS`、`SHA256SUMS.asc`）**保持原样未动**；Release notes 顶部已加警告并指向 0.4.1（未改 tag、未改附件）。
+- **GitHub Packages 上 `0.4.0` 存在**（包版本 id `1351737947`），且**撤不回**——那里由 CI 直接发布、不经人工批准。
+- **npmjs 上 0.4.0 从未上线**：它只进过 stage 队列（`dd9ef8e8-…`）且未经 2FA 批准；建议显式 `npm stage reject`（见上一节），或至少不要批准它。
+- 因此任何消费者都应使用 **0.4.1**；已经在跑 0.4.0 的环境（插件条目不激活、管理面不可用）**重启 `dsh web` 到 0.4.1** 即恢复。
 
 ### GitHub Release 与签名
 
-> **已发生的事实**：`v0.4.0` 的 Release 是 https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.4.0
+> **已发生的事实**：`v0.4.1` 的 Release 是 https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.4.1
+> （2026-10-08 发布，`draft: false`；`release.yml` 运行 `37735146290` 成功，`publish.yml` 运行 `37735146256` 成功），附件三件：`xinvxueyuan-cordis-plugin-secret-0.4.1.tgz`（262988 B，sha256 `46286a2eefebb0809696377ebfecf7569c8aa723287cbe7a8e2c7bee979a76f8`，与 `SHA256SUMS` 里记的一致，也与本机 `core.autocrlf=false` 干净克隆里 `npm pack` 的产物逐字节一致）、`SHA256SUMS`（109 B，sha256 `ddd3b78232803958fefd699bf7488d208db97462a8985eef891a766598f643dd`）、`SHA256SUMS.asc`（887 B，sha256 `3ded718895f81d5b03b8b6a1037f2b1138d87d10dd9f58523b88a67bc3934ec1`；RSA 4096 `6C6FD9B2…72B7B35A` 对 **CI 那份 `SHA256SUMS`** 的分离签名，本机 `gpg --verify` 通过）；
+> tgz 与 SHA256SUMS 都由 `gh attestation verify` 可验（一份 attestation，subject 同时列出两者），且**证明绑定在 tag 上**（builder id / 签名证书 SAN = `.../release.yml@refs/tags/v0.4.1`，`externalParameters.workflow.ref` = `refs/tags/v0.4.1`，`resolvedDependencies` = `git+https://github.com/xinvxueyuan/cordis-plugin-secret@refs/tags/v0.4.1` @ commit `744f5a675d3641cbf6a7dd0121e88b5fa333f4bf`）——即 tag→commit 是证明的一部分，而不是只绑定到 `refs/heads/main`（`--format json` 全文对 `refs/heads/` **零命中**）。tag 对象为 annotated + GPG 签名
+> （`git cat-file -t v0.4.1` → `tag`，tag 对象 sha `43da6f8a85797be40356691db38079de50fa0844`；GitHub API 的 `verification.verified` → `true`，`reason` → `valid`，`verified_at` → `2026-10-08T06:00:40Z`）。
+> 上一个版本 `v0.4.0` 的 Release 是 https://github.com/xinvxueyuan/cordis-plugin-secret/releases/tag/v0.4.0 **（该版本在真实运行时不可用，Release notes 顶部已加警告，见上一节；tag 与附件未动）**
 > （2026-10-07 发布，`draft: false`；`release.yml` 运行 `37661019203` 成功，`publish.yml` 运行 `37661018704` 成功），附件三件：`xinvxueyuan-cordis-plugin-secret-0.4.0.tgz`（260287 B，sha256 `4612be9c9c8ed9475d236693c32d3d473bad2803aeea2ff55f027da9f677c7e8`，与 `SHA256SUMS` 里记的一致）、`SHA256SUMS`（109 B，sha256 `f54b947346dd196ed6aa48dead4721c828b81d611b073f82548132d311d3e3be`）、`SHA256SUMS.asc`（887 B，sha256 `239251f88159500f6af917c41138b4a83e6aa42c307e98e6e8cbdc86dba4bb13`；RSA 4096 `6C6FD9B2…72B7B35A` 对 **CI 那份 `SHA256SUMS`** 的分离签名，本机 `gpg --verify` 通过）；
 > tgz 与 SHA256SUMS 都由 `gh attestation verify` 可验（一份 attestation，subject 同时列出两者），且**证明绑定在 tag 上**（builder id / 签名证书 SAN = `.../release.yml@refs/tags/v0.4.0`，`externalParameters.workflow.ref` = `refs/tags/v0.4.0`，`resolvedDependencies` = `git+https://github.com/xinvxueyuan/cordis-plugin-secret@refs/tags/v0.4.0` @ commit `26bd420e40bd242d6096478fce50ff0fbdb84655`）——即 tag→commit 是证明的一部分，而不是只绑定到 `refs/heads/main`（`--format json` 全文对 `refs/heads/` **零命中**）。tag 对象为 annotated + GPG 签名
 > （`git cat-file -t v0.4.0` → `tag`，tag 对象 sha `05942e0bba94b717b61cb0896ddf74eb2025dc9f`；GitHub API 的 `verification.verified` → `true`，`reason` → `valid`，`verified_at` → `2026-10-07T17:42:58Z`）。
@@ -594,25 +618,25 @@ npm stage approve <stage-id>                       # 需要 2FA
 | 构建来源证明 | `release.yml` 调用 `actions/attest-build-provenance`（pin 到 commit SHA），为 **tgz 与 SHA256SUMS 两者**生成 Sigstore 签名的 SLSA 构建来源证明，可用 `gh attestation verify` 校验。 |
 | npm 侧 | `release.yml` **完全不执行任何 npm publish**；npm 发布只由上面的 `publish.yml` staged publishing 负责。 |
 
-维护者操作顺序（`v0.2.0`、`v0.2.1`、`v0.3.0` 与 `v0.4.0` 都已按此执行）：
+维护者操作顺序（`v0.2.0`、`v0.2.1`、`v0.3.0`、`v0.4.0` 与 `v0.4.1` 都已按此执行）：
 
 ```sh
 # 1) 本机确认工作区干净、package.json 的 version 已就位（版本号由发布者手工提升）
 git status --porcelain
 
 # 2) 创建 annotated + GPG 签名 tag（私钥仅在本机使用；本机需能完成 GPG 签名）
-git tag -s v0.4.0 -m "v0.4.0"
+git tag -s v0.4.1 -m "v0.4.1"
 
 # 3) 只推 tag —— release.yml 会构建产物、生成来源证明并创建 Release（不要用 workflow_dispatch：那样证明会绑到 refs/heads/main）
-git push origin v0.4.0
+git push origin v0.4.1
 
 # 4) 取 Release 上 CI 生成的那份 SHA256SUMS，做分离签名并附回 Release（私钥不进 CI）
-gh release download v0.4.0 --pattern SHA256SUMS --clobber
+gh release download v0.4.1 --pattern SHA256SUMS --clobber
 gpg --armor --detach-sign SHA256SUMS          # 生成 SHA256SUMS.asc
-gh release upload v0.4.0 SHA256SUMS.asc --clobber
+gh release upload v0.4.1 SHA256SUMS.asc --clobber
 ```
 
-> **为什么第 4 步要下 CI 的 `SHA256SUMS` 而不是签本机 `npm pack` 那份**：本机是 Windows 且 `core.autocrlf=true`，工作树里 `LICENSE-MIT`/`LICENSE-APACHE` 被 checkout 成 CRLF，本机打出的 tgz 是 260311 B / sha256 `0a6fd66c…`，而 CI（Linux checkout，LF）打出的是 260287 B / sha256 `4612be9c…`——两者只差这两个 LICENSE 文件的行尾。在一个 `core.autocrlf=false` 的干净克隆里本机 `npm pack` 复现出的正是 CI 的 `4612be9c…`（`docs/` 之类不进包，`lib/**` 与 `src/**` 逐字节相同）。签错那份会让 `gpg --verify SHA256SUMS.asc SHA256SUMS` 在下载来的附件上对不上。
+> **为什么第 4 步要下 CI 的 `SHA256SUMS` 而不是签本机 `npm pack` 那份**：本机是 Windows 且 `core.autocrlf=true`，工作树里 `LICENSE-MIT`/`LICENSE-APACHE` 被 checkout 成 CRLF，本机打出的 tgz 与 CI（Linux checkout，LF）打出的只差这两个文件的行尾——`0.4.0`：本机 260311 B / `0a6fd66c…` 对 CI 260287 B / `4612be9c…`；`0.4.1`：本机 263015 B / `4b3c3a7d…` 对 CI 262988 B / `46286a2e…`。在 `core.autocrlf=false` 的干净克隆里本机 `npm pack` 复现出的正是 CI 的那份（`docs/` 之类不进包，`lib/**` 与 `src/**` 逐字节相同）。签错那份会让 `gpg --verify SHA256SUMS.asc SHA256SUMS` 在下载来的附件上对不上。
 
 校验方式：
 
@@ -624,9 +648,9 @@ sha256sum -c SHA256SUMS
 gpg --verify SHA256SUMS.asc SHA256SUMS
 
 # 校验构建来源证明（需要 gh CLI）
-gh attestation verify xinvxueyuan-cordis-plugin-secret-0.4.0.tgz --repo xinvxueyuan/cordis-plugin-secret
+gh attestation verify xinvxueyuan-cordis-plugin-secret-0.4.1.tgz --repo xinvxueyuan/cordis-plugin-secret
 gh attestation verify SHA256SUMS --repo xinvxueyuan/cordis-plugin-secret
-gh attestation verify xinvxueyuan-cordis-plugin-secret-0.4.0.tgz --repo xinvxueyuan/cordis-plugin-secret --format json   # 查 externalParameters.workflow.ref 是否为 refs/tags/v0.4.0
+gh attestation verify xinvxueyuan-cordis-plugin-secret-0.4.1.tgz --repo xinvxueyuan/cordis-plugin-secret --format json   # 查 externalParameters.workflow.ref 是否为 refs/tags/v0.4.1
 ```
 
 补充说明：
