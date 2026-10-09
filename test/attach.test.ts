@@ -176,7 +176,12 @@ test('parseAttach rebuilds the request field by field and refuses malformed inpu
 
 test('parseRelease and the attached-list query accept only shaped input', () => {
   const ok = parseRelease({ sessionId: SESSION_ID, variable: ENV_VAR })
-  assert.deepEqual(ok, { ok: true, value: { sessionId: SESSION_ID, envVar: ENV_VAR } })
+  // Round 4: a release may name why it happened, and a caller that names nothing
+  // means "the human discarded it" — the only reading every caller had before.
+  // Original assertion: { ok: true, value: { sessionId, envVar } }.
+  assert.deepEqual(ok, { ok: true, value: { sessionId: SESSION_ID, envVar: ENV_VAR, reason: 'discarded' } })
+  assert.equal(parseRelease({ sessionId: SESSION_ID, variable: ENV_VAR, reason: 'withdrawn' }).ok, true)
+  assert.equal(parseRelease({ sessionId: SESSION_ID, variable: ENV_VAR, reason: 'nonsense' }).ok, false)
   assert.equal(parseRelease({ sessionId: SESSION_ID, variable: 'OPENAI' }).ok, false)
   assert.equal(parseRelease({ variable: ENV_VAR }).ok, false)
   assert.equal(parseRelease(null).ok, false)
@@ -303,11 +308,15 @@ test('the injected note names the variables and how to read them, and carries no
   const note = renderAttachNote([
     { variable: ENV_VAR, name: 'openai', scope: 'session' },
   ])
+  // The note is where the model-facing rewrite lives: the durable message keeps
+  // the marker the conversation view projects to a capsule, and this line states
+  // the correspondence per variable, literally.
   assert.equal(
     note,
     [
       '本条消息附带 1 个由人类主动提供的密钥；明文不进入对话，只能按变量名取用。',
       `- ${ENV_VAR} · 仅本次会话有效`,
+      `正文里的 @${ENV_VAR} 即该变量，模型侧写作 [secret ${ENV_VAR}]；它不是文件路径。`,
       '',
       `取用方式：PowerShell 用 $env:${ENV_VAR}，POSIX shell 用 "$${ENV_VAR}"。`,
       '不要把该标记当作文件路径读取。',
@@ -321,6 +330,9 @@ test('the injected note names the variables and how to read them, and carries no
   ])
   assert.equal(two.includes('附带 2 个'), true)
   assert.equal(two.includes('持久保存到凭据库'), true)
+  // Every variable gets its own mapping line, so the correspondence is total.
+  assert.equal(two.includes(`正文里的 @${ENV_VAR} 即该变量，模型侧写作 [secret ${ENV_VAR}]`), true)
+  assert.equal(two.includes('正文里的 @DSH_SECRET_OTHER 即该变量，模型侧写作 [secret DSH_SECRET_OTHER]'), true)
   assert.equal(renderAttachNote([]), '')
 
   const source = attachSource([{ variable: ENV_VAR, name: 'openai', scope: 'session' }])
@@ -390,14 +402,21 @@ test('binding rides session/event and the note rides agent/pre-step', async () =
   ]
 
   // Delivery works before the message is durable, and it must not expose
-  // anything on its own: the text is rewritten and the note describes the
-  // attachment, but no variable exists yet.
+  // anything on its own: the batch is admitted verbatim (the marker the
+  // conversation view projects to a capsule stays in the durable message) and
+  // the note states the model-side correspondence, but no variable exists yet.
   const beforeBinding = await harness.preStep(messages)
   assert.equal(harness.grants.valueFor(harness.session, ENV_VAR), undefined, 'no exposure before the message is durable')
   assert.deepEqual(harness.ensured, [])
   assert.equal(beforeBinding.messages.length, 3, 'the note describes a staged attachment')
-  assert.equal(beforeBinding.messages[0]?.content?.[0]?.text, '请用 [secret DSH_SECRET_OPENAI] 跑测试')
+  assert.equal(beforeBinding.messages[0], messages[0], 'the admitted message reaches the log unchanged')
+  assert.equal(beforeBinding.messages[0]?.content?.[0]?.text, '请用 @DSH_SECRET_OPENAI 跑测试')
   assert.equal(beforeBinding.messages[2]?.content?.[0]?.text?.includes('- DSH_SECRET_OPENAI · 仅本次会话有效'), true)
+  assert.equal(
+    beforeBinding.messages[2]?.content?.[0]?.text?.includes('模型侧写作 [secret DSH_SECRET_OPENAI]'),
+    true,
+    'the model-side rewrite rides the note, verbatim',
+  )
 
   // A non-user event, and a user event without a marker, bind nothing.
   harness.emit('session/event', harness.session, { type: 'tool/result', seq: 3, data: {} })
@@ -414,15 +433,18 @@ test('binding rides session/event and the note rides agent/pre-step', async () =
   harness.emit('session/event', harness.session, durable)
   assert.deepEqual(harness.boundNotes, [{ variable: ENV_VAR, label: 'OpenAI API Key' }], 'no duplicate registration')
 
-  // Now the request carries the rewritten marker plus one value-free note.
+  // Now the request carries the marker the human sent plus one value-free note
+  // that writes out what that marker means on the model side.
   const after = await harness.preStep(messages)
   assert.equal(after.messages.length, 3)
-  assert.equal(after.messages[0]?.content?.[0]?.text, '请用 [secret DSH_SECRET_OPENAI] 跑测试')
+  assert.equal(after.messages[0]?.content?.[0]?.text, '请用 @DSH_SECRET_OPENAI 跑测试')
+  assert.equal(after.messages[0], messages[0], 'the durable message is never replaced')
   // A message from another producer is left exactly as it was.
   assert.equal(after.messages[1]?.content?.[0]?.text, `引用 ${markerFor(ENV_VAR)}`)
   const note = after.messages[2]
   assert.equal(note?.source?.kind, 'secret-attach')
   assert.equal(note?.content?.[0]?.text?.includes(`- ${ENV_VAR} · 仅本次会话有效`), true)
+  assert.equal(note?.content?.[0]?.text?.includes(`正文里的 @${ENV_VAR} 即该变量，模型侧写作 [secret ${ENV_VAR}]；它不是文件路径。`), true)
   assert.equal(note?.content?.[0]?.text?.includes('不要把该标记当作文件路径读取。'), true)
 
   // The whole request is value-free, and stable across a second step.
@@ -470,7 +492,16 @@ function makeService(options: { ttlMs?: number; capacity?: number; session?: Fak
   const failures = { set: false }
   const session = 'session' in options ? options.session : sessionWithMarker()
   const service = new SecretService({
-    config: { requestTimeoutMs: 60000, maxPendingRequests: 4, attachTtlMs: options.ttlMs ?? 1800000, maxAttachmentsPerSession: options.capacity ?? 8 },
+    config: {
+      requestTimeoutMs: 60000,
+      maxPendingRequests: 4,
+      attachTtlMs: options.ttlMs ?? 1800000,
+      maxAttachmentsPerSession: options.capacity ?? 8,
+      // Round 4 added these two required keys to `SecretConfig`. Supplied here
+      // with the schema's own defaults; no assertion in this file changed.
+      maxHistoryPerSession: 32,
+      maxAvailableEntries: 32,
+    },
     credentials: {
       async describe() {
         return { configured: false, writable: true }

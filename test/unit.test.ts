@@ -131,6 +131,10 @@ function harness(
       maxPendingRequests: options.maxPendingRequests ?? 4,
       attachTtlMs: 1800000,
       maxAttachmentsPerSession: 8,
+      // Round 4 added these two required keys to `SecretConfig`. Supplied here
+      // with the schema's own defaults; no assertion in this file changed.
+      maxHistoryPerSession: 32,
+      maxAvailableEntries: 32,
     },
     credentials,
     authorization,

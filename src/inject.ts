@@ -13,7 +13,6 @@ import {
   type SessionEventLike,
 } from './attach.ts'
 import type { GrantSessionLike } from './grants.ts'
-import { rewriteMarkers } from './naming.ts'
 
 /**
  * The value-free note this plugin injects is a first-class message source, so a
@@ -58,57 +57,101 @@ function userMessage(input: {
   ) as unknown as UserMessage
 }
 
-/** Everything the binding hooks read from their host. */
+/** One session, as the note-dedupe pass reads it. */
+export interface AttachNoteReader {
+  /** Model-visible surface event sequences, in order. */
+  readonly surface: { readonly nodes: readonly number[] }
+  /** One logged event by sequence, or undefined. */
+  eventAt(seq: number): { readonly type?: unknown; readonly data?: unknown } | undefined
+}
+
+/** Everything the two hooks read from their host. */
 export interface AttachBindingDeps extends AttachBinderDeps {
   sessionOf(agent: unknown): GrantSessionLike | undefined
+  /**
+   * The attach notes already on this session's model-visible surface.
+   *
+   * Optional: without it the note is simply never deduplicated, which is safe
+   * (a duplicate note is value-free) but noisy.
+   */
+  visibleNotes?(session: GrantSessionLike): readonly SecretAttachSource[]
 }
 
-/** One message, as the pre-step waterfall sees it. */
-interface MessageLike {
-  readonly role?: unknown
-  readonly source?: { readonly kind?: unknown }
-  readonly content?: readonly unknown[]
+/** Every attach note already present on one session's model-visible surface. */
+export function noteSourcesOn(session: AttachNoteReader): readonly SecretAttachSource[] {
+  const found: SecretAttachSource[] = []
+  for (const seq of session.surface.nodes) {
+    const event = session.eventAt(seq)
+    if (event === undefined || event.type !== 'user/message') continue
+    const source = (event.data as { readonly source?: unknown } | undefined)?.source
+    if (typeof source !== 'object' || source === null) continue
+    if ((source as { readonly kind?: unknown }).kind !== 'secret-attach') continue
+    found.push(source as SecretAttachSource)
+  }
+  return found
 }
 
-/**
- * Rewrite one message's text blocks into their model-facing form.
- *
- * Returns the original object when nothing changed, so an untouched message
- * keeps its identity and no consumer sees a spurious new value.
- */
-function rewriteMessage<Message extends MessageLike>(message: Message): Message {
-  const content = message.content
-  if (!Array.isArray(content)) return message
-  let changed = false
-  const next = content.map((block) => {
-    if (typeof block !== 'object' || block === null) return block
-    const candidate = block as { type?: unknown; text?: unknown }
-    if (candidate.type !== 'text' || typeof candidate.text !== 'string') return block
-    const text = rewriteMarkers(candidate.text)
-    if (text === candidate.text) return block
-    changed = true
-    return { ...candidate, text }
-  })
-  if (!changed) return message
-  return Object.freeze({ ...message, content: next })
+/** Whether one attach note is already visible, compared by its value-free source. */
+function noteVisible(
+  deps: AttachBindingDeps,
+  session: GrantSessionLike,
+  source: SecretAttachSource,
+): boolean {
+  const visible = deps.visibleNotes?.(session)
+  if (visible === undefined) return false
+  const key = JSON.stringify(source)
+  for (const candidate of visible) {
+    if (candidate.kind !== 'secret-attach') continue
+    if (JSON.stringify(candidate) === key) return true
+  }
+  return false
+}
+
+/** Whether one recorded payload is this plugin's own injected note. */
+function isAttachNote(data: unknown): boolean {
+  if (typeof data !== 'object' || data === null) return false
+  const source = (data as { readonly source?: unknown }).source
+  return typeof source === 'object' && source !== null && (source as { readonly kind?: unknown }).kind === 'secret-attach'
 }
 
 /**
  * Install the two hooks that turn "the human attached a secret" into "this
  * session holds it, and this request says so".
  *
- * They are deliberately split, and deliberately independent of each other's
- * order:
- *
  * 1. **Binding** rides `session/event`. The sequence number of the message is
  *    only knowable once the message is durable, and the session service never
  *    publishes seed events, so replaying or resuming a log can never re-bind an
  *    historical marker. The grant is anchored to that exact sequence, which is
  *    what makes an edit-and-retry revoke it without any bookkeeping here.
- * 2. **Delivery** rides the `agent/pre-step` waterfall. The rewrite and the note
- *    are a pure function of the text plus the current attachment state, so the
- *    request the model sees is reproducible for the same log, and nothing about
- *    it is written back to the durable log.
+ * 2. **Delivery** rides the `agent/pre-step` waterfall: it appends one
+ *    value-free note per admitted batch that carries markers.
+ *
+ * ## Why the user's own message is NOT rewritten here
+ *
+ * The admission path makes "rewrite the model-facing text without touching the
+ * durable log" impossible, so this plugin does not pretend otherwise:
+ *
+ * - `agent/pre-step` output *is* the durable record. The loop appends every
+ *   returned message verbatim as `user/message` with `surfaceOp: 'append'`
+ *   (`dsh-agent-loop/lib/index.js:1061`), and the model request for the same
+ *   step is derived from that same surface (`:1262`). A rewrite here therefore
+ *   lands in the log, and the log is what the conversation view renders.
+ * - The model input is by contract a pure function of the log: a loop-built
+ *   request is deep-frozen and `llm/stream` listeners "read it, never rewrite
+ *   it" (`dsh-llm/lib/types/index.d.ts:37-45`).
+ * - The one mechanism that *can* keep a model-only copy (a surface replacement
+ *   or a message-projection event) has to be appended *after* its target, and
+ *   there is no hook between the loop's append and its request build; appending
+ *   the target ourselves first would move the human's message in front of the
+ *   step's own `system/message` commit. Self-appended events would also have to
+ *   carry a type the persisted-log reader accepts (`dsh-session-persistence/
+ *   lib/index.js:184`), which an out-of-tree plugin cannot.
+ *
+ * So the marker stays in the log in the exact form the human's client sent and
+ * the conversation view parses (`@DSH_SECRET_*` — the shipped `projectUserText`
+ * projects it to a variable-name capsule), and the model-facing rewrite is
+ * delivered by the note, which states per variable that the marker *is* that
+ * variable and writes its model-side notation `[secret DSH_SECRET_*]`.
  *
  * @param ctx - the plugin's Host context.
  * @param deps - the staged store, the grant store, and the session lookup.
@@ -118,6 +161,9 @@ export function installAttachBinding(ctx: Context, deps: AttachBindingDeps): voi
   ctx.on('session/event', (session, event) => {
     const record = event as SessionEventLike
     if (record.type !== 'user/message') return
+    // Our own note *names* the marker in its prose, so it must never be read as
+    // a carrier: only a message the human's client submitted can bind.
+    if (isAttachNote(record.data)) return
     const seq = seqOf(record)
     if (seq === undefined) return
     for (const envVar of messageMarkers(record.data)) {
@@ -125,39 +171,34 @@ export function installAttachBinding(ctx: Context, deps: AttachBindingDeps): voi
     }
   })
 
-  // 2. Deliver: rewrite each marker and say what it is.
+  // 2. Deliver: say what the markers in this batch are.
   ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next()
     if (decision.kind !== 'enter') return decision
     const session = deps.sessionOf(payload.agent)
-    const messages: typeof decision.messages = []
+    if (session === undefined) return decision
     const notes: BoundVariable[] = []
-    let changed = false
     for (const message of decision.messages) {
-      const markers = message.source.kind === 'user' ? messageMarkers(message) : []
-      if (markers.length === 0) {
-        messages.push(message)
-        continue
-      }
-      changed = true
-      if (session !== undefined) {
-        for (const envVar of markers) {
-          const known = describeVariable(deps, session, envVar)
-          if (known !== undefined && !notes.some((note) => note.variable === known.variable)) {
-            notes.push(known)
-          }
+      if (message.source.kind !== 'user') continue
+      for (const envVar of messageMarkers(message)) {
+        const known = describeVariable(deps, session, envVar)
+        if (known !== undefined && !notes.some((note) => note.variable === known.variable)) {
+          notes.push(known)
         }
       }
-      messages.push(rewriteMessage(message as unknown as MessageLike) as unknown as (typeof decision.messages)[number])
     }
-    if (!changed) return decision
-    if (notes.length === 0) return { ...decision, messages }
+    if (notes.length === 0) return decision
+    const source = attachSource(notes)
+    // The note is durable (see above), so a step that re-admits the same
+    // markers must not stack another copy: an identical note already on the
+    // model-visible surface is the same statement said twice.
+    if (noteVisible(deps, session, source)) return decision
     return {
       ...decision,
       messages: [
-        ...messages,
+        ...decision.messages,
         userMessage({
-          source: attachSource(notes),
+          source,
           text: renderAttachNote(notes),
         }),
       ],

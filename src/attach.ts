@@ -1,5 +1,5 @@
 import type { GrantStore, GrantSessionLike } from './grants.ts'
-import { parseMarkers } from './naming.ts'
+import { markerFor, modelFormFor, parseMarkers } from './naming.ts'
 import type { SecretScope } from './types.ts'
 
 /**
@@ -29,6 +29,28 @@ export interface StagedAttach {
 /** Timer seam so tests never depend on the wall clock (mirrors `Scheduler`). */
 export type AttachScheduler = (delayMs: number, callback: () => void) => () => void
 
+/**
+ * The store's own copy of one staged entry.
+ *
+ * `scope` and `value` are the two fields a human may change in place (the info
+ * box's re-scope and re-value actions), and they are the only two the store
+ * treats as mutable. Both are edited *in place* on purpose: the TTL timer drops
+ * an entry by comparing the object it was armed for against what the map holds
+ * (`put` above), so replacing the object would disarm the bound that keeps a
+ * value out of a long-lived process.
+ */
+interface MutableStagedAttach extends StagedAttach {
+  scope: SecretScope
+  value: string
+}
+
+/** Why one staged attach left the store. */
+export type AttachDropReason =
+  /** The TTL elapsed before the entry was sent. */
+  | 'expired'
+  /** A caller removed it explicitly (the capsule's discard, or the draft watcher's withdrawal). */
+  | 'removed'
+
 /** Everything the staged store needs from its host. */
 export interface AttachStoreDeps {
   /** How long a staged attach waits before it is dropped. */
@@ -36,6 +58,13 @@ export interface AttachStoreDeps {
   /** How many staged attaches one session may hold. */
   readonly capacity: number
   readonly schedule: AttachScheduler
+  /**
+   * Reported once per entry that leaves the store by TTL or by an explicit
+   * removal. Session teardown and plugin unload do not report (their history is
+   * dropped with them), and a replacement never reports: the new entry under the
+   * same key keeps the slot alive.
+   */
+  readonly onDrop?: (sessionId: string, envVar: string, reason: AttachDropReason) => void
 }
 
 /** The result of staging one attach. */
@@ -53,7 +82,7 @@ export interface StagedWrite {
  * message can never be injected into a shell.
  */
 export class AttachStore {
-  private readonly items = new Map<string, StagedAttach>()
+  private readonly items = new Map<string, MutableStagedAttach>()
   private readonly timers = new Map<string, () => void>()
   private readonly deps: AttachStoreDeps
 
@@ -83,7 +112,7 @@ export class AttachStore {
     const key = pairKey(input.sessionId, input.envVar)
     const replaced = this.items.has(key)
     if (!replaced && this.countFor(input.sessionId) >= this.deps.capacity) return undefined
-    const stored: StagedAttach = { ...input }
+    const stored: MutableStagedAttach = { ...input }
     this.clearTimer(key)
     this.items.set(key, stored)
     this.timers.set(
@@ -91,7 +120,7 @@ export class AttachStore {
       this.deps.schedule(this.deps.ttlMs, () => {
         // A replacement installed a new entry under the same key: only the
         // entry this timer was armed for may be dropped.
-        if (this.items.get(key) === stored) this.drop(key)
+        if (this.items.get(key) === stored) this.drop(key, 'expired')
       }),
     )
     return { attach: stored, replaced }
@@ -100,6 +129,36 @@ export class AttachStore {
   /** One staged attach, or undefined. */
   get(sessionId: string, envVar: string): StagedAttach | undefined {
     return this.items.get(pairKey(sessionId, envVar))
+  }
+
+  /**
+   * Change one staged entry's scope in place.
+   *
+   * In place, and never through `put`: `put` re-arms the TTL, and a management
+   * action must not extend how long a value sits in memory. The entry's
+   * identity is also what the TTL timer compares against, so replacing the
+   * object would silently disarm that bound.
+   *
+   * @returns true when a staged entry was there and its scope really changed.
+   */
+  reScope(sessionId: string, envVar: string, scope: SecretScope): boolean {
+    const stored = this.items.get(pairKey(sessionId, envVar))
+    if (stored === undefined || stored.scope === scope) return false
+    stored.scope = scope
+    return true
+  }
+
+  /**
+   * Replace the value one staged entry holds, in place and for the same
+   * reasons {@link reScope} gives. The old value has no other copy in the store.
+   *
+   * @returns true when a staged entry was there to change.
+   */
+  reValue(sessionId: string, envVar: string, value: string): boolean {
+    const stored = this.items.get(pairKey(sessionId, envVar))
+    if (stored === undefined) return false
+    stored.value = value
+    return true
   }
 
   /** Every staged attach of one session, oldest first. */
@@ -113,7 +172,7 @@ export class AttachStore {
   remove(sessionId: string, envVar: string): boolean {
     const key = pairKey(sessionId, envVar)
     if (!this.items.has(key)) return false
-    this.drop(key)
+    this.drop(key, 'removed')
     return true
   }
 
@@ -122,7 +181,10 @@ export class AttachStore {
     let dropped = 0
     for (const [key, item] of [...this.items]) {
       if (item.sessionId !== sessionId) continue
-      this.drop(key)
+      // Session teardown drops the history with the entries, so it reports
+      // nothing: an `expired`/`removed` entry for a session that no longer
+      // exists would be a fact nobody could ever read.
+      this.dropQuiet(key)
       dropped += 1
     }
     return dropped
@@ -134,7 +196,15 @@ export class AttachStore {
     this.items.clear()
   }
 
-  private drop(key: string): void {
+  private drop(key: string, reason: AttachDropReason): void {
+    const item = this.items.get(key)
+    this.clearTimer(key)
+    this.items.delete(key)
+    if (item === undefined) return
+    this.deps.onDrop?.(item.sessionId, item.envVar, reason)
+  }
+
+  private dropQuiet(key: string): void {
     this.clearTimer(key)
     this.items.delete(key)
   }
@@ -184,6 +254,16 @@ export function scopeLabel(scope: SecretScope): string {
  * an edit-and-retry that rewrites the message away revokes the exposure without
  * any bookkeeping here.
  *
+ * Order matters. The `shellEnv` contributor is declared **before** the grant is
+ * recorded and the staged entry is consumed, so a registry failure leaves the
+ * session exactly as it was (no grant, nothing consumed, the staged entry still
+ * armed for a later attempt). The reverse order would leave a grant with no
+ * contributor and an unconsumed staged entry — an exposure that silently never
+ * injects. In the other direction a recorded grant whose contributor
+ * registration failed for an unrelated reason is harmless: the resolver asks
+ * `valueFor`, so a missing contributor injects nothing (fail-closed) while the
+ * staged entry stays consumed.
+ *
  * @returns the bound variable, or undefined when nothing was staged for it.
  */
 export function bindStaged(
@@ -195,6 +275,7 @@ export function bindStaged(
   const sessionId = String(session.id)
   const staged = deps.store.get(sessionId, envVar)
   if (staged === undefined) return undefined
+  deps.envs.ensure(staged.envVar)
   deps.grants.put({
     sessionId,
     name: staged.name,
@@ -206,7 +287,6 @@ export function bindStaged(
     replaceGenerationAtApproval: session.surface.replaceGeneration,
     authorizedAt: deps.now(),
   })
-  deps.envs.ensure(staged.envVar)
   // Consuming the staged entry is what makes binding idempotent: whichever hook
   // gets there first wins, and the other finds nothing to do.
   deps.store.remove(sessionId, staged.envVar)
@@ -296,17 +376,28 @@ export function seqOf(event: SessionEventLike): number | undefined {
 /**
  * The value-free note injected beside a message that carried attachments.
  *
- * It names the variables and how to read them, and it says out loud what the
- * system prompt would otherwise get wrong: the marker is not a file path.
+ * It names the variables and how to read them, and it says out loud the two
+ * things the surrounding prompt would otherwise get wrong: what the marker in
+ * the message body *is*, and that it is not a file path.
+ *
+ * The mapping line is the model-facing rewrite. The harness derives every model
+ * request from the durable log, so the message body keeps the marker form the
+ * human's client sent (which is also the form the conversation view projects to
+ * a variable-name capsule); the rewrite therefore rides this note, which states
+ * the correspondence per variable, literally.
  */
 export function renderAttachNote(notes: readonly BoundVariable[]): string {
   if (notes.length === 0) return ''
   const heading = `本条消息附带 ${String(notes.length)} 个由人类主动提供的密钥；明文不进入对话，只能按变量名取用。`
   const bullets = notes.map((note) => `- ${note.variable} · ${scopeLabel(note.scope)}`)
+  const mappings = notes.map(
+    (note) => `正文里的 ${markerFor(note.variable)} 即该变量，模型侧写作 ${modelFormFor(note.variable)}；它不是文件路径。`,
+  )
   const reads = notes.map((note) => `PowerShell 用 $env:${note.variable}，POSIX shell 用 "$${note.variable}"`).join('；')
   return [
     heading,
     ...bullets,
+    ...mappings,
     '',
     `取用方式：${reads}。`,
     '不要把该标记当作文件路径读取。',

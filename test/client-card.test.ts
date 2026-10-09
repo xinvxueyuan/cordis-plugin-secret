@@ -291,18 +291,51 @@ test('a settled failure keeps its structured identity, and an unreadable call st
 })
 
 test('exactly one card node and one tool-row placeholder are registered', () => {
-  assert.equal(definitions.length, 1, 'the client half must register exactly one conversation definition')
+  // Updated in round 4: the client half registered TWO conversation
+  // definitions — the request card and the side-car attach row (requirement 1 /
+  // O2). Round 5 adds a third, the management card (`sr-manage`), and a second
+  // tool-row placeholder for its tool. The assertion is not relaxed: every
+  // definition is named, in registration order, and the request card's shape is
+  // still pinned exactly.
+  // Disclosed change: `definitions.length` 2 to 3, the two new named rows below,
+  // and the keyed-node list. No prior expectation was removed or altered.
+  assert.equal(definitions.length, 3, 'the client half must register the card, the side-car row and the management card')
   assert.equal((definitions[0] as { kind: string }).kind, 'secret-request')
   assert.equal((definitions[0] as { target: string }).target, 'chat')
+  assert.equal((definitions[1] as { kind: string }).kind, 'sr-chip')
+  assert.equal((definitions[1] as { target: string }).target, 'chat')
+  assert.equal((definitions[2] as { kind: string }).kind, 'sr-manage')
+  assert.equal((definitions[2] as { target: string }).target, 'chat')
 
   const byName = (name: string) => registrations.filter((entry) => entry.name === name)
-  assert.equal(byName('conversation.chat.node').length, 1)
-  assert.equal(byName('conversation.chat.node')[0]?.key, 'secret-request')
-  assert.equal(byName('tool.call.toolview').length, 1)
-  assert.equal(byName('tool.call.toolview')[0]?.key, 'secret_request')
+  assert.deepEqual(
+    byName('conversation.chat.node').map((entry) => entry.key).sort(),
+    ['secret-request', 'sr-chip', 'sr-manage'],
+    'one keyed chat node per kind, so none can replace another',
+  )
+  assert.deepEqual(
+    byName('tool.call.toolview').map((entry) => entry.key).sort(),
+    ['secret_manage', 'secret_request'],
+    'one placeholder per tool, so the generic Tool row never shows for either',
+  )
+  assert.equal(byName('tool.call.toolview').length, 2)
+  assert.equal(
+    byName('tool.call.toolview').some((entry) => entry.key === 'secret_request'),
+    true,
+  )
+  assert.equal(
+    byName('tool.call.toolview').some((entry) => entry.key === 'secret_manage'),
+    true,
+  )
   // A keyed slot keeps one entry per key and a later registration replaces the
-  // earlier one, so no priority games are needed (or wanted) here.
-  assert.equal(byName('tool.call.toolview')[0]?.priority, undefined)
+  // earlier one, so no priority games are needed (or wanted) here. Both
+  // placeholders are checked, not just the first: the original assertion named
+  // the single row that existed then, and this keeps the same claim about every
+  // row that exists now.
+  assert.deepEqual(
+    byName('tool.call.toolview').map((entry) => entry.priority),
+    [undefined, undefined],
+  )
   assert.equal(byName('shell.overlay').length, 0)
   assert.equal(byName('conversation.composer').length, 0)
   assert.equal(byName('conversation.chat.commandview').length, 0)
@@ -451,6 +484,80 @@ test('the raw value never leaves the input the human typed it into', () => {
   // A masked input never carries the value in a label, title or data attribute.
   assert.equal(String(typed[0]?.props['aria-label']).includes(SECRET), false)
   assert.equal(JSON.stringify({ ...typed[0]?.props, value: undefined }).includes(SECRET), false)
+})
+
+// ---- the field itself must not be captureable --------------------------------
+/**
+ * The suppression bag every field that can hold a secret must carry, byte for
+ * byte as `src/client/entry.ts` declares it. A regression here is a security
+ * regression: the user reported the key being autofilled and captured by a
+ * password manager, and no single attribute closes that.
+ */
+const SECRET_FIELD_BAG: Record<string, unknown> = {
+  autoComplete: 'new-password',
+  autoCorrect: 'off',
+  autoCapitalize: 'off',
+  spellCheck: false,
+  'data-1p-ignore': 'true',
+  'data-lpignore': 'true',
+  'data-bwignore': 'true',
+  'data-form-type': 'other',
+  'data-protonpass-ignore': 'true',
+}
+
+/**
+ * Assert one secret-holding field is un-fillable, un-savable and starts
+ * read-only, with the focus handler that releases it.
+ */
+function assertSecretField(field: Element | undefined, where: string): void {
+  assert.notEqual(field, undefined, `${where}: no field rendered`)
+  const props = (field as Element).props
+  // Report every gap at once: a partial bag is exactly the regression this test
+  // exists to catch, so the failure must name all of what is missing.
+  const missing = Object.entries(SECRET_FIELD_BAG)
+    .filter(([key, value]) => props[key] !== value)
+    .map(([key, value]) => `${key}=${JSON.stringify(props[key] ?? null)} (want ${JSON.stringify(value)})`)
+  assert.deepEqual(missing, [], `${where}: suppression attributes missing or wrong`)
+  const named = Object.keys(props).filter((key) => key.toLowerCase() === 'name')
+  assert.deepEqual(named, [], `${where}: a secret field must carry no name attribute`)
+  assert.equal(props.readOnly, true, `${where}: must start read-only so autofill skips it on load`)
+  const onFocus = props.onFocus as ((event: unknown) => void) | undefined
+  assert.equal(typeof onFocus, 'function', `${where}: must release the read-only guard on focus`)
+  const node = { readOnly: true }
+  onFocus?.({ currentTarget: node })
+  assert.equal(node.readOnly, false, `${where}: focus must release the read-only guard`)
+}
+
+test('the card’s secret field cannot be autofilled or captured by a password manager', () => {
+  const tree = renderer.render(CARD_COMPONENT, cardProps())
+  const fields = elements(tree).filter(
+    (element) => element.type === 'input' && element.props.type === 'password',
+  )
+  assert.equal(fields.length, 1, 'the answering form owns exactly one secret field')
+  assertSecretField(fields[0], 'request card value')
+
+  // The free-text instruction box can hold no secret, so it takes the hygiene
+  // subset (no spell service, no autocorrection) and not the manager bag. The
+  // box lives behind the "other" action; an earlier test may already have opened
+  // it, and this renderer keeps one component instance, so open it only if the
+  // first render does not show it.
+  if (elements(tree).every((element) => element.type !== 'textarea')) {
+    const other = byLabel(tree, '其他') as Element
+    ;(other.props.onClick as (() => void) | undefined)?.()
+  }
+  const opened = renderer.render(CARD_COMPONENT, cardProps())
+  const textareas = elements(opened).filter((element) => element.type === 'textarea')
+  assert.equal(textareas.length, 1, 'the instruction box is on screen')
+  for (const [key, value] of Object.entries({
+    autoComplete: 'off',
+    autoCorrect: 'off',
+    autoCapitalize: 'off',
+    spellCheck: false,
+  })) {
+    assert.equal(textareas[0]?.props[key], value, `instruction box: ${key} must be ${String(value)}`)
+  }
+  // The instruction is prose, never a secret: the sentinel never reaches it.
+  assert.equal(JSON.stringify(textareas[0]?.props).includes(SECRET), false)
 })
 
 test('the test seam is frozen, stateless and free of secret material', () => {
