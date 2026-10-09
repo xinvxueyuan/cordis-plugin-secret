@@ -611,3 +611,127 @@ test('the card derives the same variable name the Host publishes', () => {
   assert.equal(seam.parseCallRequest(JSON.stringify(REQUEST)).variable, 'DSH_SECRET_OPENAI')
   assert.equal(seam.parseCallRequest(JSON.stringify(REQUEST)).alreadyConfigured, false)
 })
+
+// ---------------------------------------------------------------------------
+// Round 7 / R2 — the request card's two fields own their own 粘贴 action.
+//
+// The card is the *request* direction's surface (`POST /api/secret.answer`), so
+// its paste action writes the field and nothing else: R3's "register it as a
+// secret" belongs to the attach capsule's value field, and must not happen here.
+// ---------------------------------------------------------------------------
+
+/** Run `body` with a scripted `navigator.clipboard`, then restore the real one. */
+async function withCardClipboard(clipboard: unknown, body: () => Promise<void>): Promise<void> {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  Object.defineProperty(globalThis, 'navigator', {
+    value: clipboard === undefined ? {} : { clipboard },
+    configurable: true,
+    writable: true,
+  })
+  try {
+    await body()
+  } finally {
+    if (original === undefined) {
+      Reflect.deleteProperty(globalThis as unknown as Record<string, unknown>, 'navigator')
+    } else {
+      Object.defineProperty(globalThis, 'navigator', original)
+    }
+  }
+}
+
+/** The parent of one element, so a field's own row can be inspected. */
+function parentOf(root: unknown, target: Element): Element | undefined {
+  const walk = (node: unknown, parent: Element | undefined): Element | undefined => {
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const hit = walk(child, parent)
+        if (hit !== undefined) return hit
+      }
+      return undefined
+    }
+    if (typeof node !== 'object' || node === null) return undefined
+    const element = node as Element
+    if (element === target) return parent
+    return walk(element.props.children, element)
+  }
+  return walk(root, undefined)
+}
+
+/** The paste action of the row that holds `field`, or undefined. */
+function pasteButtonFor(tree: unknown, field: Element | undefined): Element | undefined {
+  if (field === undefined) return undefined
+  const row = parentOf(tree, field)
+  if (row === undefined) return undefined
+  return elements(row).find((element) => element.props['data-secret-paste'] === 'true')
+}
+
+test('R2: the card’s value and instruction fields each own a 粘贴 action', async () => {
+  assert.equal(seam.TEXT.paste, '粘贴', 'the copy is the word the user asked for')
+  const tree = renderer.render(CARD_COMPONENT, cardProps())
+  const valueField = elements(tree).find(
+    (element) => element.type === 'input' && element.props.type === 'password',
+  )
+  const valueButton = pasteButtonFor(tree, valueField)
+  assert.notEqual(valueButton, undefined, 'the value field owns a paste action')
+  assert.equal(valueButton?.type, 'button')
+  assert.equal(valueButton?.props.type, 'button', 'type=button so it can never submit the card')
+  assert.equal(valueButton?.props['aria-label'], seam.TEXT.paste)
+  assert.equal(valueButton?.props.disabled, valueField?.props.disabled, 'the action mirrors its field')
+  let prevented = false
+  ;(valueButton?.props.onMouseDown as ((event: unknown) => void) | undefined)?.({
+    preventDefault: () => {
+      prevented = true
+    },
+  })
+  assert.equal(prevented, true, 'mousedown is prevented so the field keeps focus')
+
+  // The instruction box carries its own action, disabled exactly like it is. An
+  // earlier test in this file may already have opened the box, so open it only
+  // when the render does not show it.
+  if (elements(tree).every((element) => element.type !== 'textarea')) {
+    const other = byLabel(tree, '其他') as Element
+    ;(other.props.onClick as (() => void) | undefined)?.()
+  }
+  const opened = renderer.render(CARD_COMPONENT, cardProps())
+  const textarea = elements(opened).find((element) => element.type === 'textarea')
+  const textareaButton = pasteButtonFor(opened, textarea)
+  assert.notEqual(textareaButton, undefined, 'the instruction box owns a paste action')
+  assert.equal(textareaButton?.props.type, 'button')
+  assert.equal(textareaButton?.props['aria-label'], seam.TEXT.paste)
+  assert.equal(textareaButton?.props.disabled, textarea?.props.disabled)
+  assert.equal(
+    elements(opened).filter((element) => element.props['data-secret-paste'] === 'true').length,
+    2,
+    'exactly the two card fields have one',
+  )
+
+  // Pressing it writes the field through the same setter typing uses, and asks
+  // the Host for nothing: this face never registers a secret by itself.
+  const realFetch = (globalThis as Record<string, unknown>).fetch
+  let requests = 0
+  ;(globalThis as Record<string, unknown>).fetch = async () => {
+    requests += 1
+    return { ok: true, status: 200, json: async () => ({ ok: true }) }
+  }
+  try {
+    await withCardClipboard({ readText: async () => `  ${SECRET}  ` }, async () => {
+      const live = renderer.render(CARD_COMPONENT, cardProps())
+      const field = elements(live).find(
+        (element) => element.type === 'input' && element.props.type === 'password',
+      )
+      const button = elements(live).find((element) => element.props['data-secret-paste'] === 'true')
+      ;(button?.props.onClick as ((event: unknown) => void) | undefined)?.({ currentTarget: { parentElement: null } })
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+      const after = renderer.render(CARD_COMPONENT, cardProps())
+      const typed = elements(after).find(
+        (element) => element.type === 'input' && element.props.type === 'password',
+      )
+      assert.equal(String(typed?.props.value), SECRET, 'the clipboard text lands in the field, trimmed')
+    })
+  } finally {
+    ;(globalThis as Record<string, unknown>).fetch = realFetch
+  }
+  assert.equal(requests, 0, 'no request: the card must not register a secret from a paste')
+})

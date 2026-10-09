@@ -192,6 +192,10 @@ const TEXT = {
   configured: '该凭据已在凭据库中，本次无需重新输入，只需决定是否授权本次使用。',
   show: '显示',
   hide: '隐藏',
+  paste: '粘贴',
+  pasteUnavailable: '当前浏览器不允许脚本读取剪贴板，请手动粘贴（在输入框里按 Ctrl/⌘+V）。',
+  pasteDenied: '读取剪贴板被拒绝（可能缺少权限），请手动粘贴。',
+  pasteEmpty: '剪贴板里没有可粘贴的文本。',
   approve: '同意',
   reject: '拒绝',
   ignore: '忽略',
@@ -1125,6 +1129,17 @@ function SecretRequestCard(props: {
             },
             reveal ? TEXT.hide : TEXT.show,
           ),
+          // R2: the card's value field gets the suffix action too, writing through
+          // `setValue`. R3 is not wired here: a paste into this card is the
+          // *request* direction's approval input (`POST /api/secret.answer`), not
+          // an attach, so "register it as a new secret" would be a different act.
+          pasteAction({
+            t: (key) => (TEXT as unknown as Record<string, string | undefined>)[key] ?? key,
+            className: C.toggle,
+            disabled: !answerable,
+            setNotice: setError,
+            apply: (text) => setValue(text),
+          }),
         ),
       ),
     )
@@ -1137,15 +1152,28 @@ function SecretRequestCard(props: {
           'div',
           { key: 'other', className: C.field },
           h('label', { className: C.fieldLabel, htmlFor: `dsh-secret-other-${callId}` }, TEXT.otherLabel),
-          h('textarea', {
-            ...PLAIN_TEXT_HYGIENE,
-            id: `dsh-secret-other-${callId}`,
-            className: C.textarea,
-            value: otherText,
-            placeholder: TEXT.otherPlaceholder,
-            disabled: !answerable,
-            onChange: (event: { target: { value: string } }) => setOtherText(event.target.value),
-          }),
+          h(
+            'div',
+            { className: C.inputRow },
+            h('textarea', {
+              ...PLAIN_TEXT_HYGIENE,
+              id: `dsh-secret-other-${callId}`,
+              className: C.textarea,
+              value: otherText,
+              placeholder: TEXT.otherPlaceholder,
+              disabled: !answerable,
+              onChange: (event: { target: { value: string } }) => setOtherText(event.target.value),
+            }),
+            // R2 only: free-text instructions are prose, never material, so this
+            // one gets the paste action and no classifier (R3's scope ruling).
+            pasteAction({
+              t: (key) => (TEXT as unknown as Record<string, string | undefined>)[key] ?? key,
+              className: C.toggle,
+              disabled: !answerable,
+              setNotice: setError,
+              apply: (text) => setOtherText(text),
+            }),
+          ),
           h(
             'div',
             { className: C.actions },
@@ -1268,11 +1296,31 @@ function SecretRequestCard(props: {
 const ATTACH_SLOT = 'conversation.input.left'
 /** Where the capsule floats: above the composer card, the `@` menu's own seat. */
 const CAPSULE_SLOT = 'conversation.input.overlay'
+/**
+ * The composer's compact-control seat, rendered before the submit action.
+ *
+ * Declared by `dsh-client-ui-conversation` as `{ kind: 'list', scope: 'session' }`
+ * (`lib/types/client/contract/slots.d.ts:235`, rendered at `lib/client.js:17532`),
+ * and its occupants receive the Session's standard props — `inputActions` among
+ * them (`…/contract/slots.d.ts:332-339`). That is the whole reason this seat can
+ * act on the editor at all; see {@link SecretComposerPaste} for the boundary.
+ */
+const INPUT_RIGHT_SLOT = 'conversation.input.right'
 /** Locale namespace of the attach surface, when the runtime has a locale face. */
 const ATTACH_NS = 'secretAttach'
 const ATTACH_PATH = '/api/secret.attach'
 const RELEASE_PATH = '/api/secret.release'
 const ATTACHED_PATH = '/api/secret.attached'
+/**
+ * The scope an attach takes when nothing on screen chose one.
+ *
+ * The fill form starts on it, and the selection conversion (R5), which has no
+ * form at all, uses this very constant — so the two ways a secret enters a
+ * session can never drift into two different defaults. Session scope is the
+ * narrower of the two: nothing is written to the credential store unless a human
+ * asks for it.
+ */
+const DEFAULT_ATTACH_SCOPE: Scope = 'session'
 /** Read-only history of this session's attachments and authorizations. */
 const HISTORY_PATH = '/api/secret.history'
 /** Every secret this session may use, plus what the credential store holds. */
@@ -1350,11 +1398,15 @@ const ATTACH_ZH: Record<string, string> = {
   toggle: '附密钥',
   toggleOpen: '收起附密钥',
   toggleHint: '把一枚密钥附加到这条消息：明文不进入对话，Agent 只会拿到变量名',
+  toggleConvert: '转为密钥',
+  toggleConvertHint: '把选中的文本登记为本次会话的密钥，并把该段替换为标记胶囊（明文仍只交给宿主，不进入对话）',
+  convertDone: '已登记，选中文本已替换为标记胶囊',
+  convertManual: '已登记，但编辑器拒绝了自动替换；请在详情面用「插入到光标处」手工插入标记',
   fillTitle: '附加一枚密钥',
   detailTitle: '随这条消息附加的密钥',
   keyLabel: '凭据键',
-  keyPlaceholder: 'openai',
-  keyHint: '小写 kebab/snake，例如 openai、openai-key；决定变量名 DSH_SECRET_*',
+  keyPlaceholder: '留空则由 AI 命名',
+  keyHint: '可选：留空则由 AI 依据标题与值的形态推断（不含明文）；也可自己写小写 kebab/snake，例如 openai、openai-key',
   labelLabel: '标题',
   labelPlaceholder: 'OpenAI API Key（可选）',
   valueLabel: '密钥内容',
@@ -1386,6 +1438,15 @@ const ATTACH_ZH: Record<string, string> = {
   footerTail: '。',
   badKey: '凭据键必须是小写 kebab/snake，例如 openai。',
   noValue: '请先填入密钥内容。',
+  paste: '粘贴',
+  pasteUnavailable: '当前浏览器不允许脚本读取剪贴板，请手动粘贴（在输入框里按 Ctrl/⌘+V）。',
+  pasteDenied: '读取剪贴板被拒绝（可能缺少权限），请手动粘贴。',
+  pasteEmpty: '剪贴板里没有可粘贴的文本。',
+  // The insert side's own message. The clipboard read has already succeeded by
+  // the time this one is shown, so it must not blame the clipboard; it names the
+  // two things that actually failed (no scripted-insert capability, or nowhere to
+  // put the text) and still tells the human how to get it in.
+  pasteInsertFailed: '无法把内容插入输入框（编辑器不支持脚本插入，或当前没有可插入的光标位置），请手动粘贴（按 Ctrl/⌘+V）。',
   historyLink: '历史记录',
   historyTitle: '本会话的附加与授权记录',
   historyEmpty: '本进程内暂无记录。',
@@ -1416,6 +1477,12 @@ const ATTACH_ZH: Record<string, string> = {
   expiredNote: '这条暂存记录已到 TTL，未发送即被丢弃。',
   chipRowLabel: '本条消息附带的密钥',
   chipOpenHint: '查看该密钥的详情',
+  chipRemove: '移除',
+  chipRemoveHint: '移除即解绑：从本会话移除这条登记，凭据库里的持久记录保持不变',
+  chipRemoveStaged: '已丢弃尚未发送的登记',
+  chipRemoveBound: '已从本会话解绑；凭据库未改动',
+  chipRemoveGone: '这条在本会话里已经不存在了，未做任何改动',
+  chipRemoveFailed: '未能移除，未做任何改动',
   detailTabTitle: '密钥详情',
   detailTabMissing: '这个地址不是本插件登记的变量名。',
   detailTabHint: '来自转录里原始胶囊的打开请求；详情与输入框上方的胶囊同源。',
@@ -1499,11 +1566,15 @@ const ATTACH_EN: Record<string, string> = {
   toggle: 'Attach secret',
   toggleOpen: 'Close attach panel',
   toggleHint: 'Attach a secret to this message: the value stays out of the conversation and the agent only receives the variable name',
+  toggleConvert: 'Turn into a secret',
+  toggleConvertHint: 'Register the selected text as a secret of this session and replace it with the reference marker (the value still goes only to the host, never into the conversation)',
+  convertDone: 'Registered; the selected text is now a reference marker',
+  convertManual: 'Registered, but the editor refused the replacement; insert the marker from the details face',
   fillTitle: 'Attach a secret',
   detailTitle: 'Secret attached to this message',
   keyLabel: 'Credential key',
-  keyPlaceholder: 'openai',
-  keyHint: 'Lowercase kebab/snake, e.g. openai or openai-key; decides the DSH_SECRET_* variable name',
+  keyPlaceholder: 'Leave empty to let AI name it',
+  keyHint: 'Optional: leave it empty and AI infers one from the title and the value shape (never the plaintext); or write lowercase kebab/snake, e.g. openai or openai-key',
   labelLabel: 'Title',
   labelPlaceholder: 'OpenAI API Key (optional)',
   valueLabel: 'Secret value',
@@ -1535,6 +1606,11 @@ const ATTACH_EN: Record<string, string> = {
   footerTail: '.',
   badKey: 'The credential key must be lowercase kebab/snake, e.g. openai.',
   noValue: 'Enter the secret value first.',
+  paste: 'Paste',
+  pasteUnavailable: 'This browser does not let the page read the clipboard. Paste by hand instead (press Ctrl/⌘+V in the field).',
+  pasteDenied: 'Reading the clipboard was refused (a permission may be missing). Paste by hand instead.',
+  pasteEmpty: 'The clipboard holds no text to paste.',
+  pasteInsertFailed: 'Could not insert the text into the composer (this editor does not accept scripted insertion, or there is no caret to insert at). Paste by hand instead (press Ctrl/⌘+V).',
   historyLink: 'History',
   historyTitle: 'Attachments and authorizations of this session',
   historyEmpty: 'Nothing recorded in this process yet.',
@@ -1565,6 +1641,12 @@ const ATTACH_EN: Record<string, string> = {
   expiredNote: 'This staged record reached its TTL and was dropped before it was ever sent.',
   chipRowLabel: 'Secrets attached to this message',
   chipOpenHint: 'Open the details of this secret',
+  chipRemove: 'Remove',
+  chipRemoveHint: 'Removing here means unbinding: this session loses the record, the durable credential-store entry stays as it is',
+  chipRemoveStaged: 'Discarded the staged record before it was sent',
+  chipRemoveBound: 'Unbound from this session; the credential store is unchanged',
+  chipRemoveGone: 'This session no longer holds it; nothing was changed',
+  chipRemoveFailed: 'Not removed; nothing was changed',
   detailTabTitle: 'Secret details',
   detailTabMissing: 'This address is not a variable name this plugin registered.',
   detailTabHint: 'Opened from a capsule in the transcript; the details are the same ones the capsule above the composer shows.',
@@ -1695,6 +1777,9 @@ const A = {
   link: `${AP}_link`,
   chipRow: `${AP}_chipRow`,
   chipPill: `${AP}_chipPill`,
+  chipPillGroup: `${AP}_chipPillGroup`,
+  chipRemove: `${AP}_chipRemove`,
+  toggleWrap: `${AP}_toggleWrap`,
   histList: `${AP}_histList`,
   histItem: `${AP}_histItem`,
   histEvent: `${AP}_histEvent`,
@@ -1706,6 +1791,7 @@ const A = {
 
 const ATTACH_CSS = `
 .${A.btn}{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;border-radius:999px;align-items:center;gap:5px;height:28px;padding:0 10px;font-size:12px;line-height:16px;display:inline-flex}
+.${A.toggleWrap}{align-items:center;gap:6px;display:inline-flex}
 .${A.btn}:hover{border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary)}
 .${A.btn}[aria-pressed=true]{background:var(--dsw-alias-button-ghost-active-fill);border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary)}
 .${A.btn}:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
@@ -1718,7 +1804,7 @@ const ATTACH_CSS = `
 .${A.close}:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .${A.body}{flex-direction:column;gap:8px;display:flex;min-width:0}
 .${A.field}{flex-direction:column;gap:6px;display:flex;min-width:0}
-.${A.fieldGroup}{flex-direction:column;gap:6px;display:flex;min-width:0}
+.${A.fieldGroup}{flex:auto;flex-direction:column;gap:6px;display:flex;min-width:0}
 .${A.label}{color:var(--dsw-alias-label-caption);font-size:12px;line-height:18px}
 .${A.inputRow}{align-items:center;gap:8px;display:flex}
 .${A.input}{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-label-primary);flex:auto;font:inherit;font-size:13px;height:32px;min-width:0;outline:none;padding:0 10px}
@@ -1753,6 +1839,15 @@ const ATTACH_CSS = `
 .${A.chipPill}{background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:999px;color:var(--dsw-alias-label-secondary);cursor:pointer;font-family:var(--ds-font-family-code,ui-monospace,monospace);font-size:11px;line-height:18px;padding:1px 8px}
 .${A.chipPill}:hover{border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-primary)}
 .${A.chipPill}:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
+.${A.chipPillGroup}{align-items:center;gap:2px;display:inline-flex}
+.${A.chipRemove}{background:0 0;border:0;color:var(--dsw-alias-label-secondary);cursor:pointer;font:inherit;font-size:11px;line-height:18px;padding:0 4px;visibility:hidden}
+.${A.chipPillGroup}:hover .${A.chipRemove},
+.${A.chipPillGroup}:focus-within .${A.chipRemove},
+.${A.chipRemove}:focus-visible{visibility:visible}
+.${A.chipRemove}:hover{color:var(--dsw-alias-state-error-primary)}
+.${A.chipRemove}:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px;border-radius:var(--dsw-radius-xs)}
+.${A.chipRemove}:disabled{cursor:default;opacity:.55}
+@media (hover:none){.${A.chipRemove}{visibility:visible}}
 .${A.histList}{flex-direction:column;gap:6px;display:flex;margin:0;padding:0;list-style:none;max-height:220px;overflow-y:auto}
 .${A.histItem}{background:var(--dsw-alias-bg-layer-2);border-radius:var(--dsw-radius-sm);flex-direction:column;gap:2px;padding:6px 10px;display:flex}
 .${A.histEvent}{color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px}
@@ -1944,6 +2039,8 @@ interface CandidateLike {
 interface InputStateLike {
   readonly draft?: unknown
   readonly phase?: unknown
+  /** The reference occurrences of the draft, in clipboard-text coordinates. */
+  readonly occurrences?: unknown
 }
 /** One optimistic submission echo: the text that is about to be sent. */
 interface PendingSubmissionLike {
@@ -2003,6 +2100,16 @@ type AttachMode =
 
 /** Attached secrets per session. Values are never stored here. */
 const attachedBySession = new Map<string, Map<string, AttachedMeta>>()
+/**
+ * Sessions whose attachment list this page has really read from the host.
+ *
+ * It separates "the host answered and this session no longer holds it" from
+ * "this page never asked". The side-car row's ✕ removes a capsule from the row,
+ * so the row may only stop rendering one on positive evidence: a record it knows
+ * to be `withdrawn`, or a variable absent from a list the host itself answered.
+ * Hiding on ignorance would let a failed or never-attempted read erase a capsule.
+ */
+const attachedKnown = new Set<string>()
 /** The last history this page read per session, newest first. Never a value. */
 const historyBySession = new Map<string, readonly HistoryEntry[]>()
 /** Whether the last history read for a session failed (fixed wording, no retry storm). */
@@ -2174,6 +2281,74 @@ function attachErrorFor(status: number): string {
   return ATTACH_FAILURE[status] ?? ATTACH_FAILURE_UNKNOWN
 }
 
+/** One attach attempt's outcome, exactly as the host answered it. */
+type AttachAttempt =
+  | { readonly ok: true; readonly variable: string; readonly scope: Scope }
+  | { readonly ok: false; readonly error: string }
+
+/**
+ * Register one secret for this session: the one route a value leaves this file.
+ *
+ * Two callers use it — the fill form (where a human typed the value) and the
+ * selection conversion (R5, where the value is the text the human selected) — and
+ * both must send exactly the same thing: the field-validated body, this plugin's
+ * own fixed failure sentences (never the host's text, which can quote a value),
+ * and the same reading of the answer. An empty `name` is legal (R1): the host
+ * settles the key itself, from a local rule and a deadline-bounded model
+ * suggestion, and reports the variable it settled on.
+ */
+async function postAttach(input: {
+  readonly sessionId: string
+  readonly name: string
+  readonly label: string
+  readonly scope: Scope
+  readonly value: string
+}): Promise<AttachAttempt> {
+  try {
+    const response = await fetch(ATTACH_PATH, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: input.sessionId,
+        name: input.name,
+        label: input.label,
+        scope: input.scope,
+        value: input.value,
+      }),
+    })
+    const payload: unknown = await response.json().catch(() => undefined)
+    if (!response.ok) return { ok: false, error: attachErrorFor(response.status) }
+    const accepted = readAttachResponse(payload)
+    if (accepted === null) return { ok: false, error: ATTACH_FAILURE_UNKNOWN }
+    return { ok: true, variable: accepted.variable, scope: accepted.scope }
+  } catch {
+    return { ok: false, error: ATTACH_UNREACHABLE }
+  }
+}
+
+/**
+ * Write one freshly registered record into this page's own map, exactly as the
+ * fill form always has: the new record takes the variable's slot over, so a
+ * withdrawal timer armed for a replaced record can never fire against this one,
+ * and "seen in the draft" stays false until the observer reports the marker.
+ */
+function noteStaged(sessionId: string, variable: string, name: string, label: string, scope: Scope): void {
+  const map = sessionAttachments(sessionId)
+  const known = map.get(variable)
+  map.set(variable, {
+    variable,
+    name,
+    label: label === '' ? name : label,
+    scope,
+    state: 'staged',
+    createdAt: Date.now(),
+    generation: known === undefined ? 0 : known.generation + 1,
+    seenPresent: false,
+  })
+  publishAttached()
+}
+
 /** Read the host's attachment list for one session and publish it. */
 async function refreshAttached(sessionId: string): Promise<void> {
   if (sessionId === '') return
@@ -2200,6 +2375,10 @@ async function refreshAttached(sessionId: string): Promise<void> {
       )
     }
     attachedBySession.set(sessionId, map)
+    // The host really answered for this session: from here on, "not in the map"
+    // is evidence that the session no longer holds the variable (the side-car
+    // row's own visibility rule reads this).
+    attachedKnown.add(sessionId)
     publishAttached()
   } catch {
     // Unreachable is not evidence of anything: the capsule keeps what it knows.
@@ -3162,6 +3341,160 @@ function insertChip(sessionId: string, variable: string, span: TokenSpanLike | n
   return 'manual'
 }
 
+/**
+ * The selection the editor is holding right now, or null when it holds none.
+ *
+ * `captureInsertion()` is the only public way to see a selection, and a collapsed
+ * caret is reported as `start === end`, so a range is exactly `start !== end` (a
+ * caret at the end of a draft and "no selection at all" are the same fact here).
+ * The read is total: a missing action, a host shape this half cannot read and a
+ * throwing editor all answer "no selection" instead of escaping — the caller is a
+ * click handler, and an exception there would be an uncaught rejection.
+ */
+function selectedSpan(actions: InputActionsLike | undefined): TokenSpanLike | null {
+  try {
+    const span = readSpan(actions?.captureInsertion?.())
+    if (span === null || span.start === span.end) return null
+    return span
+  } catch {
+    return null
+  }
+}
+
+/** One chip's two projections, as this half reads them off `InputState`. */
+interface OccurrenceView {
+  readonly offset: number
+  readonly length: number
+}
+
+/**
+ * The text one selection names, or null when the conversion cannot be trusted.
+ *
+ * `captureInsertion()` speaks **detect-projection** offsets (`chip = one U+FFFC`)
+ * while `InputState.draft` is the **clipboard projection** (`chip = its
+ * clipboardText`), so the span has to be folded back before `slice` can be
+ * right (the design's §11.2 formula). The two texts agree character for
+ * character outside chips, so the fold is exact once the chips before the
+ * selection are known.
+ *
+ * Null — never a guess — when anything does not line up: an occurrence this half
+ * cannot read, a chip whose two lengths disagree, a chip inside the selection
+ * (that selection is not plain text), a negative offset, an end past the draft,
+ * or a length that does not survive the fold. The caller then keeps the
+ * original 「附密钥」 behaviour instead of registering the wrong bytes.
+ */
+function selectedTextIn(draft: string, occurrences: readonly unknown[], span: TokenSpanLike): string | null {
+  if (span.end <= span.start) return null
+  const chips: OccurrenceView[] = []
+  for (const raw of occurrences) {
+    if (typeof raw !== 'object' || raw === null) return null
+    const record = raw as { readonly offset?: unknown; readonly length?: unknown; readonly clipboardText?: unknown }
+    const offset = record.offset
+    const length = record.length
+    if (typeof offset !== 'number' || typeof length !== 'number') return null
+    if (!Number.isInteger(offset) || !Number.isInteger(length)) return null
+    if (offset < 0 || length < 1) return null
+    // The length the occurrence declares is the length of its clipboard form:
+    // anything else means this half is not reading the shape it was written for.
+    if (typeof record.clipboardText !== 'string' || record.clipboardText.length !== length) return null
+    chips.push({ offset, length })
+  }
+  chips.sort((a, b) => a.offset - b.offset)
+  // A chip occupies one U+FFFC in detect space and `length` characters in the
+  // clipboard text, so everything after the k-th chip is shifted by the sum of
+  // the chips before it.
+  const detectAt: number[] = []
+  let carried = 0
+  for (const chip of chips) {
+    const at = chip.offset - carried
+    if (at < 0) return null
+    detectAt.push(at)
+    carried += chip.length - 1
+  }
+  let shiftStart = 0
+  let shiftEnd = 0
+  for (const [index, chip] of chips.entries()) {
+    const at = detectAt[index] ?? 0
+    if (at >= span.start && at < span.end) return null
+    if (at < span.start) shiftStart += chip.length - 1
+    if (at < span.end) shiftEnd += chip.length - 1
+  }
+  const start = span.start + shiftStart
+  const end = span.end + shiftEnd
+  if (start < 0 || end > draft.length) return null
+  if (end - start !== span.end - span.start) return null
+  const text = draft.slice(start, end)
+  if (text.length === 0 || text.includes('\uFFFC')) return null
+  return text
+}
+
+/**
+ * The contract-external live cue for the label, isolated into one total function.
+ *
+ * The seat publishes **no** selection change (moving a caret neither bumps the
+ * draft revision nor publishes `InputState`), so "the label follows the selection
+ * while nothing is pressed" cannot be built on the contract at all. This is the
+ * whole of the out-of-contract part: a DOM `selectionchange` listener may ask
+ * *this*, and this only ever answers a boolean for the label. It answers `null`
+ * — "no cue" — for everything unsupported or throwing, and it never decides
+ * behaviour: the click reads the editor itself.
+ */
+function liveSelectionCue(actions: InputActionsLike | undefined, editableFocused: boolean): boolean | null {
+  try {
+    // Nothing editable focused is not "nothing selected": it is no information,
+    // and a cue that is absent must never clear a label the press already set.
+    if (!editableFocused) return null
+    return selectedSpan(actions) !== null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Whether the focused element is an editable — the composer's own editor shape.
+ *
+ * This is the tightest scope a component with no DOM reference of its own can
+ * apply: it keeps the cue from reacting to a selection made in ordinary prose.
+ * Reading `document.activeElement` is not reading anyone's selection; the
+ * selection itself only ever comes from the public `captureInsertion()`.
+ */
+function editableFocused(): boolean {
+  try {
+    const active = document.activeElement as
+      | (Element & { readonly isContentEditable?: boolean; readonly tagName?: string })
+      | null
+    if (active === null || active === undefined) return false
+    if (active.isContentEditable === true) return true
+    return active.tagName === 'TEXTAREA' || active.tagName === 'INPUT'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The selection the last press saw, waiting for its own click.
+ *
+ * A press and the click it produces are one gesture, and the contract only lets
+ * this plugin observe the selection at the moment of an action — so the press
+ * reads it and the click resolves against that reading, never against a value a
+ * render forgot. Module scope, not component state, so a handler closure can
+ * never be one render behind; `null` means "no press is waiting".
+ */
+let pressedSelection: { readonly sessionId: string; readonly span: TokenSpanLike | null } | null = null
+/**
+ * R5's own facts, per session.
+ *
+ * They live here rather than in `useState` on purpose: the standard seat hands
+ * this control exactly one state slot, and a second one would be read
+ * positionally against whatever else shares the renderer. Only the press verdict
+ * decides behaviour; the live cue only moves the label; the notice is the one
+ * sentence the human reads after a conversion.
+ */
+const pressedVerdict = new Map<string, boolean>()
+const liveCue = new Map<string, boolean>()
+const toggleNotice = new Map<string, string>()
+const toggleBusy = new Set<string>()
+
 /** The translate seat, with the literal table as the fallback. */
 function attachT(props: { readonly t?: unknown }): (key: string) => string {
   const t = props.t
@@ -3170,53 +3503,290 @@ function attachT(props: { readonly t?: unknown }): (key: string) => string {
 }
 
 /**
+ * A translator for a seat that belongs to another package's contract.
+ *
+ * The harness hands an occupant of a `conversation.*` seat a translator bound to
+ * *its* namespaces; this plugin's keys live in `secretAttach`, which that bound
+ * translator cannot resolve. Printing a raw key would be a visible defect, so the
+ * bound one is used only when it actually knows the key, and our own table is the
+ * fallback.
+ */
+function seatT(props: { readonly t?: unknown }): (key: string) => string {
+  const bound = props.t
+  if (typeof bound === 'function') {
+    const translate = bound as (key: string) => string
+    if (translate('paste') !== 'paste') return translate
+  }
+  return (key: string) => ATTACH_ZH[key] ?? key
+}
+
+/**
+ * The composer's 「粘贴」 action (round 7, R2, composer half).
+ *
+ * It is the only place this plugin may act on the editor, and the boundary is
+ * worth stating where it lives:
+ *
+ * - `inputActions` offers `captureInsertion` and `insertText` — **no way to write
+ *   a controlled value**. The pasted text is inserted at the caret and the
+ *   editor's own onChange/validation runs, exactly as if the human had pasted it
+ *   by hand.
+ * - Only *this* button is ours. The seat is a list (other plugins may add their
+ *   own entries), and a third-party plugin's own input box cannot be decorated or
+ *   covered from here.
+ * - The `@` reference source (an `inputTriggers` source) and the floating capsule
+ *   (`conversation.input.overlay`) are different registrations and are untouched.
+ *
+ * When the clipboard cannot be read, the three dictionary messages the capsule
+ * uses are reused (`pasteUnavailable` / `pasteDenied` / `pasteEmpty`) — no
+ * duplicate set of clipboard copy exists. The **insert** side is a different
+ * failure with a different cause, so it has its own message
+ * (`pasteInsertFailed`): by the time it is shown the clipboard read already
+ * succeeded, and blaming it would be a wrong reason for a real failure. All
+ * three insert-side branches answer with that message instead of throwing or
+ * silently doing nothing, and focus is never taken from the editor.
+ */
+function SecretComposerPaste(props: {
+  readonly sessionId?: unknown
+  readonly t?: unknown
+  readonly inputActions?: InputActionsLike
+}): unknown {
+  const h = React.createElement
+  const t = seatT(props)
+  const actions = props.inputActions
+  const [notice, setNotice] = React.useState<string | null>(null)
+
+  const insert = (text: string): void => {
+    const insertText = actions?.insertText
+    if (typeof insertText !== 'function') {
+      // The capability is missing. The clipboard read above this call already
+      // succeeded, so the insert-side message is the honest one here.
+      setNotice(t('pasteInsertFailed'))
+      return
+    }
+    const span = actions?.captureInsertion?.() ?? null
+    if (span === null) {
+      // Without a caret to insert at, the plugin cannot place the text: say so
+      // rather than dropping it or moving focus.
+      setNotice(t('pasteInsertFailed'))
+      return
+    }
+    if (insertText.call(actions, text, span) !== true) {
+      // The editor declined the insertion: say so instead of losing the text.
+      setNotice(t('pasteInsertFailed'))
+      return
+    }
+    setNotice(null)
+  }
+
+  return h(
+    'span',
+    { 'data-secret-paste-seat': 'composer' },
+    pasteAction({
+      t,
+      className: A.toggle,
+      // Never disabled by the missing capability: the click is what explains it.
+      disabled: false,
+      setNotice,
+      apply: insert,
+    }),
+    notice === null ? null : h('span', { className: A.optionHint, role: 'status' }, notice),
+  )
+}
+
+/**
  * The composer's entry button: a toggle whose pressed state and label follow the
  * capsule, exactly as the vision-mode toggle's follow theirs.
+ *
+ * R5 gives it a second reading. When the human has text selected in the editor,
+ * this button does not open the capsule: it registers the selected text as a
+ * secret of this session and replaces the selection with the reference marker.
+ * The verdict is taken at the moment of the press — the one moment the frozen
+ * contract offers — and the label changes with it; the selection itself is read
+ * through `captureInsertion()` (never through the DOM), and the text behind the
+ * span through `InputState`'s draft and occurrences. When that reading does not
+ * line up exactly, the button keeps its original 「附密钥」 behaviour: nothing is
+ * registered, nothing is lost.
  */
 function SecretAttachToggle(props: {
   readonly sessionId?: unknown
   readonly open?: () => void
   readonly close?: () => void
   readonly t?: unknown
+  readonly inputActions?: InputActionsLike
+  /** The standard kit's selector hook for the composer's published state. */
+  readonly useInput?: unknown
 }): unknown {
   const h = React.createElement
   const t = attachT(props)
   const sessionId = text(props.sessionId) ?? ''
+  const actions = props.inputActions
+  // The one state slot this control has always had. Everything R5 adds is read
+  // through it (a module-scope change bumps this counter to re-render) so this
+  // registration never grows a second slot.
   const [snap, setSnap] = React.useState(0)
+  const reflow = (): void => setSnap((previous: number) => previous + 1)
   React.useEffect(() => {
-    const release = subscribeAttached(() => setSnap((previous: number) => previous + 1))
+    const release = subscribeAttached(reflow)
     // The host is the authority for what is still attached after a reload.
     void refreshAttached(sessionId)
     return release
   }, [sessionId])
+  // The contract-external enhancement (C): a DOM listener that may only move the
+  // label. It is silent when the platform does not offer `selectionchange`, when
+  // reading the editor throws, and when nothing editable is focused.
+  React.useEffect(() => {
+    if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return undefined
+    const onSelectionChange = (): void => {
+      try {
+        const cue = liveSelectionCue(actions, editableFocused())
+        if (cue === null) return
+        liveCue.set(sessionId, cue)
+        reflow()
+      } catch {
+        // Silent on purpose: the label is a hint, and the press still decides.
+      }
+    }
+    document.addEventListener('selectionchange', onSelectionChange)
+    return () => {
+      try {
+        document.removeEventListener('selectionchange', onSelectionChange)
+      } catch {
+        // Nothing to undo when the document refuses the removal.
+      }
+    }
+  }, [sessionId])
   void snap
+
+  const useInputSeat = typeof props.useInput === 'function' ? (props.useInput as SeatHook) : useAbsentSeat
+  const draftSeat = text(useInputSeat((state: InputStateLike) => state.draft)) ?? ''
+  const occurrencesSeat = useInputSeat((state: InputStateLike) => state.occurrences)
+  const occurrences = Array.isArray(occurrencesSeat) ? occurrencesSeat : []
+
   const open = currentMode().kind !== 'idle'
   const count = attachmentCount(sessionId)
+  // The label: a press that is still pending wins (it is what the click will act
+  // on); otherwise the live cue; otherwise the last press verdict. With no
+  // selection anywhere, all three agree on 「附密钥」.
+  const pending = pressedSelection !== null && pressedSelection.sessionId === sessionId ? pressedSelection.span : undefined
+  const converting =
+    pending !== undefined ? pending !== null : (liveCue.get(sessionId) ?? pressedVerdict.get(sessionId) ?? false)
+  const label = open ? t('toggleOpen') : converting ? t('toggleConvert') : t('toggle')
+  const notice = toggleNotice.get(sessionId)
+  const noticeText = typeof notice === 'string' && notice !== '' ? notice : null
+
+  /**
+   * The behaviour this button has always had: open the capsule, or close it.
+   *
+   * It is also the fallback for a selection this plugin cannot read exactly —
+   * the same click then does exactly what 「附密钥」 always did, instead of
+   * registering the wrong bytes or doing nothing at all.
+   */
+  const togglePanel = (): undefined => {
+    if (open) {
+      if (props.close !== undefined) props.close()
+      else setAttachMode({ kind: 'idle' })
+      return undefined
+    }
+    if (props.open !== undefined) props.open()
+    else setAttachMode({ kind: 'fill' })
+    return undefined
+  }
+
+  /**
+   * Turn the selection into a secret, then replace it with the marker.
+   *
+   * The text comes from the two projections, so a selection that cannot be
+   * resolved exactly registers nothing and falls back to the plain toggle. On a
+   * refusal the draft is untouched (the marker only ever replaces the span after
+   * the host accepted the value), and the sentence reported is this plugin's own.
+   */
+  const convert = async (span: TokenSpanLike): Promise<void> => {
+    if (sessionId === '' || toggleBusy.has(sessionId)) return
+    const selected = selectedTextIn(draftSeat, occurrences, span)
+    if (selected === null) {
+      // Not plain text this half can trust: never guess, never register — the
+      // click keeps the original 「附密钥」 behaviour instead.
+      pressedVerdict.set(sessionId, false)
+      reflow()
+      togglePanel()
+      return
+    }
+    toggleBusy.add(sessionId)
+    toggleNotice.delete(sessionId)
+    reflow()
+    try {
+      const attempt = await postAttach({
+        sessionId,
+        // R1: an empty key and an empty title are legal, and they are what the
+        // conversion sends — the host settles the key by its own rule.
+        name: '',
+        label: '',
+        scope: DEFAULT_ATTACH_SCOPE,
+        value: selected,
+      })
+      if (!attempt.ok) {
+        toggleNotice.set(sessionId, attempt.error)
+        return
+      }
+      noteStaged(sessionId, attempt.variable, '', '', attempt.scope)
+      const applied = insertChip(sessionId, attempt.variable, span, actions)
+      if (applied === 'manual') {
+        // The editor refused both rungs: the variable is registered, and the one
+        // honest offer left is the detail face's own insert action.
+        toggleNotice.set(sessionId, t('convertManual'))
+        setAttachMode({ kind: 'detail', variable: attempt.variable })
+        return
+      }
+      toggleNotice.set(sessionId, t('convertDone'))
+    } catch {
+      toggleNotice.set(sessionId, ATTACH_UNREACHABLE)
+    } finally {
+      toggleBusy.delete(sessionId)
+      reflow()
+    }
+  }
+
   return h(
-    'button',
-    {
-      type: 'button',
-      className: open ? `${A.btn} ${A.btnOn}` : A.btn,
-      'data-secret-attach-toggle': 'true',
-      'aria-pressed': open,
-      'aria-label': open ? t('toggleOpen') : t('toggle'),
-      title: t('toggleHint'),
-      onMouseDown: (event: { preventDefault?: () => void }) => {
-        event.preventDefault?.()
+    'span',
+    { className: A.toggleWrap, 'data-secret-attach-toggle-wrap': 'true' },
+    h(
+      'button',
+      {
+        type: 'button',
+        className: open ? `${A.btn} ${A.btnOn}` : A.btn,
+        'data-secret-attach-toggle': 'true',
+        'aria-pressed': open,
+        'aria-label': label,
+        title: converting ? t('toggleConvertHint') : t('toggleHint'),
+        onMouseDown: (event: { preventDefault?: () => void }) => {
+          event.preventDefault?.()
+          // The verdict this gesture will act on, read where the contract allows
+          // it: the press. It decides the label at once, which is the observable
+          // difference between "before" and "after" here.
+          const span = selectedSpan(actions)
+          pressedSelection = { sessionId, span }
+          pressedVerdict.set(sessionId, span !== null)
+          // A new gesture is the human acting again: the last sentence has been
+          // read (or is about to be replaced), so it does not linger for ever.
+          toggleNotice.delete(sessionId)
+          reflow()
+        },
+        onClick: () => {
+          const press = pressedSelection
+          pressedSelection = null
+          // Keyboard activation fires no press: without one, the click reads the
+          // editor itself rather than a verdict some earlier gesture left behind.
+          const span = press === null || press.sessionId !== sessionId ? selectedSpan(actions) : press.span
+          pressedVerdict.set(sessionId, span !== null)
+          if (span === null) return togglePanel()
+          return convert(span)
+        },
       },
-      onClick: () => {
-        if (open) {
-          if (props.close !== undefined) props.close()
-          else setAttachMode({ kind: 'idle' })
-          return
-        }
-        if (props.open !== undefined) props.open()
-        else setAttachMode({ kind: 'fill' })
-      },
-    },
-    h('span', { className: A.glyph, 'aria-hidden': true }, '🔑'),
-    h('span', null, t('toggle')),
-    count > 0 ? h('span', { className: A.badge }, String(count)) : null,
+      h('span', { className: A.glyph, 'aria-hidden': true }, '🔑'),
+      h('span', null, converting ? t('toggleConvert') : t('toggle')),
+      count > 0 ? h('span', { className: A.badge }, String(count)) : null,
+    ),
+    noticeText === null ? null : h('span', { className: A.optionHint, role: 'status' }, noticeText),
   )
 }
 
@@ -3245,7 +3815,7 @@ function SecretAttachCapsule(props: {
   const [label, setLabel] = React.useState('')
   const [value, setValue] = React.useState('')
   const [reveal, setReveal] = React.useState(false)
-  const [scope, setScope] = React.useState<Scope>('session')
+  const [scope, setScope] = React.useState<Scope>(DEFAULT_ATTACH_SCOPE)
   const [busy, setBusy] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [tier, setTier] = React.useState<string | null>(null)
@@ -3295,14 +3865,32 @@ function SecretAttachCapsule(props: {
   }, [sessionId, watching, draftSeat, phaseSeat, pendingSeat])
   if (mode.kind === 'idle') return null
 
-  async function submit(): Promise<void> {
+  /**
+   * Register one attach: the single place a value leaves this component.
+   *
+   * `pasted` is the material to register. The form passes whatever the field
+   * holds; the value field's paste paths (R3) pass the clipboard text, so a
+   * pasted secret is registered through **exactly this route** — the same
+   * validation, the same request, the same success handling (insert the chip,
+   * open the detail face) — instead of a second, parallel one.
+   *
+   * `restore` is the paste path's safety net: when the click took the text out of
+   * the human's hands, any refusal puts it back into the field (after whatever
+   * was there, the way an insertion would have), so a failure never loses what
+   * they pasted.
+   */
+  async function registerValue(pasted: string, restore = false): Promise<void> {
     if (busy) return
     const name = key.trim()
-    if (!ATTACH_KEY_RE.test(name)) {
+    // R1: the key is optional. An empty one is completed by the Host — the local
+    // rule decides it, and a deadline-bounded model suggestion may improve it —
+    // so a human never has to invent a key just to attach a secret.
+    if (name.length > 0 && !ATTACH_KEY_RE.test(name)) {
       setError(t('badKey'))
+      if (restore) setValue(value + pasted)
       return
     }
-    if (value.length === 0) {
+    if (pasted.length === 0) {
       setError(t('noValue'))
       return
     }
@@ -3310,57 +3898,72 @@ function SecretAttachCapsule(props: {
     setError(null)
     const span = actions?.captureInsertion?.() ?? null
     try {
-      const response = await fetch(ATTACH_PATH, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          name,
-          label: label.trim() === '' ? name : label.trim(),
-          scope,
-          value,
-        }),
+      // The request itself lives in `postAttach`, shared with the selection
+      // conversion (R5): same body, same failure sentences, same reading of the
+      // answer. This component's own work is only what it alone knows — the
+      // fields, the record it keeps, and where the marker goes.
+      const attempt = await postAttach({
+        sessionId,
+        name,
+        label: label.trim(),
+        scope,
+        value: pasted,
       })
-      const payload: unknown = await response.json().catch(() => undefined)
-      if (!response.ok) {
-        setError(attachErrorFor(response.status))
-        return
-      }
-      const accepted = readAttachResponse(payload)
-      if (accepted === null) {
-        setError(ATTACH_FAILURE_UNKNOWN)
+      if (!attempt.ok) {
+        setError(attempt.error)
+        if (restore) setValue(value + pasted)
         return
       }
       // The value leaves this component here, and this is the only place it is
       // ever read: it is not stored, echoed, or carried into the detail view.
       setValue('')
-      const map = sessionAttachments(sessionId)
-      const known = map.get(accepted.variable)
-      map.set(accepted.variable, {
-        variable: accepted.variable,
-        name,
-        label: label.trim() === '' ? name : label.trim(),
-        scope: accepted.scope,
-        state: 'staged',
-        createdAt: Date.now(),
-        // This record takes the variable's slot over from whatever was there:
-        // the generation advances so a timer armed for the replaced record can
-        // never withdraw this one, and "seen in the draft" starts false until
-        // the observer reports the marker actually landed (a marker that never
-        // lands must never cost the human the value they just typed).
-        generation: known === undefined ? 0 : known.generation + 1,
-        seenPresent: false,
-      })
-      publishAttached()
-      const applied = insertChip(sessionId, accepted.variable, span, actions)
+      noteStaged(sessionId, attempt.variable, name, label.trim(), attempt.scope)
+      const applied = insertChip(sessionId, attempt.variable, span, actions)
       setTier(applied)
-      setAttachMode({ kind: 'detail', variable: accepted.variable })
+      setAttachMode({ kind: 'detail', variable: attempt.variable })
     } catch {
       setError(ATTACH_UNREACHABLE)
+      if (restore) setValue(value + pasted)
     } finally {
       setBusy(false)
     }
+  }
+
+  /** The form's own submit: register whatever the value field holds. */
+  async function submit(): Promise<void> {
+    await registerValue(value)
+  }
+
+  /**
+   * The value field's paste paths (R3).
+   *
+   * The native paste event and the 「粘贴」 button both land here, so one
+   * intention has one behaviour. Material-shaped text is registered through the
+   * form's own route; anything else is written exactly as typing it would be.
+   */
+  function pasteIntoValue(text: string): void {
+    if (classifyPastedText(text).secret) {
+      void registerValue(text, true)
+      return
+    }
+    setValue(text)
+  }
+
+  /**
+   * The value field's native paste: take over only for material-shaped text.
+   *
+   * A paste the classifier does not recognise keeps the browser's own behaviour
+   * (the field's `onChange` runs, as with typing) — the plugin must not swallow
+   * text it cannot account for.
+   */
+  function onValuePaste(event: {
+    readonly clipboardData?: { getData?: (type: string) => string }
+    preventDefault?: () => void
+  }): void {
+    const text = event.clipboardData?.getData?.('text') ?? ''
+    if (!classifyPastedText(text).secret) return
+    event.preventDefault?.()
+    pasteIntoValue(text)
   }
 
   /**
@@ -3631,52 +4234,84 @@ function SecretAttachCapsule(props: {
         h(
           'div',
           { className: A.field },
-          // Implicit label association: the caption and the control live inside
-          // one `<label>`, so the control carries no `id` and the caption no
-          // `for`. Chrome's own Autofill guide says the browser stores and fills
-          // a field by its `name` attribute and, in some browsers, its `id`, so
-          // the stable identity is exactly what has to go; MDN documents the
-          // nested form as the equivalent association ("the `for` and `id`
-          // attributes are not needed because the association is implicit"), and
-          // `aria-label` carries the same text as an explicit accessible name for
-          // the assistive technologies that do not implement implicit labels.
           h(
-            'label',
-            { className: A.fieldGroup },
-            h('span', { className: A.label }, t('keyLabel')),
-            h('input', {
-              ...IDENTIFIER_FIELD_SUPPRESSION,
-              ...secretFieldGuards(),
-              className: A.input,
-              type: 'text',
-              value: key,
-              placeholder: t('keyPlaceholder'),
+            'div',
+            { className: A.inputRow },
+            // Implicit label association: the caption and the control live inside
+            // one `<label>`, so the control carries no `id` and the caption no
+            // `for`. Chrome's own Autofill guide says the browser stores and fills
+            // a field by its `name` attribute and, in some browsers, its `id`, so
+            // the stable identity is exactly what has to go; MDN documents the
+            // nested form as the equivalent association ("the `for` and `id`
+            // attributes are not needed because the association is implicit"), and
+            // `aria-label` carries the same text as an explicit accessible name for
+            // the assistive technologies that do not implement implicit labels.
+            h(
+              'label',
+              { className: A.fieldGroup },
+              h('span', { className: A.label }, t('labelLabel')),
+              h('input', {
+                ...IDENTIFIER_FIELD_SUPPRESSION,
+                ...secretFieldGuards(),
+                className: A.input,
+                type: 'text',
+                value: label,
+                placeholder: t('labelPlaceholder'),
+                disabled: busy,
+                'aria-label': t('labelLabel'),
+                onChange: (event: { target: { value: string } }) => setLabel(event.target.value),
+              }),
+            ),
+            // The paste button sits **outside** the `<label>` on purpose: a
+            // `<button>` is itself labelable, so inside it would become the
+            // label's labelled control and click-to-focus would leave the input.
+            pasteAction({
+              t,
+              className: A.toggle,
               disabled: busy,
-              'aria-label': t('keyLabel'),
-              onChange: (event: { target: { value: string } }) => setKey(event.target.value),
+              setNotice: setError,
+              apply: (text) => setLabel(text),
             }),
           ),
-          h('span', { className: A.optionHint }, t('keyHint')),
         ),
+        // R1: the credential key is the *second* identifier field (it used to be
+        // the first), and it may be left empty — the Host then derives one.
         h(
           'div',
           { className: A.field },
           h(
-            'label',
-            { className: A.fieldGroup },
-            h('span', { className: A.label }, t('labelLabel')),
-            h('input', {
-              ...IDENTIFIER_FIELD_SUPPRESSION,
-              ...secretFieldGuards(),
-              className: A.input,
-              type: 'text',
-              value: label,
-              placeholder: t('labelPlaceholder'),
+            'div',
+            { className: A.inputRow },
+            // Outside the `<label>` for the same reason as the title field above:
+            // a button inside it would become the label's labelled control.
+            h(
+              'label',
+              { className: A.fieldGroup },
+              h('span', { className: A.label }, t('keyLabel')),
+              h('input', {
+                ...IDENTIFIER_FIELD_SUPPRESSION,
+                ...secretFieldGuards(),
+                className: A.input,
+                type: 'text',
+                value: key,
+                placeholder: t('keyPlaceholder'),
+                disabled: busy,
+                'aria-label': t('keyLabel'),
+                // Pasting here writes through the field's own setter, exactly as
+                // typing does; the key's validation still happens on submit, so a
+                // pasted invalid key reaches the same `badKey` branch.
+                onChange: (event: { target: { value: string } }) => setKey(event.target.value),
+              }),
+            ),
+            pasteAction({
+              t,
+              className: A.toggle,
               disabled: busy,
-              'aria-label': t('labelLabel'),
-              onChange: (event: { target: { value: string } }) => setLabel(event.target.value),
+              setNotice: setError,
+              apply: (text) => setKey(text),
             }),
           ),
+          h('span', { className: A.optionHint }, t('keyHint')),
         ),
         h(
           'div',
@@ -3695,6 +4330,9 @@ function SecretAttachCapsule(props: {
               placeholder: t('valuePlaceholder'),
               disabled: busy,
               'aria-label': t('valueLabel'),
+              // R3: material-shaped pastes are taken over and registered; anything
+              // else keeps the browser's own behaviour (onChange runs as with typing).
+              onPaste: onValuePaste,
               onChange: (event: { target: { value: string } }) => setValue(event.target.value),
             }),
             h(
@@ -3708,6 +4346,14 @@ function SecretAttachCapsule(props: {
               },
               reveal ? t('hide') : t('show'),
             ),
+            // R2 + R3: the same classify-and-register path the native paste takes.
+            pasteAction({
+              t,
+              className: A.toggle,
+              disabled: busy,
+              setNotice: setError,
+              apply: pasteIntoValue,
+            }),
           ),
         ),
         h(
@@ -4007,6 +4653,18 @@ function SecretAttachCapsule(props: {
               },
               editReveal ? t('hide') : t('show'),
             ),
+            // R2: the change-value face gets the same suffix action, writing
+            // through `setEditValue` — the same setter its onChange uses. R3 is
+            // deliberately *not* wired here: this face changes an existing
+            // record's material, and "register it as a new secret" is not what a
+            // paste into it means.
+            pasteAction({
+              t,
+              className: A.toggle,
+              disabled: busy,
+              setNotice: setError,
+              apply: (text) => setEditValue(text),
+            }),
           ),
         ),
         h(
@@ -4729,6 +5387,17 @@ function SecretManageCard(props: {
                 },
                 reveal ? '隐藏' : '显示',
               ),
+              // R2: the management confirmation card's value field, writing through
+              // `setValue`. R3 is deliberately not wired here: this card answers a
+              // `secret_manage` action (a change, `POST /api/secret.manage`), and a
+              // paste into it must not become a second, parallel registration.
+              pasteAction({
+                t,
+                className: C.toggle,
+                disabled: busy || !answerable,
+                setNotice: setError,
+                apply: (text) => setValue(text),
+              }),
             ),
           )
         : null,
@@ -4870,22 +5539,134 @@ function chipRowVariables(node: { readonly data?: unknown } | undefined): readon
 }
 
 /**
- * One side-car row: a pill per variable, and nothing else.
+ * Whether one side-car row still shows a variable.
  *
- * The pill shows the variable name and opens the detail face. A value can never
- * appear here — the row's data holds two strings per message, a message id and
- * variable names.
+ * The row renders what the message carried, so a capsule is normally present
+ * because the message says so. It may only disappear on positive evidence that
+ * this session no longer holds it: a record this page knows to be `withdrawn`,
+ * or a variable missing from a list the host itself answered. A session this page
+ * has never read keeps every capsule — "unknown" is not evidence, and a failed
+ * read must not erase anything. Re-attaching the variable moves it back into the
+ * live map, and the capsule reappears.
+ */
+function chipVariableVisible(sessionId: string, variable: string): boolean {
+  const meta = attachedBySession.get(sessionId)?.get(variable)
+  if (meta !== undefined) return meta.state !== 'withdrawn'
+  return !attachedKnown.has(sessionId)
+}
+
+/**
+ * The row's translator.
+ *
+ * The chat seat hands its occupant a translator bound to *its* namespace, which
+ * cannot resolve this plugin's keys, so a bound one is used only when it really
+ * knows a key of ours; otherwise this plugin's own table answers. That keeps the
+ * ✕'s accessible name from ever rendering as a raw key.
+ */
+function rowT(props: { readonly t?: unknown }): (key: string) => string {
+  const bound = props.t
+  if (typeof bound === 'function') {
+    const translate = bound as (key: string) => string
+    if (translate('chipRemove') !== 'chipRemove') return translate
+  }
+  return (key: string) => ATTACH_ZH[key] ?? key
+}
+
+/** Variables whose removal is on the wire, so one click cannot post twice. */
+const removalsInFlight = new Set<string>()
+
+/**
+ * One side-car row: the pills of one message, each with a remove action.
+ *
+ * The pill shows the variable name and opens the detail face; the ✕ beside it
+ * removes the record from this session — the user's own ruling that the close
+ * action *is* the unbind. `staged` goes through the existing release route,
+ * `bound` through the management action `unbind`; neither ever touches the
+ * credential store, so a durable record outlives the ✕ by construction. A
+ * value can never appear here — the row's data holds two strings per message, a
+ * message id and variable names.
  */
 function SecretAttachChipRow(props: {
   readonly node?: { readonly data?: unknown }
+  readonly sessionId?: unknown
   readonly t?: unknown
 }): unknown {
   const h = React.createElement
-  const t = attachT(props)
-  const variables = chipRowVariables(props.node)
-  if (variables.length === 0) return null
+  const t = rowT(props)
+  const sessionId = text(props.sessionId) ?? ''
+  // Re-render when the attachment store changes: the row's own visibility is
+  // derived from it, so a removal performed anywhere must reach this component.
+  const [snap, setSnap] = React.useState(0)
+  const [notice, setNotice] = React.useState<{ readonly variable: string; readonly text: string } | null>(null)
+  React.useEffect(() => subscribeAttached(() => setSnap((previous: number) => previous + 1)), [])
+  void snap
   const data = props.node?.data as { messageId?: unknown } | undefined
   const messageId = text(data?.messageId) ?? ''
+  const variables = chipRowVariables(props.node).filter((variable) => chipVariableVisible(sessionId, variable))
+  // A shared renderer slot can carry a leftover value from another component in
+  // these tests; only a real notice object is ever rendered.
+  const noticeText =
+    typeof notice === 'object' && notice !== null && typeof (notice as { text?: unknown }).text === 'string'
+      ? (notice as { text: string }).text
+      : null
+  // A row with nothing left to show still renders its own outcome sentence: a
+  // removal that worked must not take its report away with the capsule.
+  if (variables.length === 0 && noticeText === null) return null
+
+  /**
+   * Remove one variable from this session, by the route its state calls for.
+   *
+   * Every outcome is reported as the host answered it: a refusal leaves the
+   * capsule in place and says so instead of pretending the list changed.
+   */
+  const remove = async (variable: string): Promise<void> => {
+    if (sessionId === '' || removalsInFlight.has(variable)) return
+    removalsInFlight.add(variable)
+    setNotice(null)
+    try {
+      const meta = attachedBySession.get(sessionId)?.get(variable)
+      if (meta === undefined || meta.state === 'withdrawn') {
+        // No live record this page knows of: never act on a guess. Ask the host
+        // and report what its own answer says, without removing anything myself.
+        await refreshAttached(sessionId)
+        const after = attachedBySession.get(sessionId)?.get(variable)
+        const live = after !== undefined && after.state !== 'withdrawn'
+        setNotice({ variable, text: live || !attachedKnown.has(sessionId) ? t('chipRemoveFailed') : t('chipRemoveGone') })
+        return
+      }
+      if (meta.state === 'staged') {
+        const attempt = await postRelease(sessionId, variable, 'withdrawn')
+        applyRelease(sessionId, variable, attempt.answer, 'withdrawn')
+        const after = attachedBySession.get(sessionId)?.get(variable)
+        const gone = attempt.ok && (after === undefined || after.state === 'withdrawn')
+        setNotice({ variable, text: gone ? t('chipRemoveStaged') : t('chipRemoveFailed') })
+      } else {
+        const attempt = await postManage({ sessionId, action: 'unbind', variable })
+        if (!attempt.ok) {
+          setNotice({ variable, text: attempt.error ?? t('chipRemoveFailed') })
+          return
+        }
+        // The host confirmed the exposure is gone and drops the record from its
+        // own attached list, so this page mirrors the same fact at once rather
+        // than waiting for a refresh that may never arrive.
+        attachedBySession.get(sessionId)?.delete(variable)
+        attachedKnown.add(sessionId)
+        publishAttached()
+        setNotice({ variable, text: t('chipRemoveBound') })
+      }
+      await refreshAttached(sessionId)
+      await refreshHistory(sessionId)
+      if (meta.state === 'bound') await refreshManage(sessionId)
+    } catch {
+      // Every reader below already reports its own failure; this is the last
+      // guard so an unforeseen throw still leaves a sentence instead of an
+      // unhandled rejection and a capsule that silently did nothing.
+      setNotice({ variable, text: t('chipRemoveFailed') })
+    } finally {
+      removalsInFlight.delete(variable)
+    }
+  }
+
   return h(
     'div',
     {
@@ -4896,21 +5677,61 @@ function SecretAttachChipRow(props: {
     },
     ...variables.map((variable: string) =>
       h(
-        'button',
-        {
-          key: variable,
-          type: 'button',
-          className: A.chipPill,
-          'data-secret-variable': variable,
-          'aria-label': `${t('chipOpenHint')} @${variable}`,
-          title: markerOf(variable),
-          onClick: () => {
-            setAttachMode({ kind: 'detail', variable })
+        // A container, not a button: the two actions are siblings, so no button
+        // ever nests inside another button.
+        'span',
+        { key: variable, className: A.chipPillGroup, 'data-secret-variable': variable },
+        h(
+          'button',
+          {
+            type: 'button',
+            className: A.chipPill,
+            'data-secret-chip-open': variable,
+            'aria-label': `${t('chipOpenHint')} @${variable}`,
+            title: markerOf(variable),
+            onClick: () => {
+              setAttachMode({ kind: 'detail', variable })
+            },
           },
-        },
-        variable,
+          variable,
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: A.chipRemove,
+            'data-secret-chip-remove': variable,
+            'aria-label': `${t('chipRemove')} @${variable}`,
+            title: t('chipRemoveHint'),
+            disabled: removalsInFlight.has(variable),
+            // Taking this press is this button's own business: it must not move
+            // focus to the pill, and it must not reach any ancestor.
+            onMouseDown: (event: { stopPropagation?: () => void; preventDefault?: () => void }) => {
+              event.stopPropagation?.()
+              event.preventDefault?.()
+            },
+            onClick: (event: { stopPropagation?: () => void; preventDefault?: () => void }) => {
+              event.stopPropagation?.()
+              event.preventDefault?.()
+              return remove(variable)
+            },
+          },
+          '✕',
+        ),
       ),
     ),
+    noticeText === null
+      ? null
+      : h(
+          'span',
+          {
+            className: A.optionHint,
+            role: 'status',
+            'data-secret-chip-notice':
+              typeof notice === 'object' && notice !== null ? String((notice as { variable?: unknown }).variable ?? '') : '',
+          },
+          noticeText,
+        ),
   )
 }
 
@@ -5135,6 +5956,315 @@ const SEAM = Object.freeze({
 ;(globalThis as unknown as { __cordisSecretClient?: unknown }).__cordisSecretClient = SEAM
 
 /**
+ * The mechanical privacy classifier, **mirrored** from `src/privacy.ts`.
+ *
+ * This file is compiled to a classic script (`tsconfig.client.json` emits zero
+ * `import`/`export`, and the harness loads exactly this one artifact), so it
+ * cannot import the reference module. The rules are therefore spelled out again
+ * here, exactly as the client already mirrors `deriveVariable`/`markerOf` — and
+ * the two implementations are pinned together by one test that compares the
+ * rule sets, the threshold constants and a shared corpus case by case
+ * (`test/client-attach.test.ts` → "the client mirror and the reference
+ * implementation agree"). Change one side without the other and that test fails.
+ *
+ * Keep this block free of dependencies (no `import`, no `require`) and free of
+ * any value that travelled in from a paste: it only ever answers with ids.
+ */
+type ClientPrivacyRule =
+  | 'pem'
+  | 'jwt'
+  | 'vendor-prefix'
+  | 'long-concentrated'
+  | 'high-entropy'
+type ClientPrivacyExclusion =
+  | 'empty'
+  | 'reference'
+  | 'url'
+  | 'path'
+  | 'email'
+  | 'domain'
+  | 'cjk'
+  | 'multi-line'
+  | 'whitespace'
+  | 'identifier'
+interface ClientPrivacyVerdict {
+  readonly secret: boolean
+  readonly rule?: ClientPrivacyRule
+  readonly exclusion?: ClientPrivacyExclusion
+}
+
+/** Mirror of `PRIVACY_RULES` (`src/privacy.ts`). */
+const PRIVACY_RULES: readonly ClientPrivacyRule[] = [
+  'pem',
+  'jwt',
+  'vendor-prefix',
+  'long-concentrated',
+  'high-entropy',
+]
+/** Mirror of `PRIVACY_EXCLUSIONS` (`src/privacy.ts`). */
+const PRIVACY_EXCLUSIONS: readonly ClientPrivacyExclusion[] = [
+  'empty',
+  'reference',
+  'url',
+  'path',
+  'email',
+  'domain',
+  'cjk',
+  'multi-line',
+  'whitespace',
+  'identifier',
+]
+/** Mirror of `PRIVACY_THRESHOLDS` (`src/privacy.ts`), value for value. */
+const PRIVACY_THRESHOLDS = {
+  minVendorPayload: 8,
+  longTokenMinLength: 32,
+  longTokenMinDistinct: 12,
+  entropyTokenMinLength: 20,
+  minBitsPerChar: 3.5,
+  minDistinctChars: 10,
+  identifierMaxLength: 40,
+  identifierMaxSegments: 4,
+} as const
+
+/** Mirror of the vendor prefix table (`src/privacy.ts`, which names each vendor). */
+const VENDOR_PREFIXES: readonly string[] = [
+  'sk-', 'sk.', 'sk_live_', 'sk_test_', 'rk_live_', 'rk_test_',
+  'ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', 'github_pat_',
+  'xoxb-', 'xoxp-', 'xoxa-', 'xoxr-', 'xoxs-',
+  'AKIA', 'ASIA', 'AIza', 'ya29.', 'SG.',
+  'npm_', 'pypi-', 'dop_v1_', 'glpat-', 'hf_',
+  'shpat_', 'shpss_', 'shpca_', 'sq0atp-', 'sq0csp-', 'dapi',
+]
+const PRIVACY_TOKEN_ALPHABET = /^[A-Za-z0-9+/=_.-]+$/
+const PRIVACY_CJK = /[\u3000-\u303F\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFFEF]/
+const PRIVACY_JWT_SHAPE = /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/
+const PRIVACY_PEM_HEADER = /^-----BEGIN [A-Z0-9 ]{1,40}-----$/
+const PRIVACY_URL_SHAPE = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//
+const PRIVACY_PATH_SHAPES: readonly RegExp[] = [
+  /^[A-Za-z]:[\\/]/,
+  /^\\\\/,
+  /^\//,
+  /^\.{1,2}[\\/]/,
+  /^~\//,
+]
+const PRIVACY_EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$/
+const PRIVACY_DOMAIN_SHAPE = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$/
+const PRIVACY_IDENTIFIER_SHAPE = /^[A-Za-z][A-Za-z0-9]*(?:[-_.][A-Za-z0-9]+)+$/
+
+/** Mirror of `distinctCharCount`. */
+function distinctCharCount(text: string): number {
+  return new Set(text).size
+}
+
+/** Mirror of `entropyBitsPerChar` (Shannon, bits per character). */
+function entropyBitsPerChar(text: string): number {
+  if (text.length === 0) return 0
+  const counts = new Map<string, number>()
+  for (const character of text) counts.set(character, (counts.get(character) ?? 0) + 1)
+  let bits = 0
+  for (const count of counts.values()) {
+    const probability = count / text.length
+    bits -= probability * Math.log2(probability)
+  }
+  return bits
+}
+
+/** Mirror of `isReferenceText`: a name, not material. */
+function isReferenceText(text: string): boolean {
+  return text.includes('@DSH_SECRET_')
+    || text.includes('[secret ')
+    || text.includes('dsh-resource://')
+}
+
+/** Mirror of `hasCjk`. */
+function hasCjk(text: string): boolean {
+  return PRIVACY_CJK.test(text)
+}
+
+function privacyIdentifierLike(text: string): boolean {
+  if (text.length > PRIVACY_THRESHOLDS.identifierMaxLength) return false
+  if (!PRIVACY_IDENTIFIER_SHAPE.test(text)) return false
+  if (text.split(/[-_.]/).length > PRIVACY_THRESHOLDS.identifierMaxSegments) return false
+  if (/\d{4,}/.test(text)) return false
+  return text === text.toLowerCase() || text === text.toUpperCase()
+}
+
+function privacyLetterAndDigitCounts(text: string): { letters: number; digits: number } {
+  let letters = 0
+  let digits = 0
+  for (const character of text) {
+    if (character >= '0' && character <= '9') digits += 1
+    else if ((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z')) letters += 1
+  }
+  return { letters, digits }
+}
+
+function privacyPreciseRule(text: string): ClientPrivacyRule | undefined {
+  if (PRIVACY_PEM_HEADER.test(text.split(/\r?\n/, 1)[0] ?? '')) return 'pem'
+  if (PRIVACY_JWT_SHAPE.test(text)) return 'jwt'
+  for (const prefix of VENDOR_PREFIXES) {
+    if (!text.startsWith(prefix)) continue
+    if (text.slice(prefix.length).length < PRIVACY_THRESHOLDS.minVendorPayload) continue
+    if (!PRIVACY_TOKEN_ALPHABET.test(text)) continue
+    return 'vendor-prefix'
+  }
+  return undefined
+}
+
+function privacyExclusionFor(text: string): ClientPrivacyExclusion | undefined {
+  if (text.length === 0) return 'empty'
+  if (isReferenceText(text)) return 'reference'
+  if (PRIVACY_URL_SHAPE.test(text) || /^www\./i.test(text)) return 'url'
+  if (PRIVACY_PATH_SHAPES.some((shape) => shape.test(text))) return 'path'
+  if (PRIVACY_EMAIL_SHAPE.test(text)) return 'email'
+  if (PRIVACY_DOMAIN_SHAPE.test(text)) return 'domain'
+  if (hasCjk(text)) return 'cjk'
+  if (text.includes('\n') || text.includes('\r')) return 'multi-line'
+  if (/\s/.test(text)) return 'whitespace'
+  if (privacyIdentifierLike(text)) return 'identifier'
+  return undefined
+}
+
+function privacyStatisticalRule(text: string): ClientPrivacyRule | undefined {
+  if (!PRIVACY_TOKEN_ALPHABET.test(text)) return undefined
+  const { letters, digits } = privacyLetterAndDigitCounts(text)
+  if (letters === 0 || digits === 0) return undefined
+  const distinct = distinctCharCount(text)
+  if (
+    text.length >= PRIVACY_THRESHOLDS.longTokenMinLength
+    && distinct >= PRIVACY_THRESHOLDS.longTokenMinDistinct
+  ) {
+    return 'long-concentrated'
+  }
+  if (
+    text.length >= PRIVACY_THRESHOLDS.entropyTokenMinLength
+    && distinct >= PRIVACY_THRESHOLDS.minDistinctChars
+    && entropyBitsPerChar(text) >= PRIVACY_THRESHOLDS.minBitsPerChar
+  ) {
+    return 'high-entropy'
+  }
+  return undefined
+}
+
+/**
+ * Mirror of `classifyPastedText` (`src/privacy.ts`): same order, same answer,
+ * total and value-free. The paste path (a value field, R3) calls this and, when
+ * `secret` is true, hands the text to the existing attach registration.
+ */
+function classifyPastedText(raw: string): ClientPrivacyVerdict {
+  const text = typeof raw === 'string' ? raw.trim() : ''
+  const precise = privacyPreciseRule(text)
+  if (precise !== undefined) return { secret: true, rule: precise }
+  const exclusion = privacyExclusionFor(text)
+  if (exclusion !== undefined) return { secret: false, exclusion }
+  const statistical = privacyStatisticalRule(text)
+  if (statistical !== undefined) return { secret: true, rule: statistical }
+  return { secret: false }
+}
+
+/**
+ * The clipboard reader, or undefined when this browser gives the page none.
+ *
+ * Asked once per click and never at module load: a browser without the API must
+ * produce a message and a manual-paste hint, never a throw at script load.
+ */
+function clipboardReader(): (() => Promise<unknown>) | undefined {
+  const navigatorLike = (globalThis as { navigator?: { clipboard?: { readText?: unknown } } }).navigator
+  const clipboard = navigatorLike?.clipboard
+  const readText = clipboard?.readText
+  if (typeof readText !== 'function') return undefined
+  return () => readText.call(clipboard) as Promise<unknown>
+}
+
+/**
+ * Read the clipboard, trim it, and hand the text to `apply`.
+ *
+ * Never throws and never fails silently: a browser without the Clipboard API, a
+ * refused read and an empty clipboard each put a fixed, dictionary-provided
+ * message on screen telling the human to paste by hand. The text itself goes
+ * only to `apply` — it is not logged, echoed, or stored anywhere here.
+ */
+async function pasteFromClipboard(options: {
+  readonly t: (key: string) => string
+  readonly setNotice: (message: string | null) => void
+  readonly apply: (text: string) => void
+}): Promise<void> {
+  options.setNotice(null)
+  const read = clipboardReader()
+  if (read === undefined) {
+    options.setNotice(options.t('pasteUnavailable'))
+    return
+  }
+  let raw: unknown
+  try {
+    raw = await read()
+  } catch {
+    options.setNotice(options.t('pasteDenied'))
+    return
+  }
+  const text = typeof raw === 'string' ? raw.trim() : ''
+  if (text.length === 0) {
+    options.setNotice(options.t('pasteEmpty'))
+    return
+  }
+  options.apply(text)
+}
+
+/**
+ * Put the caret back in the field the button belongs to.
+ *
+ * The button lives in the field's own row, so the row's input or textarea is the
+ * field the human was working in. Called as the last step of every click,
+ * failure paths included: the point of the button is to save keystrokes, and a
+ * click that leaves focus on a button costs a Tab.
+ */
+function focusAfterPaste(button: unknown): void {
+  const row = (button as { parentElement?: { querySelector?: (selector: string) => unknown } } | null)?.parentElement
+  const field = row?.querySelector?.('input, textarea') as { focus?: () => void } | null | undefined
+  field?.focus?.()
+}
+
+/**
+ * The suffix 「粘贴」 action every user-visible input gets (round 7, R2).
+ *
+ * `type="button"` so it can never submit anything; `aria-label` equal to the
+ * visible text; `disabled` mirroring the field it belongs to; and a
+ * `onMouseDown` that is prevented so pressing it does not move focus out of the
+ * field before the click lands — the handler then hands focus back as its last
+ * step regardless of how the read went.
+ */
+function pasteAction(options: {
+  readonly t: (key: string) => string
+  readonly className: string
+  readonly disabled: boolean
+  readonly setNotice: (message: string | null) => void
+  readonly apply: (text: string) => void
+}): unknown {
+  return React.createElement(
+    'button',
+    {
+      type: 'button',
+      className: options.className,
+      'aria-label': options.t('paste'),
+      'data-secret-paste': 'true',
+      disabled: options.disabled,
+      onMouseDown: (event: { preventDefault?: () => void }) => {
+        event.preventDefault?.()
+      },
+      onClick: (event: unknown) => {
+        // `currentTarget` is only valid during the handler, so the button node is
+        // captured now and used once the clipboard read has settled.
+        const button = (event as { currentTarget?: unknown }).currentTarget
+        void pasteFromClipboard(options).then(() => {
+          focusAfterPaste(button)
+        })
+      },
+    },
+    options.t('paste'),
+  )
+}
+
+/**
  * The attach surface's own read-only seam.
  *
  * Kept separate from the card's seam on purpose: the card's seam is a frozen,
@@ -5145,6 +6275,28 @@ const SEAM = Object.freeze({
  */
 const ATTACH_SEAM = Object.freeze({
   version: 1,
+  // Test-only, like the blocks below: the stylesheet this surface injects, so a
+  // test can hold the ✕'s visibility rules (default hidden, parent hover /
+  // focus-within, `@media (hover:none)`) to the real text the page receives. It
+  // is a constant string and carries no state and no value.
+  ATTACH_CSS,
+  // The mirrored privacy classifier (see the block above). Exposed so that one
+  // test can hold this implementation and the reference one in `src/privacy.ts`
+  // to the same answer: rule and exclusion sets, every threshold, and a shared
+  // corpus case by case. **Test-only**: no production path reads these keys, and
+  // they are pure functions and frozen constants — no state, no values.
+  PRIVACY_RULES,
+  PRIVACY_EXCLUSIONS,
+  PRIVACY_THRESHOLDS,
+  classifyPastedText,
+  entropyBitsPerChar,
+  distinctCharCount,
+  isReferenceText,
+  hasCjk,
+  // Test-only, like the block above: the English dictionary is exposed so a test
+  // can pin that both languages carry the paste copy (the rendered tree in tests
+  // binds the Chinese one).
+  ATTACH_EN,
   ATTACH_SLOT,
   CAPSULE_SLOT,
   ATTACH_PATH,
@@ -5156,6 +6308,15 @@ const ATTACH_SEAM = Object.freeze({
   ATTACH_NS,
   MARKER_RE,
   ATTACH_ZH,
+  // Test-only, like the block above: the two pure readings the R5 conversion is
+  // built from (the press-time selection, and the text a selection names across
+  // the editor's two projections), the live-cue core whose failure mode the
+  // documentation has to state, and the one default scope both attach paths
+  // share. Total functions and frozen constants: no state, no values.
+  selectedSpan,
+  selectedTextIn,
+  liveSelectionCue,
+  DEFAULT_ATTACH_SCOPE,
   ATTACH_FAILURE,
   ATTACH_FAILURE_UNKNOWN,
   ATTACH_UNREACHABLE,
@@ -5302,6 +6463,20 @@ loader?.load({
               }),
             },
             SecretAttachToggle,
+          ),
+        )
+        // Requirement 2 (composer half): one compact 「粘贴」 control before the
+        // submit action, acting on the editor through the seat's `inputActions`.
+        // A different seat from the attach toggle (left) and the capsule
+        // (overlay), so neither existing registration changes.
+        ctx.slots.inject(INPUT_RIGHT_SLOT, () =>
+          ctx.slots.register(
+            {
+              name: INPUT_RIGHT_SLOT,
+              id: 'secret-paste-composer',
+              order: 40,
+            },
+            SecretComposerPaste,
           ),
         )
         // The capsule, floating above the composer card.

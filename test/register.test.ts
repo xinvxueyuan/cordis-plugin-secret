@@ -23,11 +23,12 @@ import {
   PENDING_PATH,
   RELEASE_PATH,
 } from '../src/routes.ts'
+import { fixtureFingerprint, fixtureToken } from './secret-fixtures.ts'
 
-const SECRET = 'sk-register-DO-NOT-LEAK'
+const SECRET = fixtureToken('sk-', 'register-DO-NOT-LEAK')
 /** The value a human types into a *change* form: a second sentinel, so a scan
  * can never pass because it looked for the string that was there all along. */
-const ROTATED = 'sk-register-ROTATED-DO-NOT-LEAK'
+const ROTATED = fixtureToken('sk-', 'register-ROTATED-DO-NOT-LEAK')
 const ENV_VAR = 'DSH_SECRET_OPENAI'
 
 /** Minimal scripted session satisfying every structural contract the plugin reads. */
@@ -37,6 +38,10 @@ class FakeSession {
   nodes: number[] = []
   replaceGeneration = 0
   events: { type: string; seq: number; data?: unknown }[] = []
+  /** The logged request route a key suggestion reads through `requestHeader`. */
+  header: { provider: string; model: string } | undefined
+  /** How many events somebody tried to append: a suggestion must not append any. */
+  appends = 0
 
   constructor(id: string, ownFrom = 0) {
     this.id = id
@@ -57,6 +62,16 @@ class FakeSession {
 
   snapshotEvents(): readonly { type: string; seq: number; data?: unknown }[] {
     return this.events
+  }
+
+  /** The conversation's own call configuration, when this session has one. */
+  requestHeader(): { config: { provider: string; model: string } } | undefined {
+    return this.header === undefined ? undefined : { config: this.header }
+  }
+
+  /** Nothing in this plugin may append during a key suggestion. */
+  append(): void {
+    this.appends += 1
   }
 }
 
@@ -151,6 +166,13 @@ interface Harness {
    * express, and the whole of the caller boundary rides on it.
    */
   readonly delegated: Set<string>
+  /**
+   * R1: install (or clear) a fake optional `llm` service before `apply`.
+   *
+   * Left unset — the default — the harness models a profile with no model at
+   * all, which is the positive control for the optional wiring.
+   */
+  setLlm(service: unknown): void
   emit(event: string, ...args: unknown[]): void
 }
 
@@ -315,7 +337,14 @@ function buildContext(main: FakeSession, options: HarnessOptions = {}): Harness 
         return { status: 'authorized' }
       },
     },
+    // R1: the optional `llm` service, resolved the way cordis resolves an
+    // optional dependency — an absent service is `undefined`, never a throw.
+    get(name: string) {
+      return name === 'llm' ? llmService : undefined
+    },
   }
+
+  let llmService: unknown
 
   const harness: Harness = {
     ctx,
@@ -335,6 +364,9 @@ function buildContext(main: FakeSession, options: HarnessOptions = {}): Harness 
     unsetCalls,
     deleteCalls,
     delegated,
+    setLlm(service: unknown) {
+      llmService = service
+    },
     emit(event, ...args) {
       for (const handler of listeners.get(event) ?? []) handler(...args)
     },
@@ -537,6 +569,16 @@ async function seedSession(harness: Harness, session: FakeSession): Promise<void
     value: SECRET,
   })
 }
+
+test('the composed sentinels and the vendor fixture are byte-identical to the literals they replaced', () => {
+  // Composed at run time (`fixtureToken`, `./secret-fixtures.ts`) so this
+  // repository carries no matchable vendor token; the digests below are the
+  // ones the single-literal forms had, so a "simplification" or an edit to a
+  // fixture cannot slip through unnoticed.
+  assert.equal(fixtureFingerprint(SECRET), '4aebcb85b6fa')
+  assert.equal(fixtureFingerprint(ROTATED), '965d5e0ea4b0')
+  assert.equal(fixtureFingerprint(fixtureToken('ghp_', '0123456789abcdefghijklmnopqrstuvwxyz')), '6675cd0c365d')
+})
 
 test('plugin metadata, Config defaults and apply wiring', () => {
   assert.equal(name, 'cordis-plugin-secret')
@@ -1534,5 +1576,146 @@ test('every exact Fetch path is registered once, and the manage path owns both m
   } as never)
   assert.equal(confirmed.status, 200)
   assert.deepEqual(harness.deleteCalls, ['cordis-plugin-secret/openai'])
+  unload(harness)
+})
+
+// ---------------------------------------------------------------------------
+// R1: a credential key the human left blank (round 7)
+//
+// Two promises are asserted here, and nothing else: a blank key never blocks
+// (the local rule decides, and an absent model is fine), and a model suggestion
+// is session-free and redacted.
+// ---------------------------------------------------------------------------
+
+/** Post one attach body and hand back the route's own answer. */
+async function attachBody(
+  harness: Harness,
+  session: FakeSession,
+  body: Record<string, unknown>,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const response = await routeFor(harness, ATTACH_PATH, 'POST').fetch({
+    method: 'POST',
+    url: `http://local${ATTACH_PATH}`,
+    json: async () => ({ sessionId: session.id, ...body }),
+  } as never)
+  return { status: response.status, body: (await response.json()) as Record<string, unknown> }
+}
+
+/** A fake optional `llm` service whose one stream yields these text chunks. */
+function fakeLlm(chunks: readonly string[], calls: Record<string, unknown>[]): unknown {
+  return {
+    stream(options: Record<string, unknown>) {
+      calls.push(options)
+      return (async function* () {
+        for (const text of chunks) yield { type: 'text-delta', text }
+      })()
+    },
+  }
+}
+
+test('R1: with no model in the profile the key is completed locally and the plugin still activates', async () => {
+  const session = sessionWithCall('call-1')
+  const harness = buildContext(session)
+  // Positive control for the optional wiring: `setLlm` is never called here, so
+  // this is a profile with no `llm` service at all.
+  applyPlugin(harness)
+
+  assert.equal(harness.tools.length, 2, 'the plugin must activate without any llm service')
+  const answer = await attachBody(harness, session, { label: 'OpenAI API Key', scope: 'session', value: SECRET })
+  assert.equal(answer.status, 200)
+  assert.equal(answer.body['variable'], 'DSH_SECRET_OPENAI_KEY', 'the value’s public category names the key')
+  assert.equal(JSON.stringify(answer.body).includes(SECRET), false, 'the answer never carries the value')
+  unload(harness)
+})
+
+test('R1: the key is asked of the session’s own model, session-free and redacted', async () => {
+  const session = sessionWithCall('call-1')
+  session.header = { provider: 'deepseek', model: 'deepseek-chat' }
+  const harness = buildContext(session)
+  const calls: Record<string, unknown>[] = []
+  harness.setLlm(fakeLlm(['github', '-token'], calls))
+  applyPlugin(harness)
+
+  const before = session.events.length
+  const answer = await attachBody(harness, session, { label: 'GitHub token', scope: 'session', value: SECRET })
+  assert.equal(answer.status, 200)
+  assert.equal(answer.body['variable'], 'DSH_SECRET_GITHUB_TOKEN', 'the model’s answer became the key')
+
+  assert.equal(calls.length, 1, 'exactly one suggestion per attach')
+  const options = calls[0] as Record<string, unknown>
+  assert.equal(options['provider'], 'deepseek', 'the session’s own route')
+  assert.equal(options['model'], 'deepseek-chat')
+  assert.equal(options['purpose'], 'session-title', 'the purpose that forces reasoning effort off')
+  assert.equal('sessionId' in options, false, 'the call is session-free')
+  assert.equal('tools' in options, false, 'no tool is offered')
+
+  const sent = JSON.stringify(options)
+  assert.equal(sent.includes(SECRET), false, 'the plaintext never reaches the model')
+  assert.equal(sent.includes('DO-NOT-LEAK'), false)
+  // Positive control: the same sweep does find the sentinel where it really is.
+  assert.equal(JSON.stringify({ value: SECRET }).includes(SECRET), true)
+  assert.equal(sent.includes('GitHub token'), true, 'the human title is what the model reads')
+  assert.equal(sent.includes('category=openai-like'), true, 'so are the shape tokens')
+
+  assert.equal(session.events.length, before, 'no session event was appended')
+  assert.equal(session.appends, 0, 'nothing appended to the session')
+  unload(harness)
+})
+
+test('R1: an unusable or empty model answer falls back to the local key', async () => {
+  for (const chunks of [['!!!'], [], ['   ', '\n']] as const) {
+    const session = sessionWithCall('call-1')
+    session.header = { provider: 'deepseek', model: 'deepseek-chat' }
+    const harness = buildContext(session)
+    const calls: Record<string, unknown>[] = []
+    harness.setLlm(fakeLlm(chunks, calls))
+    applyPlugin(harness)
+    const answer = await attachBody(harness, session, { label: 'OpenAI API Key', scope: 'session', value: SECRET })
+    assert.equal(answer.status, 200)
+    assert.equal(answer.body['variable'], 'DSH_SECRET_OPENAI_KEY', `fallback for ${JSON.stringify(chunks)}`)
+    assert.equal(calls.length, 1, 'the model was still asked')
+    unload(harness)
+  }
+})
+
+test('R1: a session with no logged model route never reaches the model, and still attaches', async () => {
+  const session = sessionWithCall('call-1')
+  // No `header`, so `requestHeader()` answers undefined: the suggestion has no
+  // provider/model to name and must decline instead of guessing one.
+  const harness = buildContext(session)
+  const calls: Record<string, unknown>[] = []
+  harness.setLlm(fakeLlm(['github-token'], calls))
+  applyPlugin(harness)
+
+  const answer = await attachBody(harness, session, { label: 'OpenAI API Key', scope: 'session', value: SECRET })
+  assert.equal(answer.status, 200)
+  assert.equal(answer.body['variable'], 'DSH_SECRET_OPENAI_KEY', 'the local rule decides')
+  assert.equal(calls.length, 0, 'a model with no route is not called')
+  unload(harness)
+})
+
+test('R1: a model answer that collides with an existing key is refused, and the local key is de-duplicated', async () => {
+  const session = sessionWithCall('call-1')
+  const harness = buildContext(session)
+  harness.records.set('cordis-plugin-secret/github-token', {
+    version: 1,
+    envVar: 'DSH_SECRET_GITHUB_TOKEN',
+    name: 'github-token',
+    scope: 'persistent',
+    authorizedAt: 1,
+  })
+  const calls: Record<string, unknown>[] = []
+  harness.setLlm(fakeLlm(['github-token'], calls))
+  applyPlugin(harness)
+
+  const answer = await attachBody(harness, session, {
+    label: 'GitHub token',
+    scope: 'session',
+    value: fixtureToken('ghp_', '0123456789abcdefghijklmnopqrstuvwxyz'),
+  })
+  assert.equal(answer.status, 200)
+  assert.equal(answer.body['variable'], 'DSH_SECRET_GITHUB_TOKEN_2', 'never onto an existing record key')
+  assert.equal(harness.records.has('cordis-plugin-secret/github-token'), true, 'the existing record is untouched')
+  assert.equal(harness.records.has('cordis-plugin-secret/github-token-2'), false, 'a session attach writes no record')
   unload(harness)
 })

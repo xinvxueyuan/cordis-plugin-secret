@@ -9,6 +9,7 @@ import type {} from '@deepseek-ai/dsh-tools'
 import { anchorSessionOf, authorizationPort, classifyCaller, credentialsPort, sessionById, sessionOf } from './adapters.ts'
 import { AttachStore } from './attach.ts'
 import { assertConfig, Config, type SecretConfig } from './config.ts'
+import { NAME_DEADLINE_MS } from './naming.ts'
 import { EnvContributorRegistry } from './envs.ts'
 import { GrantStore } from './grants.ts'
 import { HistoryStore } from './history.ts'
@@ -68,6 +69,12 @@ export function apply(ctx: Context, config: SecretConfig): void {
       envs,
       attachments,
       history,
+      // R1: a blank credential key is completed by the local rule and — when
+      // this profile has a model — improved by one session-free suggestion.
+      // `llm` is deliberately NOT in the hard `inject` list above: a profile
+      // without it must still activate this plugin.
+      nameSuggester: (request) => suggestCredentialKey(ctx, request),
+      nameDeadlineMs: NAME_DEADLINE_MS,
       classifyCaller: (agent) => classifyCaller(ctx, agent),
       sessionOf: (agent) => sessionOf(ctx, agent),
       sessionById: (id) => sessionById(ctx, id),
@@ -118,4 +125,71 @@ export function apply(ctx: Context, config: SecretConfig): void {
   // card and persisted meta are a frozen contract, and changing an existing
   // secret is a different question from asking for a new one.
   ctx.tools.register(defineSecretManageTool(service, config))
+}
+
+/** The optional `llm` service, as this plugin needs it: one streaming call. */
+interface LlmStreamLike {
+  stream(options: Record<string, unknown>): AsyncIterable<unknown>
+}
+
+/** Optional-service lookup: an absent service is `undefined`, never a throw. */
+interface OptionalServiceLookup {
+  get(name: string): unknown
+}
+
+/** The one session fact a key suggestion needs: which model this conversation uses. */
+interface RequestHeaderLike {
+  requestHeader?(): { readonly config?: { readonly provider?: unknown; readonly model?: unknown } } | undefined
+}
+
+/**
+ * Ask the session's own model for a credential key, outside the conversation.
+ *
+ * Three promises, all of them structural:
+ *
+ * - the model is **optional** — no `llm` service in the profile means this
+ *   returns undefined and the local rule alone decides the key;
+ * - the call is **session-free** — no `sessionId` is passed to the stream, no
+ *   event is appended to any session and no tool is offered, so neither the
+ *   request nor its answer leaves a trace in the conversation;
+ * - the request carries **only the redacted prompt** the service built from the
+ *   human's title and the value's shape.
+ */
+async function suggestCredentialKey(
+  ctx: Context,
+  request: {
+    readonly sessionId: string
+    readonly system: string
+    readonly user: string
+    readonly signal: AbortSignal
+  },
+): Promise<string | undefined> {
+  const llm = (ctx as unknown as OptionalServiceLookup).get('llm') as LlmStreamLike | undefined
+  if (llm === undefined) return undefined
+  const session = ctx.sessions.get(request.sessionId as never) as RequestHeaderLike | undefined
+  const route = session?.requestHeader?.()?.config
+  const provider = route?.provider
+  const model = route?.model
+  if (typeof provider !== 'string' || typeof model !== 'string' || provider.length === 0 || model.length === 0) {
+    return undefined
+  }
+  let text = ''
+  const stream = llm.stream({
+    provider,
+    model,
+    system: request.system,
+    messages: [{ role: 'user', content: [{ type: 'text', text: request.user }] }],
+    maxTokens: 24,
+    // The `session-title` purpose is what makes the harness force reasoning
+    // effort to 'off' for this call: the cheapest way to ask for a name.
+    purpose: 'session-title',
+    signal: request.signal,
+  })
+  for await (const chunk of stream) {
+    if (typeof chunk === 'object' && chunk !== null) {
+      const piece = chunk as { type?: unknown; text?: unknown }
+      if (piece.type === 'text-delta' && typeof piece.text === 'string') text += piece.text
+    }
+  }
+  return text
 }

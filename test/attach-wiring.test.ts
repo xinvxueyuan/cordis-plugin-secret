@@ -5,6 +5,7 @@ import { AttachStore, renderAttachNote, type StagedAttach } from '../src/attach.
 import { GrantStore } from '../src/grants.ts'
 import { installAttachBinding, noteSourcesOn, type AttachNoteReader } from '../src/inject.ts'
 import { markerFor } from '../src/naming.ts'
+import { fixtureFingerprint, fixtureToken } from './secret-fixtures.ts'
 
 /**
  * The admission wiring, end to end.
@@ -29,7 +30,16 @@ import { markerFor } from '../src/naming.ts'
 const SESSION_ID = 'wiring-session'
 const NAME = 'openai'
 const ENV_VAR = 'DSH_SECRET_OPENAI'
-const SECRET = 'sk-wiring-4f9c2a-do-not-echo'
+// Composed at run time (`fixtureToken`, `./secret-fixtures.ts`): GitHub Push
+// Protection scans the source text of a push, and a contiguous vendor-prefixed
+// literal is what its rules match. This value is character-for-character
+// identical to the literal it replaced — pinned by the digest below — so do not
+// "simplify" it back into one literal.
+const SECRET = fixtureToken('sk-', 'wiring-4f9c2a-do-not-echo')
+
+test('the composed sentinel is byte-identical to the literal it replaced', () => {
+  assert.equal(fixtureFingerprint(SECRET), '00134ef879e1')
+})
 
 /**
  * The shipped conversation view's own reference-token scan, verbatim

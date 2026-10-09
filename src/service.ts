@@ -5,11 +5,18 @@ import { approvedResult, mapNonApproved, planGrant } from './decisions.ts'
 import { GrantStore, type Grant, type GrantSessionLike } from './grants.ts'
 import { HistoryStore } from './history.ts'
 import {
+  describeValueShape,
   effectiveEnvVar,
   isCredentialName,
   isExposedEnvVar,
+  modelKeyFromText,
+  NAME_DEADLINE_MS,
+  provisionalKey,
   RECORD_SCOPE,
   recordKey,
+  recordKeyId,
+  renderNamingPrompt,
+  type SecretValueShape,
   validateManage,
   validateRequest,
 } from './naming.ts'
@@ -186,6 +193,23 @@ export class SecretFailure extends Error {
   }
 }
 
+/**
+ * One optional, deadline-bounded request for a credential key the human left blank.
+ *
+ * The request carries exactly the two strings a model may see (built by
+ * `renderNamingPrompt` from the human's title and a value *shape*), and the
+ * session id only so the wiring can resolve which model that session is using.
+ * There is deliberately no field for a value.
+ */
+export type NameSuggester = (request: {
+  readonly sessionId: string
+  /** Model-facing instruction; redacted facts only. */
+  readonly system: string
+  /** Model-facing text: the human's title plus the shape tokens, never the value. */
+  readonly user: string
+  readonly signal: AbortSignal
+}) => Promise<string | undefined>
+
 /** Everything the service reads from its host. */
 export interface SecretServiceDeps {
   readonly config: SecretConfig
@@ -194,6 +218,15 @@ export interface SecretServiceDeps {
   readonly envs: EnvPort
   /** Staged secrets a human attached and has not sent yet. */
   readonly attachments: AttachStore
+  /**
+   * Optional model suggestion for a credential key the human left blank.
+   *
+   * Absent (no `llm` service in the profile, or a test harness), the local rule
+   * alone decides — an attach never depends on a model being there.
+   */
+  readonly nameSuggester?: NameSuggester
+  /** Overrides {@link NAME_DEADLINE_MS}; tests use a tiny value. */
+  readonly nameDeadlineMs?: number
   /**
    * The session-scoped, memory-only record of what happened to every secret
    * this session ever carried. It is the only place a released, discarded,
@@ -455,7 +488,12 @@ export class SecretService {
    * @param raw - parsed JSON body of the attach request.
    */
   async attach(raw: unknown): Promise<AttachOutcome> {
-    const parsed = parseAttach(raw)
+    // R1: a blank credential key is completed here, before anything is staged.
+    // The key has to exist before the marker is inserted into the draft (the
+    // marker is durable message text), which is why this happens at attach time
+    // and never after the message was sent.
+    const completed = await this.resolveAttachKey(raw)
+    const parsed = parseAttach(completed)
     if (!parsed.ok) return { ok: false, status: 400, error: parsed.error }
     const input = parsed.value
     const session = this.deps.sessionById(input.sessionId)
@@ -518,6 +556,101 @@ export class SecretService {
     return {
       ok: true,
       outcome: { variable: input.envVar, scope: input.scope, replaced: written.replaced },
+    }
+  }
+
+  /**
+   * Complete an attach body whose credential key was left blank (R1).
+   *
+   * The local rule runs first and always produces a legal, unused key, so this
+   * method cannot fail and an attach can never be blocked (or lost) because a
+   * model was slow, absent or unhelpful. A model suggestion is best-effort:
+   * deadline-bounded, validated against the same contract, and only accepted
+   * when it is free.
+   *
+   * An explicit key is passed through untouched — `parseAttach` keeps reporting
+   * its own message for a malformed one, exactly as before this round.
+   *
+   * @param raw - the parsed JSON body of the attach request, as the route read it.
+   * @returns the body to validate, with `name` (and an empty `label`) filled in.
+   */
+  private async resolveAttachKey(raw: unknown): Promise<unknown> {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return raw
+    const record = raw as Record<string, unknown>
+    const given = typeof record.name === 'string' ? record.name.trim() : ''
+    if (given.length > 0) return raw
+
+    const label = typeof record.label === 'string' ? record.label.trim() : ''
+    const value = typeof record.value === 'string' ? record.value : ''
+    const sessionId = typeof record.sessionId === 'string' ? record.sessionId : ''
+    const shape = describeValueShape(value)
+    const taken = await this.takenKeys(sessionId)
+    const fallback = provisionalKey(label, shape, taken)
+    const suggested = await this.suggestKey(sessionId, label, shape)
+    const chosen =
+      suggested !== undefined && !taken.has(suggested) && !taken.has(recordKeyId(suggested))
+        ? suggested
+        : fallback
+    // The title falls back to the key when the human left it empty, which is
+    // what `label ?? name` used to do before the key itself became optional.
+    return { ...record, name: chosen, label: label.length > 0 ? label : chosen }
+  }
+
+  /**
+   * Every credential key and record id this attach must not collide with.
+   *
+   * Both halves, because two keys can share one record key (`a_b` and `a-b`).
+   * Enumeration is optional to the store, so a store that cannot list records
+   * simply contributes nothing (the session's own keys still count).
+   */
+  private async takenKeys(sessionId: string): Promise<Set<string>> {
+    const taken = new Set<string>()
+    try {
+      for (const entry of await this.storedEntries()) taken.add(entry.name)
+    } catch {
+      // A store that cannot enumerate is not an error here: nothing to avoid.
+    }
+    for (const staged of this.deps.attachments.list(sessionId)) taken.add(staged.name)
+    const session = this.deps.sessionById(sessionId)
+    if (session !== undefined) {
+      for (const name of this.grants.validNames(session)) taken.add(name)
+    }
+    for (const name of [...taken]) taken.add(recordKeyId(name))
+    return taken
+  }
+
+  /**
+   * Ask the session's own model for a key, inside a hard deadline.
+   *
+   * Nothing here touches a session: the suggester receives the redacted prompt
+   * and the session id only, and the wiring that implements it (see
+   * `src/index.ts`) passes no `sessionId` to the model and appends no event.
+   * The abort controller bounds both a late answer and the request itself.
+   */
+  private async suggestKey(sessionId: string, label: string, shape: SecretValueShape): Promise<string | undefined> {
+    const suggest = this.deps.nameSuggester
+    if (suggest === undefined) return undefined
+    const deadlineMs = this.deps.nameDeadlineMs ?? NAME_DEADLINE_MS
+    if (!(deadlineMs > 0)) return undefined
+    const prompt = renderNamingPrompt(label, shape)
+    const controller = new AbortController()
+    let cancel: () => void = () => undefined
+    const deadline = new Promise<undefined>((resolve) => {
+      cancel = this.deps.schedule(deadlineMs, () => {
+        resolve(undefined)
+      })
+    })
+    try {
+      const answer = await Promise.race([
+        suggest({ sessionId, system: prompt.system, user: prompt.user, signal: controller.signal }).catch(
+          () => undefined,
+        ),
+        deadline,
+      ])
+      return answer === undefined ? undefined : modelKeyFromText(answer)
+    } finally {
+      cancel()
+      controller.abort()
     }
   }
 

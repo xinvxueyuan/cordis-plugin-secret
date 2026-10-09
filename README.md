@@ -44,7 +44,7 @@
 - **模型侧的改写由注记承担，且注记会落盘（按 source 去重）**：`agent/pre-step` **不改**用户消息正文（harness 会让改写落盘，见「人类主动附加密钥（反方向）→ 模型侧到底看到什么」），而是追加一条只含变量名的注记，其中**逐变量逐字**写出「正文里的 `@DSH_SECRET_*` 即该变量，模型侧写作 `[secret DSH_SECRET_*]`；它不是文件路径」。注记是 durable 的 `user/message`（因此在对话流里是一行注入说明），且**按自身 source 去重**：模型可见 surface 上已有同一条就不再追加，重复引入同一标记不会堆叠。
 - **会在会话日志里留下变量名标记**：人类发送的消息本身（含 `@DSH_SECRET_OPENAI` 这种**变量名**）作为普通 `user/message` 事件持久化。变量名不是密钥材料，但它会长期留在日志里。
 - **会挂 10 条 `/api` 路由**（**9 个精确路径**：`/api/secret.manage` 一条路径两种方法，**单次注册**、按 `request.method` 分派——真实注册表按精确路径建键、与 `methods` 无关，所以同一条路径注册两次会在装配时抛 `exact Fetch route ... is already registered` 并让整个插件条目不激活；0.4.0 正是这样在实机上不激活，0.4.1 修掉）：`/api/secret.pending`(GET)、`/api/secret.attached`(GET)、`/api/secret.attach`(POST)、`/api/secret.release`(POST)、`/api/secret.answer`(POST)，以及 0.3.0 新增的三条——`/api/secret.history`(GET，本会话历史流水)、`/api/secret.available`(GET，`@` 菜单的可用密钥)、`/api/secret.adopt`(POST，把凭据库里的持久记录登记到本会话)，以及 0.4.0 新增的 `manage`(GET 管理面列表 / POST 执行一个管理动作)。全部位于 `ctx.connection` 的信任栅栏内（本机 / 可信 Host、同源标记、签名浏览器 Cookie）。值只出现在 `attach`、`answer` 与（仅 `action:"value"` 时）`manage` 的请求体里；其余路由都**不回传值**，`adopt` 的取值也由宿主自己经 `credentials.resolve` 完成，值不跨线。
-- **会注册客户端座位与一个引用源**：`conversation.chat.node`（key `secret-request`）、`tool.call.toolview`（key `secret_request` 的 `null` 占位）、`conversation.input.left`（id `secret-attach-toggle`）、`conversation.input.overlay`（id `secret-attach-capsule`），外加一个名为 `secret` 的 `InputTriggerSource` 与 locale 命名空间 `secretAttach`。0.3.0 起再增加三处**增量**注册：`conversation.chat.node`（key `sr-chip`，消息旁的旁挂胶囊）、`sidebarRightTabs` 的 `secret-attach-detail` 类型，以及它的**正文座位** `sidebar.right.pane.tab`（key `@xinvxueyuan/cordis-plugin-secret/secret-attach-detail`）。该页签的**标题不另注册座位**：注册表走 fallback 取类型自己声明的 `title(address)`，即**变量名**（`src/client/entry.ts:3555`），所以用户看到的结果是对的。`tool.call.toolview` 只替换本插件自己那次调用的泛型工具行，不触碰别的工具；其余都是增量座位。0.4.0 再增加两处**增量**注册：`conversation.chat.node`（key `sr-manage`，Agent 侧的管理确认卡）与 `tool.call.toolview`（key `secret_manage` 的 `null` 占位）；同样只影响本插件自己那次调用，且管理面的三个新面都在**既有胶囊组件**里，不新增座位、不新增引用源，`dsh.client.inject` 也不变。
+- **会注册客户端座位与一个引用源**：`conversation.chat.node`（key `secret-request`）、`tool.call.toolview`（key `secret_request` 的 `null` 占位）、`conversation.input.left`（id `secret-attach-toggle`）、`conversation.input.overlay`（id `secret-attach-capsule`），外加一个名为 `secret` 的 `InputTriggerSource` 与 locale 命名空间 `secretAttach`。0.3.0 起再增加三处**增量**注册：`conversation.chat.node`（key `sr-chip`，消息旁的旁挂胶囊）、`sidebarRightTabs` 的 `secret-attach-detail` 类型，以及它的**正文座位** `sidebar.right.pane.tab`（key `@xinvxueyuan/cordis-plugin-secret/secret-attach-detail`）。该页签的**标题不另注册座位**：注册表走 fallback 取类型自己声明的 `title(address)`，即**变量名**（`src/client/entry.ts:3555`），所以用户看到的结果是对的。`tool.call.toolview` 只替换本插件自己那次调用的泛型工具行，不触碰别的工具；其余都是增量座位。0.4.0 再增加两处**增量**注册：`conversation.chat.node`（key `sr-manage`，Agent 侧的管理确认卡）与 `tool.call.toolview`（key `secret_manage` 的 `null` 占位）；同样只影响本插件自己那次调用，且管理面的三个新面都在**既有胶囊组件**里，不新增座位、不新增引用源，`dsh.client.inject` 也不变。**0.5.0 再增加一处增量注册**：`conversation.input.right`（id `secret-paste-composer`，输入区的「粘贴」动作，见「0.5.0 的四项」第 2 条）；仍然只增座位、不新增引用源，`dsh.client.inject` 不变。
 - **不做的事**：插件自身不 spawn 子进程、不读写仓库文件、不发起网络请求（除被 Harness 自己的 API 通道承载的上面列出的 10 条同源路由外），也没有任何遥测。
 
 ## 安装
@@ -325,6 +325,41 @@ Invoke-RestMethod "http://127.0.0.1:<port>/api/secret.available?sessionId=$env:D
 if ($env:DSH_SECRET_OPENAI) { "present length=$($env:DSH_SECRET_OPENAI.Length)" } else { "absent" }
 ```
 
+### 0.5.0 的四项（本轮，将随 0.5.0 发布）
+
+> **版本说明**：截至本轮开发段，`package.json` 仍是 **0.4.3**，**0.5.0 尚未 bump、也未发布**；本节的「0.5.0」指本轮这些特性**将随 0.5.0 发布**。发布事实与 registry 现状只在「npm 发布」一节按已发布版本写。
+> 本节示例里的密钥值一律是**假值**（形如 `sk-EXAMPLE-…`），不是任何真实凭据。
+
+#### 1. 密钥键改为可选 + 附加时的会话外 AI 命名（R1）
+
+- **契约放宽**：`secret_attach` 的 `name` 由必填变为**可选**。空或缺失 ⇒ 由 Host 自动命名（旧客户端与直接调用同样得 200）；**非空但非法**的键照旧走原来的错误分支被拒（`ATTACH_KEY_RE`）。
+- **命名是「会话外」调用**：经 `llm.stream({ purpose: 'session-title', … })`，**不传 `sessionId`、不传 `tools`、不 append 任何会话事件**；提示词只带标题与**值形态**（长度 / 字符集 / 类别三类 token，**绝不含明文**）。
+- **有界且不阻塞发送**：deadline **1500ms**；超时、模型答案不合法、profile 里没有 llm，一律回落到**本地兜底键**（标题 slug → 形态默认 → 冲突时加 `-2…-99` 去重）。有「模型挂起也不拖住 attach」的单测（`elapsed < 500ms`）。
+- **llm 不在硬依赖里**：用 `ctx.get('llm')` **可选获取**（不进 `inject` 硬依赖），所以没有 llm 的 profile **插件仍激活、attach 仍成功**（有正对照测试）。
+- **未实现（如实）**：定案里「**晚到结果润色显示标题**」这一条**没有实现**。原因：键在插入胶囊（即报文标记）**之前**就已定型，不存在一个「不改报文」的安全作用点可以回填标题；因此这是**不做**，而不是"待办"。
+
+#### 2. 输入框右侧「粘贴」动作 + 值输入框粘贴命中即转胶囊（R2 / R3）
+
+- **覆盖面（我方控件，共 7 个可编辑字段）**：附加面板的标题 / 凭据键 / 密钥内容、管理面的改值、管理确认卡的「新密钥内容」、索要卡片的值 / 「其他指示」多行框，各有一个 suffix **「粘贴」**按钮：`type="button"`、`aria-label` 与可见文本同为「粘贴」、`mousedown` 被 `preventDefault`（**不抢焦点**），点击的**最后一步把焦点交还该字段**。剪贴板不可用 / 被拒 / 为空时给固定**双语**文案并引导手动粘贴，**不静默失败、不抛未捕获异常**。
+- **写入与校验同路**：粘贴文本 `trim()` 后调用**该字段自己 `onChange` 用的同一个 setter**（不 `dispatchEvent`、不直接改 DOM），因此既有校验照旧生效——例如粘进凭据键的非法值仍在提交时走 `ATTACH_KEY_RE` → `badKey`，而不是绕过校验。
+- **R3（仅值输入框，且为真登记）**：只有**胶囊的「密钥内容」**这一个值输入框在粘贴时做**机械判定**（`src/privacy.ts` 的规则集：厂商前缀 / JWT / PEM / 长且字符集集中 / 信息熵阈值，外加 URL·路径·邮箱·裸域名·CJK·多行·标识符等排除项；纯函数、不调模型）；命中即走该表单**同一条 attach 注册路径**（真登记：同一校验、同一 `POST /api/secret.attach`），成功后字段清空并按既有行为切到详情面；未命中则按普通文本写入（原生粘贴路径**不接管**）。
+- **边界（如实）**：改值面、管理确认卡（`secret_manage`）与索要卡片（`/api/secret.answer`）**不做**自动登记——对它们做会变成「假登记」。`@DSH_SECRET_*` / `[secret …]` / `dsh-resource://` 这类**引用文本**在分类器**第一步**就被排除，绝不会被当成明文再登记一次。任何失败路径（剪贴板读不到、登记被拒、网络不可达）都把粘进来的文本**放回字段**，不丢内容。
+- **composer 侧（R2 的输入区半边）**：在官方座位 `conversation.input.right` 放一个「粘贴」动作，点击经 `InputActions.insertText(text, captureInsertion())` **插入到光标处**，走编辑器自身的 onChange/校验。**能力边界（如实）**：① 只能 `captureInsertion` / `insertText`，**没有写受控 value 的能力**；② 只能在官方座位放自己的按钮，**第三方插件自建的输入框不在覆盖范围内**；③ 无 caret 或编辑器拒绝插入时给手动粘贴提示，不抛错、不抢焦点。
+
+#### 3. 胶囊 ✕ ＝ 本会话解绑（R4）
+
+- **语义**：✕ = **解绑**（`staged` → release、`bound` → manage `unbind`），即**从本会话移除**；**凭据库里的持久记录永不触碰**。其文案与 `aria-label` 全文**不含「删除」二字**（真删仍只在危险面、需 `confirm:true`）。
+- **会话级后果（诚实结果）**：解绑是会话级的，所以同一变量的**所有**消息旁胶囊都会消失——这由「胶囊状态从实时有效性推导」保证，是**设计结果而非缺陷**。
+- **bound 的 ✕ 不弹二次确认**：宿主 `src/service.ts:1050-1053` 明写该路由上「人的点击本身就是确认」；需要二次确认的只有真删那一档。
+- **显隐**：默认隐藏，`:hover` / `:focus-within` 显示，`@media (hover:none)` 下常显；`aria-label` 形如 `移除 @DSH_SECRET_X`（**不含明文**）。
+- **历史缺陷与修复（如实留痕）**：**0.4.x 的胶囊行在真实页面会把原始 i18n key 渲染成文案与 `aria-label`**（行内翻译绑到了 chat namespace，取不到本插件的键）——也就是**那一版该行的可访问名是坏的**、读屏会念出 key 而不是「移除 …」。**0.5.0 用 `rowT` 探测回落修好**：取不到本插件的键就回落自带字面表，不再渲染 key。
+
+#### 4. 输入区选区「转为密钥」（R5）
+
+- **行为以按下时刻为准**：按下时用 `captureInsertion()` 的 `start !== end` 判断"有选区"；选中文本经 `useInput` 的 `draft` + `occurrences` 由 detect→clipboard 换算得到。**任何不一致都退回原「附密钥」行为**（不猜、不登记、不改写草稿）。
+- **默认作用域 = `session`**：附加面板与转换路径**共用同一个常量** `DEFAULT_ATTACH_SCOPE`（`session`），即**仅本会话内存有效**；空键 / 空标题交给 R1 的自动命名。
+- **实时文案是契约外手段（重要）**：公开 API 只能**按下时**读取选区、**没有选区变化通知**，所以按钮的实时文案依赖**契约外的 DOM `selectionchange` 监听**。失效模式、退回行为与「需真人确认」见「边界与已知限制 → 已知限制」里那一条；**行为永不依赖它**。
+
 ### 已知限制（如实记录）
 
 - **对话框那条消息上的胶囊是 `data-ref-chip="file"`**，`openFile('DSH_SECRET_OPENAI')` 仍是它唯一的点击路径。**0.3.0 起的现状**：插件已注册 `sidebarRightTabs` 的 `secret-attach-detail` 类型**接管这次打开**，所以点它会开出**右侧栏的详情页**（见「0.3.0 的四项增强 → 原胶囊的接管是长度竞争」）；0.2.x 的行为是打开一个不存在的文件（无害但不正确；不泄露任何东西——变量名本来就在那里可见），该行为作为历史如实保留。**注意这条接管是"当前 pattern 最长"的长度竞争结果，不是契约。**原因（点击目标为何无法从插件侧直接改写）：用户气泡的正文由 `dsh-client-ui-primitives` 的 `projectUserText` 独家渲染，它对 `@token` 形状**硬编码**为文件引用并挂 `openFile`；ui-chat 的消息管线没有可注册的引用种类（能接住点击的 `openReference` 只作用于**草稿编辑器**，不作用于转录气泡）。
@@ -416,7 +451,7 @@ if ($env:DSH_SECRET_OPENAI) { "present length=$($env:DSH_SECRET_OPENAI.Length)" 
    ```sh
    npm run typecheck && npm test
    ```
-   共 8 个测试文件 / 129 个用例。管理面在 `test/register.test.ts`：两个工具的参数集（逐字断言没有 `value`）、`list`/`unbind`/`delete`/`scope`/`value` 五个动作、五条人类侧路径、降级两个按钮（文案与线上动作都不同）、真删两档（缺 `confirm` 零副作用）、列表两个方向的 `origin` 与委派子代理的可达性注意（含根代理的正对照）；**0.4.1 起还有实施真实注册表规则的严格注册表**——它断言 9 条精确路径各注册一次、`/api/secret.manage` 一行两方法，并在修复前的形态上以**同一条** `already registered` 错误失败（这就是 0.4.0 漏网的那个门）；**0.4.2 起新增两条密钥输入抑制用例**（`test/client-card.test.ts` / `test/client-attach.test.ts`）——它们逐面枚举渲染出的字段并断言那一套抑制属性与只读守卫，在修复前的形态上逐条列出缺口（正对照）；**0.4.3 起再加一条标识符字段用例**——断言凭据键/标题用 `autocomplete="off"`、无稳定 `id`/`name`、隐式 label 关联 + 同文本 `aria-label`、带只读守卫，并在 0.4.2 的形态上失败（正对照）。四类新历史事件在 `test/history.test.ts`。`npm test` 若挂住，按仓库红线处理：**先查泄漏**（本插件自己的 teardown/定时器），临时排障才用 `node --test --test-force-exit`，**不得按进程名清场**。
+   共 8 个测试文件 / **171 个用例**（这两个数字来自 0.5.0 开发段本人亲跑的 `npm test` 原始输出：`tests 171 / pass 171 / fail 0`，自然退出；见「开发」一节）。管理面在 `test/register.test.ts`：两个工具的参数集（逐字断言没有 `value`）、`list`/`unbind`/`delete`/`scope`/`value` 五个动作、五条人类侧路径、降级两个按钮（文案与线上动作都不同）、真删两档（缺 `confirm` 零副作用）、列表两个方向的 `origin` 与委派子代理的可达性注意（含根代理的正对照）；**0.4.1 起还有实施真实注册表规则的严格注册表**——它断言 9 条精确路径各注册一次、`/api/secret.manage` 一行两方法，并在修复前的形态上以**同一条** `already registered` 错误失败（这就是 0.4.0 漏网的那个门）；**0.4.2 起新增两条密钥输入抑制用例**（`test/client-card.test.ts` / `test/client-attach.test.ts`）——它们逐面枚举渲染出的字段并断言那一套抑制属性与只读守卫，在修复前的形态上逐条列出缺口（正对照）；**0.4.3 起再加一条标识符字段用例**——断言凭据键/标题用 `autocomplete="off"`、无稳定 `id`/`name`、隐式 label 关联 + 同文本 `aria-label`、带只读守卫，并在 0.4.2 的形态上失败（正对照）。四类新历史事件在 `test/history.test.ts`。`npm test` 若挂住，按仓库红线处理：**先查泄漏**（本插件自己的 teardown/定时器），临时排障才用 `node --test --test-force-exit`，**不得按进程名清场**。
 2. **活体（需真人；管理面每次都向 Host 现问，改完刷新即可再核对）**：按上面「人类侧信息框（五条路径）」逐条点一遍——列举（两个分区读得清）、改值（掩码框）、改作用域（两个降级按钮各点一次，核对其后果不同）、解绑（凭据库不动）、真删（两次点击）。断言点是上面「需真人确认」列出的那些：不可用的动作不出现；改值后活体 shell 里真的是新值；`scope → persistent` 真的写库；真删后该行从库侧分区消失、会话侧作用域如实变「仅本次会话」、历史多一条 `deleted`、其它三条外来记录一字未动；子代理调 `list` 不挂起、调四个写动作得到结构化 `DELEGATED_CALLER`（无对话框）。
 3. **浏览器侧（0.4.2 起，只能真人做）**：在真实浏览器里打开四个密钥输入面**与两个标识符输入（凭据键、标题）**，逐条核「需真人确认」里那几项——是否还弹自动填充建议（标识符字段尤其要看历史值下拉是否消失）、Chromium 是否还给"生成强密码"建议、是否还弹"保存密码？"、已装的密码管理器扩展是否仍捕获、以及**聚焦之后能否正常键入**（只读守卫的代价）。
 4. **旧版对照**：`git stash` 或 checkout `v0.3.0` 后 `git diff v0.3.0 -- src test` 可看到本轮的全部改动面；`.credentials.yaml` 的基线（大小与 SHA256）应在复测前后逐字节不变。
@@ -455,6 +490,11 @@ if ($env:DSH_SECRET_OPENAI) { "present length=$($env:DSH_SECRET_OPENAI.Length)" 
 
 ### 已知限制（如实记录）
 
+- **粘贴动作（R2）的覆盖边界（如实）**：composer 侧只能把文本 `insertText` 到光标处，**没有受控 value 写入能力**；**第三方插件自建的输入框不在覆盖范围内**——我们只能在官方座位放自己的按钮。我方那 7 个可编辑字段则是「与 `onChange` 同路」的受控写入（走同一个 setter）。
+- **粘贴自动转胶囊（R3）只在值输入框、且只有真登记**：只覆盖胶囊的「密钥内容」；改值面 / 管理确认卡 / 索要卡片**都不做**自动登记，`@DSH_SECRET_*` 等引用文本被分类器第一步排除（引用是名字，不是材质）。
+- **`selectionchange` 实时文案是契约外手段（R5 的 C）——需真人确认**：公开面只能**按需**读取选区（pull 式），**选区变化没有通知**；因此那条按钮的实时文案依赖对 DOM `selectionchange` 的监听。**失效模式**：① 非浏览器环境（没有 `document`）**不注册**，行为退回「按下时切换文案」；② 回调抛错被吞掉，同样退回；③ 没有可编辑元素聚焦时回答「无信息」（不猜）；④ 选区变化不生成本插件的事件，文案可能**滞后一个事件循环**。**关键（不得当成已验证）**：注册这一层在本套件里**未经执行验证**（测试用的 React stub 把 `useEffect` 置为 no-op，用例只断言到 props 层），**也从未在活体 DOM 上验证过** ⇒ **需真人确认**；并且**任何行为都不依赖 C**：C 只影响文案的实时性，不影响按下时刻的判定、登记与退回。
+- **测试缝的完整新增键（全部 test-only，无生产路径读取）**：`__cordisSecretAttach` 在 0.5.0 新增 `ATTACH_CSS`、8 个 privacy 键（`PRIVACY_RULES` / `PRIVACY_EXCLUSIONS` / `PRIVACY_THRESHOLDS` / `classifyPastedText` / `entropyBitsPerChar` / `distinctCharCount` / `isReferenceText` / `hasCjk`）、`ATTACH_EN`、`selectedSpan`、`selectedTextIn`、`liveSelectionCue`、`DEFAULT_ATTACH_SCOPE`；全部是常量或纯函数，**无状态、不含任何值**。
+- **0.5.0 起需真人确认的项（一律不得写成已验证）**：① 浏览器里**是否真的不再弹自动填充建议 / 密码管理器是否仍捕获**（0.4.2 / 0.4.3 的抑制属性只能机械断言，现场行为仍要人看）；② **剪贴板读取的授权提示**（`navigator.clipboard.readText()` 是否被拒、提示是否可理解）；③ **R5 的实时文案**（契约外 `selectionchange`，见上一条）；④ composer「粘贴」插入后的**编辑器焦点与光标位置**观感。
 - **转录气泡里的胶囊由 shipped 代码渲染，插件改不了那次点击的目标**：`@DSH_SECRET_*` 在用户消息气泡里被 `dsh-client-ui-primitives` 的 `projectUserText` 渲染成 `data-ref-chip="file"`，点击走它硬编码的 `openFile('DSH_SECRET_OPENAI')`。**0.3.0 起**：该 `openFile` 解析出的地址（`dsh-resource://file/session/<id>/DSH_SECRET_X`）已被本插件的右栏查看器接管，因此点击打开的是**我们的详情页**；0.2.x 的行为（打开一个同名文件）作为历史如实保留，且**接管随时可能被同档更长的 pattern 抢走**（见「0.3.0 的四项增强 → 原胶囊的接管是长度竞争」）。**编辑器内（草稿）的胶囊不受影响**：那里是插件自己注册的 `secret` 引用源，点击打开只读详情胶囊。同一条 shipped 规则也适用于 `agent/pre-step` 追加的那行注记（它正文里同样含 `@DSH_SECRET_*`，因此也会显示为 file chip）。逐行证据与"为什么不存在既是 chip 又不可点的 `@` 形态"见「人类主动附加密钥（反方向）→ 已知限制」。
 - **工具结果里的 `@DSH_SECRET_*` 没有注记解释**（值无关，不是泄漏）：注记只为**本步引入的、载有标记的用户消息**追加，因此同一形状的标记出现在工具结果里时原样进入模型上下文且无注记覆盖，模型可能按"`@` = 文件路径"去解读它（会失败）。它不会因此获得任何值，也不影响绑定、授权或 shell 注入。详见「人类主动附加密钥（反方向）→ 已知限制」。
 - **`ctx.authorization` 只承载 `persistent`**：该 seam 的契约要求"本次尝试期间提交并观察到一条凭据记录"（否则 `NOT_COMMITTED`），而 `session` 授权按定义不得落盘。因此 `session` 请求走同一套对话框、但不进该 seam；`persistent` 请求完整走 `registerFlow` + `begin`。这是 seam 契约决定的取舍，不是省事。
@@ -520,6 +560,12 @@ npm test            # node --test 八个文件：
                     #                             并断言每条记录都值无关（细节扫描 0 命中）
 npm run build       # 产出 lib/（Host 半 + 浏览器产物 ./client）
 ```
+
+**0.5.0 给测试面加的东西（如实记录）**：
+
+- **新用例面**：`test/unit.test.ts` 增加 R1 的命名纯函数（形态 token 化 / 提示词不含明文 / 本地兜底键与去重 / 模型答案清洗 / 模型挂起不阻塞，deadline 内必答）与 R3 的分类器（规则、排除项、阈值，命中与不命中两侧，含 31/32 这类边界）；`test/register.test.ts` 增加 R1 的接线（无 llm 时激活且 attach 成功＝正对照、模型键被采用且**不带 sessionId / 不含明文 / 不 append 事件**、答案不可用则回落、无 route 时不调模型）；`test/client-attach.test.ts` / `test/client-card.test.ts` 增加 R1 空键与非法键、R2 的七处「粘贴」动作与 composer 座位、R3 的两条粘贴路径与三条失败分支、R4 的 ✕ 解绑与显隐、R5 的选区转换与退回。
+- **测试基础设施的一处修正（如实记录）**：渲染器从「所有组件共用一份 state 数组」改成**每个组件各自独立的 state**（对齐真实 React 语义；此前共用一个数组会让不同组件的 `useState` 槽互相污染）。
+- **测试 fetch 助手的另一处修正（如实记录）**：从「按前缀匹配」改成**按 `pathname` 精确路由**——前缀匹配会**把 `/api/secret.attached` 误配到 `/api/secret.attach`**（前者以前缀包含后者），这个历史教训留在用例注释里。
 
 ## 设计要点
 

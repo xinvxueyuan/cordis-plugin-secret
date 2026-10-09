@@ -320,3 +320,205 @@ export function validateManage(raw: unknown): ManageRequestValidation {
     },
   }
 }
+
+// ---------------------------------------------------------------------------
+// R1: a credential key the human left blank
+//
+// The rule this section exists to keep: the model is asked for a key, never for
+// a value. What crosses the boundary is the human's own title plus a *shape*
+// (length, character classes, and one public prefix-family token) — a token such
+// as `openai-like` is the category name, and no substring of the value is ever
+// part of it. Everything here is pure, so both the shape and the exact prompt
+// text are asserted in tests.
+// ---------------------------------------------------------------------------
+
+/**
+ * Deadline for one model suggestion, in milliseconds.
+ *
+ * Hardcoded on purpose (round 7 settled that the key is fixed before the marker
+ * is inserted, so the attach may wait a *little* for a better name — never long
+ * enough for a human to notice a stall). `SecretServiceDeps.nameDeadlineMs`
+ * overrides it so tests can use a tiny value.
+ */
+export const NAME_DEADLINE_MS = 1500
+
+/** The public prefix family a value's own characters reveal; a fixed token, never the prefix. */
+export type SecretShapeCategory =
+  | 'openai-like'
+  | 'anthropic-like'
+  | 'github-pat-like'
+  | 'aws-access-key-like'
+  | 'slack-like'
+  | 'google-api-key-like'
+  | 'jwt-like'
+  | 'pem-private-key-like'
+  | 'stripe-like'
+  | 'unknown'
+
+/**
+ * The model-facing fingerprint of one value.
+ *
+ * Every field is a number or a token from a fixed vocabulary: there is no field
+ * a plaintext could travel in, which is what makes the request safe to send.
+ */
+export interface SecretValueShape {
+  readonly length: number
+  /** Character-class class of the value (never the characters themselves). */
+  readonly charset: 'base64url' | 'hex' | 'mixed' | 'other'
+  readonly category: SecretShapeCategory
+}
+
+/** Prefix families of well-known credential formats, longest match first. */
+const SHAPE_PREFIXES: readonly { readonly category: Exclude<SecretShapeCategory, 'unknown'>; readonly prefixes: readonly string[] }[] = [
+  { category: 'pem-private-key-like', prefixes: ['-----BEGIN'] },
+  { category: 'anthropic-like', prefixes: ['sk-ant-'] },
+  { category: 'stripe-like', prefixes: ['sk_live_', 'rk_live_', 'sk_test_'] },
+  { category: 'openai-like', prefixes: ['sk-'] },
+  { category: 'github-pat-like', prefixes: ['github_pat_', 'ghp_', 'gho_', 'ghs_', 'ghu_'] },
+  { category: 'aws-access-key-like', prefixes: ['AKIA', 'ASIA'] },
+  { category: 'slack-like', prefixes: ['xoxb-', 'xoxp-', 'xoxa-', 'xoxr-'] },
+  { category: 'google-api-key-like', prefixes: ['AIza', 'ya29.'] },
+  { category: 'jwt-like', prefixes: ['eyJ'] },
+]
+
+/** The fallback key each public category suggests, before de-duplication. */
+const KEY_BY_CATEGORY: Readonly<Record<Exclude<SecretShapeCategory, 'unknown'>, string>> = {
+  'openai-like': 'openai-key',
+  'anthropic-like': 'anthropic-key',
+  'github-pat-like': 'github-token',
+  'aws-access-key-like': 'aws-access-key',
+  'slack-like': 'slack-token',
+  'google-api-key-like': 'google-api-key',
+  'jwt-like': 'jwt-token',
+  'pem-private-key-like': 'private-key',
+  'stripe-like': 'stripe-key',
+}
+
+/** The longest key this plugin will mint (leaves room for a `-99` de-duplication suffix). */
+const MAX_MINTED_KEY = 36
+
+function categoryOf(value: string): SecretShapeCategory {
+  for (const family of SHAPE_PREFIXES) {
+    if (family.prefixes.some((prefix) => value.startsWith(prefix))) return family.category
+  }
+  return 'unknown'
+}
+
+function charsetOf(value: string): SecretValueShape['charset'] {
+  if (value.length === 0) return 'other'
+  if (/^[0-9a-fA-F]+$/u.test(value)) return 'hex'
+  if (/^[A-Za-z0-9_\-=+/]+$/u.test(value)) return 'base64url'
+  if (/^[\u0020-\u007E]+$/u.test(value)) return 'mixed'
+  return 'other'
+}
+
+/** The shape of one value, for the model and for the local fallback rule. */
+export function describeValueShape(value: string): SecretValueShape {
+  return {
+    length: value.length,
+    charset: charsetOf(value),
+    category: categoryOf(value),
+  }
+}
+
+/**
+ * A key derived from a human title: lowercase, dashes for every run of
+ * anything else, trimmed, and legal for {@link isCredentialName} or nothing.
+ */
+function slugOf(label: string): string | undefined {
+  const slug = label
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, '-')
+    .replace(/^-+/u, '')
+    .replace(/-+$/u, '')
+    .slice(0, MAX_MINTED_KEY)
+    .replace(/-+$/u, '')
+  return isCredentialName(slug) ? slug : undefined
+}
+
+/**
+ * Make one candidate key unique against the keys and record ids already taken.
+ *
+ * Both halves are compared because two distinct keys can share one record key
+ * (`a_b` and `a-b` both record as `a-b`), and a new key must never be minted
+ * onto an existing record.
+ */
+export function dedupeKey(base: string, taken: ReadonlySet<string>): string {
+  const root = (isCredentialName(base) ? base : 'secret').slice(0, MAX_MINTED_KEY).replace(/-+$/u, '')
+  const legalRoot = isCredentialName(root) ? root : 'secret'
+  if (!taken.has(legalRoot) && !taken.has(recordKeyId(legalRoot))) return legalRoot
+  for (let suffix = 2; suffix <= 99; suffix += 1) {
+    const candidate = `${legalRoot}-${String(suffix)}`
+    if (!taken.has(candidate) && !taken.has(recordKeyId(candidate))) return candidate
+  }
+  return `${legalRoot}-99`
+}
+
+/**
+ * The key this plugin uses when no model is available, or when the model's
+ * answer is late, empty or unusable.
+ *
+ * Follows the settled order: the value's public category first (it is the
+ * strongest signal about *which* provider a key belongs to), then the human's
+ * title, then a shape-based default.
+ */
+export function provisionalKey(label: string, shape: SecretValueShape, taken: ReadonlySet<string>): string {
+  const byCategory = shape.category === 'unknown' ? undefined : KEY_BY_CATEGORY[shape.category]
+  const byLabel = slugOf(label)
+  const byShape =
+    shape.charset === 'base64url' || shape.charset === 'hex'
+      ? 'secret-token'
+      : shape.charset === 'mixed'
+        ? 'secret-key'
+        : 'secret'
+  return dedupeKey(byCategory ?? byLabel ?? byShape, taken)
+}
+
+/**
+ * The credential key inside one model answer, or undefined when the answer has
+ * none this plugin will accept.
+ *
+ * The answer is a model's text: it is reduced to its first non-empty line, then
+ * to the legal key shape, and refused outright when that shape is not a
+ * credential key — a refusal silently falls back to the local rule. A line with
+ * more than four words is a sentence, not a key, and is refused as well (the
+ * system instruction asks for at most four).
+ */
+export function modelKeyFromText(text: string): string | undefined {
+  const line = text
+    .split(/\r?\n/u)
+    .map((candidate) => candidate.trim())
+    .find((candidate) => candidate.length > 0)
+  if (line === undefined) return undefined
+  if (line.split(/\s+/u).length > 4) return undefined
+  const cleaned = line
+    .replace(/[`'"*]/gu, ' ')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, '-')
+    .replace(/^-+/u, '')
+    .replace(/-+$/u, '')
+    .slice(0, MAX_MINTED_KEY)
+    .replace(/-+$/u, '')
+  return isCredentialName(cleaned) ? cleaned : undefined
+}
+
+/**
+ * The exact text one key suggestion sends.
+ *
+ * Two strings, and only two sources of content: the human's title (which the
+ * page shows anyway) and {@link SecretValueShape} tokens. There is deliberately
+ * no parameter here that could carry a value, so a caller cannot leak one by
+ * accident.
+ */
+export function renderNamingPrompt(label: string, shape: SecretValueShape): { readonly system: string; readonly user: string } {
+  const title = label.trim().length > 0 ? label.trim() : '(none given)'
+  return {
+    system:
+      'You name credentials. Reply with one credential key only: lowercase ASCII, kebab-case or snake_case, starting with a letter, at most four words, no quotes, no explanation, no code, no punctuation beyond - and _.',
+    user: [
+      'Suggest one credential key for a secret that is being attached to a message.',
+      `Human title: ${title}`,
+      `Value shape (plaintext is not included): length=${String(shape.length)}, charset=${shape.charset}, category=${shape.category}`,
+    ].join('\n'),
+  }
+}

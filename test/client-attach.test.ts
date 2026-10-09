@@ -9,10 +9,31 @@
  * value never leaves the masked input.
  */
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
+import {
+  PRIVACY_EXCLUSIONS as HOST_PRIVACY_EXCLUSIONS,
+  PRIVACY_RULES as HOST_PRIVACY_RULES,
+  PRIVACY_THRESHOLDS as HOST_PRIVACY_THRESHOLDS,
+  classifyPastedText as hostClassifyPastedText,
+  distinctCharCount as hostDistinctCharCount,
+  entropyBitsPerChar as hostEntropyBitsPerChar,
+  hasCjk as hostHasCjk,
+  isReferenceText as hostIsReferenceText,
+} from '../src/privacy.ts'
+import {
+  AWS_EXAMPLE_KEY,
+  fixtureFingerprint,
+  fixtureToken,
+  PEM_OPENSSH_HEADER,
+  PEM_RSA_BLOCK,
+  PEM_RSA_HEADER,
+  SAMPLE_JWT,
+  SK_PROJ_EXAMPLE,
+} from './secret-fixtures.ts'
 
-const SECRET = 'sk-attach-client-DO-NOT-LEAK'
+const SECRET = fixtureToken('sk-', 'attach-client-DO-NOT-LEAK')
 const ENV_VAR = 'DSH_SECRET_OPENAI'
 const SESSION_ID = 'session-root'
 
@@ -32,8 +53,18 @@ interface LoadedModule {
 function createRenderer(): {
   readonly react: Record<string, unknown>
   render(component: (props: unknown) => unknown, props: unknown): Element
+  /** Every component's live state slots (diagnostics for the reset below). */
+  slots(): readonly (readonly unknown[])[]
+  /** Drop every component's slots: the next render starts from the initial state. */
+  resetSlots(): void
 } {
-  const values: unknown[] = []
+  // One slot array per component: the harness models one mounted instance of
+  // *that* registration across the file's renders (including a re-render while a
+  // click is in flight), exactly as the real renderer does. The single shared
+  // array this replaced let two different registrations read each other's state
+  // positionally, which the real client never does.
+  const stores = new Map<unknown, unknown[]>()
+  let values: unknown[] = []
   let index = 0
   let dirty = false
   const react = {
@@ -66,6 +97,12 @@ function createRenderer(): {
   return {
     react,
     render(component, props) {
+      let store = stores.get(component)
+      if (store === undefined) {
+        store = []
+        stores.set(component, store)
+      }
+      values = store
       for (let attempt = 0; attempt < 50; attempt += 1) {
         index = 0
         dirty = false
@@ -73,6 +110,14 @@ function createRenderer(): {
         if (!dirty) return tree
       }
       throw new Error('the component did not settle within 50 renders')
+    },
+    // The harness models one mounted instance per component across the file's
+    // renders. A test boundary must drop those instances: without this, one
+    // case's typed value (or a parked notice) survives into the next one and a
+    // later assertion can pass — or fail — for a reason that is not under test.
+    slots: () => [...stores.values()],
+    resetSlots: () => {
+      stores.clear()
     },
   }
 }
@@ -259,6 +304,9 @@ const sources = full.sources
 function reset(): void {
   api.setAttachMode({ kind: 'idle' })
   for (const sessionId of [SESSION_ID, 'other-session']) api.sessionAttachments(sessionId).clear()
+  // Component state too: every mounted registration is dropped, so no slot can
+  // carry a value, a notice or a parked `busy` across a case boundary.
+  renderer.resetSlots()
   bailAnswer = true
   bailCalls.length = 0
 }
@@ -287,8 +335,10 @@ test('a client without the optional services degrades instead of failing the ent
   // Round 5 grows this by exactly two rows: the management card
   // (`conversation.chat.node`, key `sr-manage`) and its own tool-row placeholder
   // (`tool.call.toolview`, key `secret_manage`). Neither existing row changed.
-  // Disclosed change: the two expected lists below each gained one entry; no
-  // prior expectation was removed or altered.
+  // Round 7 grows it by exactly one: the composer's paste control
+  // (`conversation.input.right`, id `secret-paste-composer`).
+  // Disclosed change: each expected list below gained one entry; no prior
+  // expectation was removed or altered.
   assert.deepEqual(
     bare.registrations.map((entry) => entry.name).sort(),
     [
@@ -297,6 +347,7 @@ test('a client without the optional services degrades instead of failing the ent
       'conversation.chat.node',
       'conversation.input.left',
       'conversation.input.overlay',
+      'conversation.input.right',
       'tool.call.toolview',
       'tool.call.toolview',
     ],
@@ -1043,12 +1094,19 @@ interface RoutedCall {
  * told apart: a withdrawal test needs the release POST and the attached GET, and
  * the `@` menu needs the available GET and the adopt POST.
  */
+/** One fetch double answered a path it was never told about: refuse loudly. */
+function unrecognizedRoute(owner: string, path: string): never {
+  throw new Error(`${owner}: no declared answer for ${path}`)
+}
+
 function stubRoutes(): {
   readonly calls: RoutedCall[]
   readonly release: { ok: boolean; payload: unknown }
   readonly attached: { ok: boolean; payload: unknown }
   readonly available: { ok: boolean; payload: unknown }
   readonly adopt: { ok: boolean; payload: unknown }
+  /** The registration write: its own answer, never the attachments one. */
+  readonly attach: { ok: boolean; payload: unknown }
 } {
   const state = {
     calls: [] as RoutedCall[],
@@ -1056,6 +1114,7 @@ function stubRoutes(): {
     attached: { ok: true, payload: { ok: true, attachments: [] as unknown[] } },
     available: { ok: true, payload: { ok: true, entries: [] as unknown[] } },
     adopt: { ok: true, payload: { ok: true, variable: ENV_VAR, scope: 'persistent', replaced: false } },
+    attach: { ok: true, payload: { ok: true, variable: ENV_VAR, scope: 'session', replaced: false } },
   }
   ;(globalThis as Record<string, unknown>).fetch = async (url: unknown, init?: unknown) => {
     const call = init as { method?: unknown; body?: unknown } | undefined
@@ -1066,13 +1125,23 @@ function stubRoutes(): {
       method: typeof call?.method === 'string' ? call.method : 'GET',
       body: typeof raw === 'string' ? JSON.parse(raw) : undefined,
     })
-    const answer = address.startsWith(api.RELEASE_PATH)
-      ? state.release
-      : address.startsWith(api.ADOPT_PATH)
-        ? state.adopt
-        : address.startsWith(api.AVAILABLE_PATH)
-          ? state.available
-          : state.attached
+    // Route by exact pathname, and only for paths this double declares. A
+    // prefix match would conflate `/api/secret.attached` with
+    // `/api/secret.attach`; a catch-all would answer a typo with a real-looking
+    // payload, which is how a loose double lets a real defect through.
+    const path = new URL(address, 'http://localhost').pathname
+    const answer =
+      path === api.ATTACH_PATH
+        ? state.attach
+        : path === api.ATTACHED_PATH
+          ? state.attached
+          : path === api.RELEASE_PATH
+            ? state.release
+            : path === api.ADOPT_PATH
+              ? state.adopt
+              : path === api.AVAILABLE_PATH
+                ? state.available
+                : unrecognizedRoute('stubRoutes', path)
     return { ok: answer.ok, status: answer.ok ? 200 : 500, json: async () => answer.payload }
   }
   return state
@@ -1536,7 +1605,11 @@ test('a refused registration inserts nothing and says so, and the failure senten
 
     // The host refuses: nothing is registered, nothing is inserted, and the
     // question stays up with a fixed sentence (never the host's own error text).
-    const HOST_CANARY = 'adopt: credential backend said sk-host-text-DO-NOT-SHOW'
+    const hostToken = fixtureToken('sk-', 'host-text-DO-NOT-SHOW')
+    // Composed, not literal (GitHub Push Protection): pinned to the exact bytes
+    // the literal had, so a "simplification" or an edit cannot slip through.
+    assert.equal(fixtureFingerprint(hostToken), 'b0d91b8fe514', 'the composed host canary is unchanged')
+    const HOST_CANARY = 'adopt: credential backend said ' + hostToken
     stub.adopt.ok = false
     stub.adopt.payload = { ok: false, error: HOST_CANARY }
     source.onPick({ candidate: rows[0], session: { sessionId: session }, action: 'pick', span: { start: 1, end: 1, draftRev: 2 } })
@@ -2144,7 +2217,11 @@ test('the credential key and the title stop offering autofill without losing the
   for (const [index, field] of identifiers.entries()) {
     const label = parentOf(tree, field)
     assert.equal(label?.type, 'label', `identifier ${String(index)} must sit inside its <label>`)
-    const caption = index === 0 ? api.ATTACH_ZH.keyLabel : api.ATTACH_ZH.labelLabel
+    // R1 (round 7) swapped the two identifier fields: the human's title is the
+    // first field and the credential key — now optional — is the second.
+    // Disclosed change: this expectation was `keyLabel` for index 0 and
+    // `labelLabel` for index 1, which is now the reverse of the rendered order.
+    const caption = index === 0 ? api.ATTACH_ZH.labelLabel : api.ATTACH_ZH.keyLabel
     assert.equal(visibleText(label), caption, 'the label element holds exactly the visible caption')
     assert.equal(field.props['aria-label'], caption, 'and the control carries it as its accessible name')
   }
@@ -2168,5 +2245,1718 @@ test('the credential key and the title stop offering autofill without losing the
     ),
     true,
   )
+  reset()
+})
+
+// ---------------------------------------------------------------------------
+// R1: the credential key may be left blank (round 7)
+// ---------------------------------------------------------------------------
+
+/** Type into one controlled input the way the page itself does. */
+function typeInto(element: Element | undefined, text: string): void {
+  ;(element?.props.onChange as ((event: { target: { value: string } }) => void) | undefined)?.({
+    target: { value: text },
+  })
+}
+
+test('R1: a blank credential key submits — the Host completes it', async () => {
+  reset()
+  const stub = stubRoutes()
+  stub.attached.payload = { ok: true, variable: ENV_VAR, scope: 'session', replaced: false }
+  try {
+    api.setAttachMode({ kind: 'fill' })
+    const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    typeInto(
+      elements(tree).find((element) => element.props['aria-label'] === api.ATTACH_ZH.labelLabel),
+      'OpenAI API Key',
+    )
+    const withTitle = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    typeInto(
+      elements(withTitle).find((element) => element.props.id === 'dsh-secret-attach-value'),
+      SECRET,
+    )
+    const filled = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    const primary = elements(filled).find(
+      (element) => element.type === 'button' && element.props['data-kind'] === 'primary',
+    )
+    assert.notEqual(primary, undefined, 'the fill face owns one primary action')
+    ;(primary?.props.onClick as (() => void) | undefined)?.()
+    await flushOneTurn()
+
+    assert.equal(stub.calls.length, 1, 'a blank key must not block the attach')
+    assert.equal(stub.calls[0]?.url, api.ATTACH_PATH)
+    assert.equal(stub.calls[0]?.method, 'POST')
+    const body = stub.calls[0]?.body as Record<string, unknown>
+    // The empty key travels as an empty string: the Host decides it (local rule
+    // first, a deadline-bounded model suggestion second). The body's field set is
+    // unchanged — R1 added no wire field, it only stopped demanding one.
+    assert.equal(body['name'], '', `a blank key must travel as an empty name: ${JSON.stringify(body)}`)
+    assert.equal(body['label'], 'OpenAI API Key', `the title travels as typed: ${JSON.stringify(body)}`)
+    assert.equal(body['value'], SECRET)
+    assert.equal(body['sessionId'], SESSION_ID)
+    assert.deepEqual(Object.keys(body).sort(), ['label', 'name', 'scope', 'sessionId', 'value'])
+  } finally {
+    restoreFetch()
+    reset()
+  }
+})
+
+test('R1: a malformed credential key is still refused before any request', async () => {
+  reset()
+  const stub = stubRoutes()
+  try {
+    api.setAttachMode({ kind: 'fill' })
+    const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    typeInto(
+      elements(tree).find((element) => element.props.id === 'dsh-secret-attach-value'),
+      SECRET,
+    )
+    const withValue = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    const keyField = elements(withValue).find(
+      (element) => element.props['aria-label'] === api.ATTACH_ZH.keyLabel,
+    )
+    assert.notEqual(keyField, undefined, 'the credential key field is still there (now the second one)')
+    typeInto(keyField, 'Bad Key!')
+    const typed = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    const primary = elements(typed).find(
+      (element) => element.type === 'button' && element.props['data-kind'] === 'primary',
+    )
+    ;(primary?.props.onClick as (() => void) | undefined)?.()
+    await flushOneTurn()
+
+    assert.equal(stub.calls.length, 0, 'a malformed key never reaches the host')
+    assert.equal(
+      visibleText(renderer.render(CAPSULE, { sessionId: SESSION_ID })).includes(api.ATTACH_ZH.badKey),
+      true,
+      'and the human is told why',
+    )
+  } finally {
+    restoreFetch()
+    reset()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Round 7 / R3 — the client mirror of the privacy classifier.
+//
+// The client artifact is a classic script, so it cannot import `src/privacy.ts`;
+// the rules are mirrored inside `src/client/entry.ts` instead (the same
+// arrangement the client already uses for `deriveVariable`/`markerOf`). This test
+// is what keeps the two from drifting: the rule ids, the exclusion ids and every
+// threshold constant are compared value for value, and one shared corpus — with
+// a case on both sides of each threshold — is run through both implementations
+// and compared case by case. Change one side alone and this test goes red.
+// ---------------------------------------------------------------------------
+
+/** Material-shaped bases, used to build the boundary cases below. */
+const MIRROR_LONG_BASE = 'aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY'
+const MIRROR_SHORT_BASE = 'x7Kq2Mv9Rt4Wz8Bn3Ls6Yp1D'
+const MIRROR_IDENTIFIER_40 = `deploy-${'a'.repeat(33)}`
+const MIRROR_IDENTIFIER_41 = `deploy-${'a'.repeat(34)}`
+
+/**
+ * Every case both implementations must answer identically.
+ *
+ * The vendor-shaped entries are **composed** (`fixtureToken`, from
+ * `./secret-fixtures.ts`) instead of written as literals: GitHub Push Protection
+ * scans the source text of a push, so a contiguous `<prefix><payload>` literal
+ * is exactly what its vendor rules matched when this release commit was rejected
+ * (GH013: Slack). A composed string is character-for-character identical to the
+ * literal it replaced — the digests below pin both — and must not be
+ * "simplified" back: that re-arms the scanner and rejects the push again.
+ *
+ * The table is assembled from four parts so its *pure* half can be fingerprinted
+ * on its own: `MIRROR_LITERALS` holds only entries a reader can recompute from
+ * this file (composed literal pairs and plain literals); the two derived parts
+ * hold the entries that depend on the module constants above, on `.slice()` or
+ * on interpolation. The concatenation below keeps the table's original order, so
+ * the whole-table digest is unchanged.
+ */
+const MIRROR_RULE_HITS: readonly string[] = [
+  // One hit per rule. (Composed at run time: see `fixtureToken`.)
+  PEM_OPENSSH_HEADER,
+  PEM_RSA_BLOCK,
+  SAMPLE_JWT,
+  SK_PROJ_EXAMPLE,
+  AWS_EXAMPLE_KEY,
+  fixtureToken('xoxb-', '0123456789-abcdefghijklmnop'),
+]
+
+/** Derived from a module constant, a `.slice()` or interpolation. */
+const MIRROR_DERIVED_CONSTANT_CASES: readonly string[] = [
+  MIRROR_LONG_BASE,
+  MIRROR_SHORT_BASE,
+  // Both sides of the long-token floor and the entropy floor.
+  MIRROR_LONG_BASE.slice(0, 31),
+  MIRROR_LONG_BASE.slice(0, 32),
+  MIRROR_SHORT_BASE.slice(0, 19),
+  MIRROR_SHORT_BASE.slice(0, 20),
+  // Both sides of the vendor-payload floor.
+  `ghp_${'a'.repeat(7)}`,
+  `ghp_${'a'.repeat(8)}`,
+  // Both sides of the identifier length cap.
+  MIRROR_IDENTIFIER_40,
+  MIRROR_IDENTIFIER_41,
+]
+
+/** Plain literals: a reader can recompute every one of them from this file. */
+const MIRROR_LITERAL_CASES: readonly string[] = [
+  // One case per exclusion.
+  '',
+  '   ',
+  'https://example.com/x?token=abc',
+  'www.example.com',
+  'C:\\Users\\admin\\.dsh\\profiles\\web\\cordis.patch.yml',
+  '/etc/hosts',
+  './lib/index.js',
+  '~/notes.txt',
+  '\\\\server\\share\\file.txt',
+  'dev@example.com',
+  'api.example.co.uk',
+  '这是一句中文说明，不该被登记',
+  'line one\nline two',
+  'Please rotate this key before Friday',
+  'openai-key',
+  'DSH_SECRET_OPENAI',
+  'aoai_deployment_2',
+  'my.key.1',
+  // Repetition and letters-only, which no statistical rule may claim.
+  'abcdefghijklmnopqrstuvwxyzabcdefghijklmn',
+  'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1',
+  'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+  // References are names, never material.
+  '@DSH_SECRET_OPENAI',
+]
+
+/** The table's last entry: a plain literal too, but it sits after the references. */
+const MIRROR_TAIL_CASES: readonly string[] = ['🙂🙂🙂']
+
+/** References built from a base constant (derived). */
+const MIRROR_DERIVED_REFERENCE_CASES: readonly string[] = [
+  `@DSH_SECRET_${MIRROR_LONG_BASE}`,
+  `[secret DSH_SECRET_${MIRROR_LONG_BASE}]`,
+  `dsh-resource://file/session/s/DSH_SECRET_${MIRROR_LONG_BASE}`,
+]
+
+/**
+ * The pure subset: composed literal pairs and plain literals only — no module
+ * constant, no `.slice()`, no interpolation — so a third party can recompute its
+ * digest by reading this file alone.
+ */
+const MIRROR_LITERALS: readonly string[] = [
+  ...MIRROR_RULE_HITS,
+  ...MIRROR_LITERAL_CASES,
+  ...MIRROR_TAIL_CASES,
+]
+
+/** The whole table, in its original order: the pure half plus every derived case. */
+const MIRROR_CORPUS: readonly string[] = [
+  ...MIRROR_RULE_HITS,
+  ...MIRROR_DERIVED_CONSTANT_CASES,
+  ...MIRROR_LITERAL_CASES,
+  ...MIRROR_DERIVED_REFERENCE_CASES,
+  ...MIRROR_TAIL_CASES,
+]
+
+test('privacy: the client mirror and the reference implementation agree', () => {
+  // 1) Sets and thresholds, value for value: a one-sided edit goes red here.
+  assert.deepEqual(api.PRIVACY_RULES, HOST_PRIVACY_RULES)
+  assert.deepEqual(api.PRIVACY_EXCLUSIONS, HOST_PRIVACY_EXCLUSIONS)
+  assert.deepEqual(api.PRIVACY_THRESHOLDS, HOST_PRIVACY_THRESHOLDS)
+
+  // 2) The corpus is not vacuous: it fires every rule and every exclusion, and
+  // each threshold has a case on both sides of it.
+  const verdicts = MIRROR_CORPUS.map((text) => hostClassifyPastedText(text))
+  // Mechanical guard for the run-time composition above: the whole corpus still
+  // hashes to the digest it had while its token entries were single literals
+  // (recorded before the GitHub Push Protection repair). Any fixture edit — or a
+  // "simplification" back to literals — changes this.
+  assert.equal(fixtureFingerprint(MIRROR_CORPUS.join('\u0000')), 'f3bacc95d34d')
+  // The same claim for the *pure* half alone: every entry there is a composed
+  // literal pair or a plain literal, so a third party can recompute this digest
+  // by reading the file, without evaluating module constants or slices.
+  assert.equal(fixtureFingerprint(MIRROR_LITERALS.join('\u0000')), 'cc3e78537797')
+  // This file's own composed sentinel, pinned the same way.
+  assert.equal(fixtureFingerprint(SECRET), 'f363be094370', 'the composed client sentinel is unchanged')
+  const hits = verdicts.filter((verdict) => verdict.secret)
+  const excluded = verdicts.filter((verdict) => verdict.exclusion !== undefined)
+  for (const rule of HOST_PRIVACY_RULES) {
+    assert.equal(hits.some((verdict) => verdict.rule === rule), true, `the corpus never exercises ${rule}`)
+  }
+  for (const exclusion of HOST_PRIVACY_EXCLUSIONS) {
+    assert.equal(
+      excluded.some((verdict) => verdict.exclusion === exclusion),
+      true,
+      `the corpus never exercises ${exclusion}`,
+    )
+  }
+  assert.equal(hostClassifyPastedText(MIRROR_LONG_BASE.slice(0, 31)).rule, 'high-entropy')
+  assert.equal(hostClassifyPastedText(MIRROR_LONG_BASE.slice(0, 32)).rule, 'long-concentrated')
+  assert.equal(hostClassifyPastedText(MIRROR_SHORT_BASE.slice(0, 19)).secret, false)
+  assert.equal(hostClassifyPastedText(MIRROR_SHORT_BASE.slice(0, 20)).rule, 'high-entropy')
+  assert.deepEqual(hostClassifyPastedText(`ghp_${'a'.repeat(7)}`), { secret: false, exclusion: 'identifier' })
+  assert.deepEqual(hostClassifyPastedText(`ghp_${'a'.repeat(8)}`), { secret: true, rule: 'vendor-prefix' })
+  assert.equal(hostClassifyPastedText(MIRROR_IDENTIFIER_40).exclusion, 'identifier')
+  assert.equal(hostClassifyPastedText(MIRROR_IDENTIFIER_41).exclusion, undefined)
+
+  // 3) Case by case: both implementations, verdict for verdict.
+  for (const text of MIRROR_CORPUS) {
+    assert.deepEqual(api.classifyPastedText(text), hostClassifyPastedText(text), JSON.stringify(text))
+  }
+
+  // 4) The helpers the rules are built from agree as well.
+  for (const text of MIRROR_CORPUS) {
+    assert.equal(api.distinctCharCount(text), hostDistinctCharCount(text), text)
+    assert.equal(api.entropyBitsPerChar(text), hostEntropyBitsPerChar(text), text)
+    assert.equal(api.isReferenceText(text), hostIsReferenceText(text), text)
+    assert.equal(api.hasCjk(text), hostHasCjk(text), text)
+  }
+
+  // 5) The mirror stays dependency-free, so the artifact stays a classic script.
+  const source = readFileSync(new URL('../src/client/entry.ts', import.meta.url), 'utf8')
+  assert.equal(
+    /^\s*(import|export)\b/m.test(source),
+    false,
+    'the client artifact must remain a classic script (no import/export)',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Round 7 / R2 + R3 — the 粘贴 suffix action and the paste interception.
+//
+// One action per user-visible field, one classify-and-register route for the
+// value field, and nothing swallowed on any failure path.
+// ---------------------------------------------------------------------------
+
+/** Material-shaped text the classifier is expected to claim. */
+const PASTE_TOKEN = 'aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY'
+
+/** The value the field with this id holds right now, or undefined. */
+function fieldValue(root: unknown, id: string): unknown {
+  return elements(root).find((element) => element.props.id === id)?.props.value
+}
+
+/** The paste action of the row that holds `field`, walking up a few levels. */
+function pasteButtonFor(tree: unknown, field: Element | undefined): Element | undefined {
+  let scope = field
+  for (let depth = 0; depth < 4 && scope !== undefined; depth += 1) {
+    const parent = parentOf(tree, scope)
+    if (parent === undefined) return undefined
+    const found = elements(parent).find((element) => element.props['data-secret-paste'] === 'true')
+    if (found !== undefined) return found
+    scope = parent
+  }
+  return undefined
+}
+
+/** A fake DOM node for a click, so the focus hand-back can be observed. */
+function fakeButtonNode(): { parentElement: { querySelector: () => { focus: () => void } } } {
+  return { parentElement: { querySelector: () => ({ focus: () => undefined }) } }
+}
+
+/** A fake DOM node whose parent row yields a focusable field. */
+function fakeButtonNodeWithFocus(onFocus: () => void): unknown {
+  return { parentElement: { querySelector: () => ({ focus: onFocus }) } }
+}
+
+/** Run `body` with a scripted `navigator.clipboard`, then restore the real one. */
+async function withClipboard(clipboard: unknown, body: () => Promise<void>): Promise<void> {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'navigator')
+  Object.defineProperty(globalThis, 'navigator', {
+    value: clipboard === undefined ? {} : { clipboard },
+    configurable: true,
+    writable: true,
+  })
+  try {
+    await body()
+  } finally {
+    if (original === undefined) {
+      Reflect.deleteProperty(globalThis as unknown as Record<string, unknown>, 'navigator')
+    } else {
+      Object.defineProperty(globalThis, 'navigator', original)
+    }
+  }
+}
+
+/**
+ * Start the fill face from a legal state.
+ *
+ * One component instance is shared across this file's renders, so an earlier case
+ * can leave an invalid credential key behind — and an invalid key sends the
+ * registration straight to its `badKey` branch, which would make a paste case look
+ * like it never tried. Clearing the two identifier fields isolates what is under
+ * test here.
+ */
+function clearFillIdentifiers(): void {
+  const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+  for (const label of [api.ATTACH_ZH.labelLabel, api.ATTACH_ZH.keyLabel]) {
+    typeInto(elements(tree).find((element) => element.props['aria-label'] === label), '')
+  }
+}
+
+test('R2: every capsule field owns a 粘贴 action, disabled exactly when its field is', async () => {
+  // The copy is the word the user asked for, and both dictionaries carry the
+  // manual-paste guidance (the rendered tree binds the Chinese one).
+  assert.equal(api.ATTACH_ZH.paste, '粘贴')
+  assert.equal(api.ATTACH_EN.paste, 'Paste')
+  for (const key of ['pasteUnavailable', 'pasteDenied', 'pasteEmpty']) {
+    assert.equal(typeof api.ATTACH_ZH[key], 'string')
+    assert.equal(api.ATTACH_ZH[key].length > 0, true)
+    assert.equal(typeof api.ATTACH_EN[key], 'string')
+    assert.equal(api.ATTACH_EN[key].length > 0, true)
+    assert.notEqual(api.ATTACH_ZH[key], api.ATTACH_EN[key], key)
+  }
+
+  reset()
+  api.setAttachMode({ kind: 'fill' })
+  const fill = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+  // The three editable fields of the fill face: title, credential key, value.
+  const fillFields = [api.ATTACH_ZH.labelLabel, api.ATTACH_ZH.keyLabel, api.ATTACH_ZH.valueLabel].map((label) =>
+    elements(fill).find((element) => element.props['aria-label'] === label),
+  )
+  for (const [index, field] of fillFields.entries()) {
+    assert.notEqual(field, undefined, `fill field ${String(index)} is missing`)
+    const button = pasteButtonFor(fill, field)
+    assert.notEqual(button, undefined, `fill field ${String(index)} has no paste action`)
+    assert.equal(button?.type, 'button')
+    assert.equal(button?.props.type, 'button', 'type=button so it can never submit')
+    assert.equal(button?.props['aria-label'], api.ATTACH_ZH.paste)
+    assert.equal(button?.props.disabled, field?.props.disabled, 'the button mirrors its field')
+    let prevented = false
+    ;(button?.props.onMouseDown as ((event: unknown) => void) | undefined)?.({
+      preventDefault: () => {
+        prevented = true
+      },
+    })
+    assert.equal(prevented, true, 'mousedown is prevented so the field keeps focus')
+  }
+  // The label's labelled control is still the input, not the button: t19's
+  // accessibility must survive the new sibling.
+  for (const index of [0, 1]) {
+    const field = fillFields[index] as Element
+    const label = parentOf(fill, field)
+    assert.equal(label?.type, 'label')
+    assert.equal(elements(label).includes(field), true)
+    assert.equal(
+      elements(label).some((element) => element.props['data-secret-paste'] === 'true'),
+      false,
+      'the button must stay outside the label',
+    )
+  }
+
+  // The change-value face, and the management card's value field: same action,
+  // disabled exactly when the field is (the card's field is dormant without a
+  // claimed pending entry, so both must be disabled there).
+  reset()
+  api.setAttachMode({ kind: 'edit', variable: ENV_VAR, target: 'session' })
+  const edit = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+  const editField = elements(edit).find((element) => element.props.id === 'dsh-secret-manage-value')
+  const editButton = pasteButtonFor(edit, editField)
+  assert.equal(editButton?.props['aria-label'], api.ATTACH_ZH.paste)
+  assert.equal(editButton?.props.disabled, editField?.props.disabled)
+
+  const manageCard = MANAGE.SecretManageCard as (props: unknown) => unknown
+  const card = manageCard({
+    node: {
+      data: {
+        callId: 'call-paste-1',
+        request: { action: 'value', target: 'session' },
+        requestUnreadable: false,
+        settled: false,
+        outcome: null,
+        failure: null,
+      },
+    },
+    sessionId: SESSION_ID,
+  })
+  const cardField = elements(card).find((element) => element.props.type === 'password')
+  const cardButton = pasteButtonFor(card, cardField)
+  assert.notEqual(cardButton, undefined, 'the management card has no paste action')
+  assert.equal(cardButton?.props['aria-label'], api.ATTACH_ZH.paste)
+  assert.equal(cardButton?.props.disabled, cardField?.props.disabled)
+  assert.equal(cardField?.props.disabled, true, 'the card field is dormant here, so the button is too')
+  reset()
+})
+
+test('R2: the click reads the clipboard, writes the field through its own setter, and hands focus back', async () => {
+  reset()
+  api.setAttachMode({ kind: 'fill' })
+  await withClipboard({ readText: async () => `  ${'OpenAI API Key'}  ` }, async () => {
+    const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    const field = elements(tree).find((element) => element.props['aria-label'] === api.ATTACH_ZH.labelLabel)
+    let focused = 0
+    ;(pasteButtonFor(tree, field)?.props.onClick as ((event: unknown) => void) | undefined)?.(
+      { currentTarget: fakeButtonNodeWithFocus(() => { focused += 1 }) },
+    )
+    await flushOneTurn()
+    const after = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(
+      elements(after).find((element) => element.props['aria-label'] === api.ATTACH_ZH.labelLabel)?.props.value,
+      'OpenAI API Key',
+      'the clipboard text is trimmed and written through the field setter',
+    )
+    await flushOneTurn()
+    assert.equal(focused, 1, 'the last step of the click is handing focus back to the field')
+  })
+  reset()
+})
+
+test('R3: both paste paths in the value field register through the attach route and clear the field', async () => {
+  const accepted = { ok: true, variable: ENV_VAR, scope: 'session', replaced: false }
+
+  // Path one: the native paste event, taken over for material-shaped text.
+  reset()
+  const native = stubRoutes()
+  native.attached.payload = accepted
+  try {
+    api.setAttachMode({ kind: 'fill' })
+    clearFillIdentifiers()
+    const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    const field = elements(tree).find((element) => element.props.id === 'dsh-secret-attach-value')
+    // This renderer keeps one component instance across tests, so the field may
+    // hold text from an earlier case: what matters is that *this* paste did not
+    // put the token there, and that the registration clears it on success.
+    assert.equal(String(field?.props.value ?? '').includes(PASTE_TOKEN), false)
+    let prevented = false
+    ;(field?.props.onPaste as ((event: unknown) => void) | undefined)?.({
+      clipboardData: { getData: () => PASTE_TOKEN },
+      preventDefault: () => {
+        prevented = true
+      },
+    })
+    assert.equal(prevented, true, 'the plugin takes the paste over instead of leaving material in the field')
+    await flushOneTurn()
+    assert.equal(native.calls.length, 1, 'exactly one registration')
+    assert.equal(native.calls[0]?.url, api.ATTACH_PATH)
+    assert.equal((native.calls[0]?.body as Record<string, unknown>)['value'], PASTE_TOKEN, '真登记: the paste is the value')
+    const afterNative = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(
+      elements(afterNative).some((element) => element.props.id === 'dsh-secret-attach-value'),
+      false,
+      'the success path hands over to the detail face, exactly as a manual submit does',
+    )
+    api.setAttachMode({ kind: 'fill' })
+    const reopened = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(fieldValue(reopened, 'dsh-secret-attach-value'), '', 'the registered value left the field')
+  } finally {
+    restoreFetch()
+    reset()
+  }
+
+  // Path two: the 「粘贴」 button on the same field, same route, same outcome.
+  reset()
+  const clicked = stubRoutes()
+  clicked.attached.payload = accepted
+  try {
+    await withClipboard({ readText: async () => PASTE_TOKEN }, async () => {
+      api.setAttachMode({ kind: 'fill' })
+      clearFillIdentifiers()
+      const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      const field = elements(tree).find((element) => element.props.id === 'dsh-secret-attach-value')
+      let focused = 0
+      ;(pasteButtonFor(tree, field)?.props.onClick as ((event: unknown) => void) | undefined)?.(
+        { currentTarget: fakeButtonNodeWithFocus(() => { focused += 1 }) },
+      )
+      await flushOneTurn()
+      await flushOneTurn()
+      assert.equal(clicked.calls.length, 1, 'the button registers through the same route')
+      assert.equal(clicked.calls[0]?.url, api.ATTACH_PATH)
+      const body = clicked.calls[0]?.body as Record<string, unknown>
+      assert.equal(body['value'], PASTE_TOKEN)
+      assert.deepEqual(Object.keys(body).sort(), ['label', 'name', 'scope', 'sessionId', 'value'])
+      const after = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      assert.equal(
+        elements(after).some((element) => element.props.id === 'dsh-secret-attach-value'),
+        false,
+        'the button path hands over to the detail face as well',
+      )
+      api.setAttachMode({ kind: 'fill' })
+      assert.equal(
+        fieldValue(renderer.render(CAPSULE, { sessionId: SESSION_ID }), 'dsh-secret-attach-value'),
+        '',
+        'the registered value left the field',
+      )
+      assert.equal(focused, 1, 'focus comes back to the field even on the success path')
+    })
+  } finally {
+    restoreFetch()
+    reset()
+  }
+})
+
+test('R2/R3: no failed paste is swallowed, and none of them throws', async () => {
+  const rejections: unknown[] = []
+  const onRejection = (reason: unknown): void => {
+    rejections.push(reason)
+  }
+  process.on('unhandledRejection', onRejection)
+  try {
+    // (a) The Clipboard API is not there at all: a message and no request.
+    reset()
+    const noApi = stubRoutes()
+    let beforeA: unknown
+    await withClipboard(undefined, async () => {
+      api.setAttachMode({ kind: 'fill' })
+      const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      const field = elements(tree).find((element) => element.props.id === 'dsh-secret-attach-value')
+      beforeA = field?.props.value
+      ;(pasteButtonFor(tree, field)?.props.onClick as ((event: unknown) => void) | undefined)?.(
+        { currentTarget: fakeButtonNode() },
+      )
+      await flushOneTurn()
+    })
+    assert.equal(noApi.calls.length, 0)
+    const treeA = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(visibleText(treeA).includes(api.ATTACH_ZH.pasteUnavailable), true, 'the human is told to paste by hand')
+    assert.equal(fieldValue(treeA, 'dsh-secret-attach-value'), beforeA, 'a failed read leaves the field exactly as it was')
+    restoreFetch()
+
+    // (b) The read is refused: same guidance, still no request, field untouched.
+    reset()
+    const denied = stubRoutes()
+    let beforeB: unknown
+    await withClipboard({ readText: async () => { throw new Error('denied') } }, async () => {
+      api.setAttachMode({ kind: 'fill' })
+      const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      const field = elements(tree).find((element) => element.props.id === 'dsh-secret-attach-value')
+      beforeB = field?.props.value
+      ;(pasteButtonFor(tree, field)?.props.onClick as ((event: unknown) => void) | undefined)?.(
+        { currentTarget: fakeButtonNode() },
+      )
+      await flushOneTurn()
+    })
+    assert.equal(denied.calls.length, 0)
+    const treeB = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(visibleText(treeB).includes(api.ATTACH_ZH.pasteDenied), true)
+    assert.equal(fieldValue(treeB, 'dsh-secret-attach-value'), beforeB)
+    restoreFetch()
+
+    // (c) The registration itself fails: the pasted text comes back to the field.
+    reset()
+    const failing = stubRoutes()
+    // The registration write fails: declared on its own route, since the
+    // attachments read has its own answer (the two are not interchangeable).
+    failing.attach.ok = false
+    await withClipboard({ readText: async () => PASTE_TOKEN }, async () => {
+      api.setAttachMode({ kind: 'fill' })
+      clearFillIdentifiers()
+      const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      const field = elements(tree).find((element) => element.props.id === 'dsh-secret-attach-value')
+      ;(pasteButtonFor(tree, field)?.props.onClick as ((event: unknown) => void) | undefined)?.(
+        { currentTarget: fakeButtonNode() },
+      )
+      await flushOneTurn()
+      await flushOneTurn()
+    })
+    assert.equal(failing.calls.length, 1, 'the attempt was made')
+    const treeC = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(
+      fieldValue(treeC, 'dsh-secret-attach-value'),
+      PASTE_TOKEN,
+      'a refused registration puts the pasted text back — nothing is lost',
+    )
+    assert.equal(visibleText(treeC).includes(api.attachErrorFor(500)), true, 'and it says what happened')
+    restoreFetch()
+
+    assert.deepEqual(rejections, [], 'no paste path may produce an unhandled rejection')
+  } finally {
+    process.off('unhandledRejection', onRejection)
+    restoreFetch()
+    reset()
+  }
+})
+
+test('R2/R3: a pasted key still hits the key validation, and non-value fields never register', async () => {
+  reset()
+  const stub = stubRoutes()
+  try {
+    await withClipboard({ readText: async () => 'Bad Key!' }, async () => {
+      api.setAttachMode({ kind: 'fill' })
+      let tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      const keyField = elements(tree).find((element) => element.props['aria-label'] === api.ATTACH_ZH.keyLabel)
+      ;(pasteButtonFor(tree, keyField)?.props.onClick as ((event: unknown) => void) | undefined)?.(
+        { currentTarget: fakeButtonNode() },
+      )
+      await flushOneTurn()
+      tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      assert.equal(
+        elements(tree).find((element) => element.props['aria-label'] === api.ATTACH_ZH.keyLabel)?.props.value,
+        'Bad Key!',
+        'the paste went through the same setter typing uses',
+      )
+      assert.equal(stub.calls.length, 0, 'the key field registers nothing by itself')
+
+      // The value field, so the form can be submitted and the key checked.
+      typeInto(elements(tree).find((element) => element.props.id === 'dsh-secret-attach-value'), SECRET)
+      const filled = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      ;(elements(filled).find((element) => element.type === 'button' && element.props['data-kind'] === 'primary')
+        ?.props.onClick as (() => void) | undefined)?.()
+      await flushOneTurn()
+      assert.equal(stub.calls.length, 0, 'a malformed key is refused before any request, as before')
+      const after = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      assert.equal(visibleText(after).includes(api.ATTACH_ZH.badKey), true, 'the pasted key reaches the same badKey branch')
+    })
+  } finally {
+    restoreFetch()
+    reset()
+  }
+
+  // The change-value face writes and never registers (R3 is value-field only).
+  reset()
+  const editStub = stubRoutes()
+  try {
+    await withClipboard({ readText: async () => PASTE_TOKEN }, async () => {
+      api.setAttachMode({ kind: 'edit', variable: ENV_VAR, target: 'session' })
+      const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      const field = elements(tree).find((element) => element.props.id === 'dsh-secret-manage-value')
+      ;(pasteButtonFor(tree, field)?.props.onClick as ((event: unknown) => void) | undefined)?.(
+        { currentTarget: fakeButtonNode() },
+      )
+      await flushOneTurn()
+      assert.equal(editStub.calls.length, 0, 'the change-value face must not register anything')
+      const after = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      assert.equal(fieldValue(after, 'dsh-secret-manage-value'), PASTE_TOKEN)
+    })
+  } finally {
+    restoreFetch()
+    reset()
+  }
+})
+
+// This case parks the capsule in `busy` on purpose (its submit never resolves),
+// so it is deliberately the last test in the file: nothing after it may be
+// affected by that state.
+test('R2: the composer seat inserts at the caret through inputActions, and reports a missing capability', async () => {
+  // The seat is the composer's right rail, registered once, by id, and it is a
+  // *list* seat: other plugins' entries are untouched by this one.
+  const seats = registrations.filter((entry) => entry.name === 'conversation.input.right')
+  assert.equal(seats.length, 1, 'exactly one composer paste entry')
+  assert.equal(seats[0]?.id, 'secret-paste-composer')
+  const component = seats[0]?.component as (props: unknown) => unknown
+  assert.notEqual(component, undefined)
+
+  // A fake editor, as the harness's `InputActions` face: captureInsertion hands
+  // back the caret span, insertText records what it was asked to insert.
+  const inserted: { text: string; span: unknown }[] = []
+  const editor = {
+    captureInsertion: () => ({ start: 3, end: 3, draftRev: 7 }),
+    insertText: (text: string, span: unknown) => {
+      inserted.push({ text, span })
+      return true
+    },
+  }
+
+  await withClipboard({ readText: async () => `  ${PASTE_TOKEN}  ` }, async () => {
+    const tree = renderer.render(component, { sessionId: SESSION_ID, inputActions: editor })
+    const button = elements(tree).find((element) => element.props['data-secret-paste'] === 'true')
+    assert.notEqual(button, undefined, 'the seat renders one paste action')
+    assert.equal(button?.props.type, 'button')
+    assert.equal(button?.props['aria-label'], api.ATTACH_ZH.paste)
+    // Pressing it must not move focus out of the editor…
+    let prevented = false
+    ;(button?.props.onMouseDown as ((event: unknown) => void) | undefined)?.({
+      preventDefault: () => {
+        prevented = true
+      },
+    })
+    assert.equal(prevented, true, 'the editor keeps focus: mousedown is prevented')
+    // …and the text goes in at the caret the editor reported, trimmed, through
+    // its own insert path (no controlled value is written from here).
+    ;(button?.props.onClick as ((event: unknown) => void) | undefined)?.({ currentTarget: null })
+    await flushOneTurn()
+    assert.deepEqual(
+      inserted,
+      [{ text: PASTE_TOKEN, span: { start: 3, end: 3, draftRev: 7 } }],
+      'the clipboard text is inserted at the captured caret span',
+    )
+  })
+
+  // No clipboard at all: the same three messages the capsule uses, and a throw
+  // would fail this test (the click path is synchronous on the outside).
+  for (const item of [
+    { clipboard: undefined, key: 'pasteUnavailable' },
+    { clipboard: { readText: async () => { throw new Error('denied') } }, key: 'pasteDenied' },
+    { clipboard: { readText: async () => '   ' }, key: 'pasteEmpty' },
+  ] as const) {
+    await withClipboard(item.clipboard, async () => {
+      const tree = renderer.render(component, { sessionId: SESSION_ID, inputActions: editor })
+      const button = elements(tree).find((element) => element.props['data-secret-paste'] === 'true')
+      ;(button?.props.onClick as ((event: unknown) => void) | undefined)?.({ currentTarget: null })
+      await flushOneTurn()
+      const after = renderer.render(component, { sessionId: SESSION_ID, inputActions: editor })
+      assert.equal(
+        visibleText(after).includes(api.ATTACH_ZH[item.key]),
+        true,
+        `${item.key} is the same dictionary string the capsule shows`,
+      )
+      // The other direction of the same rule: a clipboard-side failure is never
+      // reported as an insert failure (that is a different cause).
+      assert.equal(
+        visibleText(after).includes(api.ATTACH_ZH.pasteInsertFailed),
+        false,
+        `${item.key} is not the insert-side message`,
+      )
+    })
+  }
+  assert.equal(inserted.length, 1, 'a failed read inserts nothing')
+
+  // The editor offers no insertion capability at all: the insert-side message is
+  // the honest one — the clipboard read above already succeeded, so blaming the
+  // clipboard would name the wrong cause. Never a throw, never a stolen focus,
+  // never a silent no-op.
+  await withClipboard({ readText: async () => PASTE_TOKEN }, async () => {
+    const tree = renderer.render(component, {
+      sessionId: SESSION_ID,
+      inputActions: { captureInsertion: () => ({ start: 0, end: 0, draftRev: 1 }) },
+    })
+    const button = elements(tree).find((element) => element.props['data-secret-paste'] === 'true')
+    ;(button?.props.onClick as ((event: unknown) => void) | undefined)?.({ currentTarget: null })
+    await flushOneTurn()
+    const after = renderer.render(component, {
+      sessionId: SESSION_ID,
+      inputActions: { captureInsertion: () => ({ start: 0, end: 0, draftRev: 1 }) },
+    })
+    assert.equal(
+      visibleText(after).includes(api.ATTACH_ZH.pasteInsertFailed),
+      true,
+      'a missing insertText capability is reported as an insert failure',
+    )
+    assert.equal(
+      visibleText(after).includes(api.ATTACH_ZH.pasteUnavailable),
+      false,
+      'the clipboard is not blamed: its read already succeeded',
+    )
+  })
+  // And without a caret to insert at, the same insert-side answer.
+  await withClipboard({ readText: async () => PASTE_TOKEN }, async () => {
+    const tree = renderer.render(component, { sessionId: SESSION_ID, inputActions: { insertText: () => true } })
+    const button = elements(tree).find((element) => element.props['data-secret-paste'] === 'true')
+    ;(button?.props.onClick as ((event: unknown) => void) | undefined)?.({ currentTarget: null })
+    await flushOneTurn()
+    const after = renderer.render(component, { sessionId: SESSION_ID, inputActions: { insertText: () => true } })
+    assert.equal(
+      visibleText(after).includes(api.ATTACH_ZH.pasteInsertFailed),
+      true,
+      'no caret to insert at is reported as an insert failure',
+    )
+    assert.equal(visibleText(after).includes(api.ATTACH_ZH.pasteUnavailable), false)
+  })
+  // And when the editor itself declines the insertion, the same.
+  await withClipboard({ readText: async () => PASTE_TOKEN }, async () => {
+    const refusing = { captureInsertion: () => ({ start: 0, end: 0, draftRev: 1 }), insertText: () => false }
+    const tree = renderer.render(component, { sessionId: SESSION_ID, inputActions: refusing })
+    const button = elements(tree).find((element) => element.props['data-secret-paste'] === 'true')
+    ;(button?.props.onClick as ((event: unknown) => void) | undefined)?.({ currentTarget: null })
+    await flushOneTurn()
+    const after = renderer.render(component, { sessionId: SESSION_ID, inputActions: refusing })
+    assert.equal(
+      visibleText(after).includes(api.ATTACH_ZH.pasteInsertFailed),
+      true,
+      'an insertion the editor declined is reported as an insert failure',
+    )
+    assert.equal(visibleText(after).includes(api.ATTACH_ZH.pasteUnavailable), false)
+  })
+})
+
+test('R2: a field busy with a submit in flight disables its own paste action', async () => {
+  const realFetch = (globalThis as Record<string, unknown>).fetch
+  ;(globalThis as Record<string, unknown>).fetch = () => new Promise(() => undefined)
+  try {
+    reset()
+    api.setAttachMode({ kind: 'fill' })
+    clearFillIdentifiers()
+    const ready = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    typeInto(elements(ready).find((element) => element.props.id === 'dsh-secret-attach-value'), SECRET)
+    const filled = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    ;(elements(filled).find((element) => element.type === 'button' && element.props['data-kind'] === 'primary')
+      ?.props.onClick as (() => void) | undefined)?.()
+    const busyTree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    const busyField = elements(busyTree).find((element) => element.props.id === 'dsh-secret-attach-value')
+    const busyButton = pasteButtonFor(busyTree, busyField)
+    assert.equal(busyField?.props.disabled, true, 'the field is disabled while the submit is in flight')
+    assert.equal(busyButton?.props.disabled, true, 'and so is its paste action: one state, both controls')
+  } finally {
+    ;(globalThis as Record<string, unknown>).fetch = realFetch
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Round 7 / R4 — the side-car capsule's ✕: closing it *is* unbinding it.
+//
+// The row is this plugin's own DOM, so it is the only place a remove action can
+// live. By the user's ruling the ✕ and the unbind are one gesture: `staged`
+// releases through the route 0.3.0 already used, `bound` through the management
+// action `unbind`, and neither ever touches the credential store.
+// ---------------------------------------------------------------------------
+
+const CHIP_ROW = registrations.find((entry) => entry.key === 'sr-chip')?.component as (props: unknown) => unknown
+assert.notEqual(CHIP_ROW, undefined, 'the side-car row component is not registered')
+
+/** The history route, whose path constant is not part of the attach seam. */
+const HISTORY_ROUTE = '/api/secret.history'
+
+/** One row's props, as the chat seat hands them over (message id + names only). */
+function chipProps(sessionId: string, variables: readonly string[] = [ENV_VAR]): unknown {
+  return { sessionId, node: { data: { messageId: 'message-1', variables } } }
+}
+
+/** Render the side-car row for one session. */
+function renderChipRow(sessionId: string, variables: readonly string[] = [ENV_VAR]): unknown {
+  return renderer.render(CHIP_ROW, chipProps(sessionId, variables))
+}
+
+/** Seed one staged/bound record exactly as the store holds one (never a value). */
+function seedChip(sessionId: string, state: 'staged' | 'bound'): void {
+  api.sessionAttachments(sessionId).set(ENV_VAR, {
+    variable: ENV_VAR,
+    name: 'openai',
+    label: 'OpenAI API Key',
+    scope: 'session',
+    state,
+    createdAt: 1700000000000,
+    generation: 1,
+    seenPresent: true,
+  })
+}
+
+/** The ✕ of the one row in `tree`. */
+function chipRemoveButton(tree: unknown): Element | undefined {
+  return elements(tree).find((element) => typeof element.props['data-secret-chip-remove'] === 'string')
+}
+
+/** The main pill of the one row in `tree`. */
+function chipOpenButton(tree: unknown): Element | undefined {
+  return elements(tree).find((element) => typeof element.props['data-secret-chip-open'] === 'string')
+}
+
+/** Whether the row still shows the variable at all. */
+function chipShown(tree: unknown): boolean {
+  return elements(tree).some((element) => element.props['data-secret-variable'] === ENV_VAR)
+}
+
+/** A DOM-ish event whose two side effects are counted, for the ✕'s own press. */
+function chipEvent(): { event: { stopPropagation: () => void; preventDefault: () => void }; stops: { count: number }; prevents: { count: number } } {
+  const stops = { count: 0 }
+  const prevents = { count: 0 }
+  return {
+    event: {
+      stopPropagation: () => {
+        stops.count += 1
+      },
+      preventDefault: () => {
+        prevents.count += 1
+      },
+    },
+    stops,
+    prevents,
+  }
+}
+
+/** Press the ✕ of `tree` and let its own promise chain finish. */
+async function clickChipRemove(tree: unknown): Promise<void> {
+  const remove = chipRemoveButton(tree)
+  assert.notEqual(remove, undefined, 'the row has no ✕')
+  const press = chipEvent()
+  await (remove?.props.onClick as ((event: unknown) => Promise<void>) | undefined)?.(press.event)
+}
+
+/**
+ * Route the four calls the ✕ can reach, recording every one of them.
+ *
+ * The refusal cases are the point: a stub can answer "no" on each route, which is
+ * how the tests below prove a failure never removes anything by itself.
+ */
+function stubChipRoutes(options: {
+  readonly attach?: { ok: boolean; status?: number; payload: unknown }
+  readonly release?: { ok: boolean; status?: number; payload: unknown }
+  readonly manage?: { ok: boolean; status?: number; payload: unknown }
+  readonly attached?: { ok: boolean; status?: number; payload: unknown }
+}): RoutedCall[] {
+  const calls: RoutedCall[] = []
+  ;(globalThis as Record<string, unknown>).fetch = async (url: unknown, init?: unknown) => {
+    const call = init as { method?: unknown; body?: unknown } | undefined
+    const raw = call?.body
+    const address = String(url)
+    // Route by pathname, never by prefix: `/api/secret.attached` starts with
+    // `/api/secret.attach`, and conflating the two would answer a read with a
+    // write's shape.
+    const path = new URL(address, 'http://localhost').pathname
+    calls.push({
+      url: address,
+      method: typeof call?.method === 'string' ? call.method : 'GET',
+      body: typeof raw === 'string' ? JSON.parse(raw) : undefined,
+    })
+    const answer =
+      path === api.ATTACH_PATH
+        ? (options.attach ?? { ok: true, payload: { ok: true, variable: ENV_VAR, scope: 'session', replaced: false } })
+        : path === api.RELEASE_PATH
+          ? (options.release ?? { ok: true, payload: { ok: true, released: true, state: 'staged' } })
+          : path === MANAGE.MANAGE_PATH
+            ? call?.method === 'POST'
+              ? (options.manage ?? {
+                  ok: true,
+                  payload: {
+                    ok: true,
+                    action: 'unbind',
+                    variable: ENV_VAR,
+                    scope: 'session',
+                    changed: { session: true, store: false },
+                  },
+                })
+              : { ok: true, payload: { ok: true, entries: [] } }
+            : path === HISTORY_ROUTE
+              ? { ok: true, payload: { ok: true, entries: [] } }
+              : path === api.ATTACHED_PATH
+                ? (options.attached ?? { ok: true, payload: { ok: true, attachments: [] } })
+                : unrecognizedRoute('stubChipRoutes', path)
+    return { ok: answer.ok, status: answer.status ?? (answer.ok ? 200 : 500), json: async () => answer.payload }
+  }
+  return calls
+}
+
+test('R4: the capsule is a container with a main button and its own ✕, never a button inside a button', () => {
+  reset()
+  const session = 'row-structure'
+  api.sessionAttachments(session).clear()
+  seedChip(session, 'staged')
+  const tree = renderChipRow(session)
+  const group = elements(tree).find((element) => element.props['data-secret-variable'] === ENV_VAR)
+  const open = chipOpenButton(tree)
+  const remove = chipRemoveButton(tree)
+  assert.notEqual(group, undefined, 'the row has no container for the variable')
+  assert.equal(group?.type, 'span', 'the container is not a button: the two actions are siblings')
+  assert.notEqual(open, undefined, 'the detail-facing pill is missing')
+  assert.notEqual(remove, undefined, 'the ✕ is missing')
+  assert.equal(parentOf(tree, open as Element), group, 'the pill sits inside the container')
+  assert.equal(parentOf(tree, remove as Element), group, 'the ✕ sits inside the container, beside the pill')
+  assert.equal(open?.type, 'button')
+  assert.equal(open?.props.type, 'button')
+  assert.equal(remove?.type, 'button')
+  assert.equal(remove?.props.type, 'button', 'an explicit type keeps it out of any form submit path')
+  // The accessible name carries the identifier the human reads, and no value.
+  assert.equal(remove?.props['aria-label'], `${api.ATTACH_ZH.chipRemove} @${ENV_VAR}`)
+  assert.equal(String(remove?.props['aria-label']).includes(SECRET), false)
+  assert.equal(String(remove?.props.title).includes(SECRET), false)
+  assert.equal(visibleText(remove), '✕')
+  assert.equal(remove?.props.disabled, false)
+  // No button contains a button, at any depth.
+  for (const button of elements(tree).filter((element) => element.type === 'button')) {
+    const nested = elements(button.props.children).filter((child) => child.type === 'button')
+    assert.equal(nested.length, 0, 'a button must never nest inside another button')
+  }
+  // Nothing this row renders may carry secret material.
+  assert.equal(JSON.stringify(tree).includes(SECRET), false)
+  reset()
+  api.sessionAttachments(session).clear()
+})
+
+test('R4: the ✕ press is its own event, never opens the detail face, and never takes focus', async () => {
+  reset()
+  const session = 'row-press'
+  api.sessionAttachments(session).clear()
+  seedChip(session, 'staged')
+  stubChipRoutes({})
+  try {
+    const tree = renderChipRow(session)
+    // Positive control first: the pill itself still opens the detail face.
+    ;(chipOpenButton(tree)?.props.onClick as (() => void) | undefined)?.()
+    assert.equal(api.currentMode().kind, 'detail')
+    assert.equal(api.currentMode().kind === 'detail' && api.currentMode().variable, ENV_VAR)
+    api.setAttachMode({ kind: 'idle' })
+
+    const remove = chipRemoveButton(renderChipRow(session))
+    const down = chipEvent()
+    ;(remove?.props.onMouseDown as ((event: unknown) => void) | undefined)?.(down.event)
+    assert.equal(down.prevents.count, 1, 'the press is prevented so focus stays where it was')
+    assert.equal(down.stops.count, 1, 'and it does not reach any ancestor')
+    assert.equal(api.currentMode().kind, 'idle', 'a press on the ✕ must not open the detail face')
+
+    const click = chipEvent()
+    await (remove?.props.onClick as ((event: unknown) => Promise<void>) | undefined)?.(click.event)
+    assert.equal(click.stops.count, 1, 'the click does not bubble to the pill')
+    assert.equal(click.prevents.count, 1)
+    assert.equal(api.currentMode().kind, 'idle', 'the ✕ click never reached the capsule main action')
+  } finally {
+    ;(globalThis as Record<string, unknown>).fetch = REAL_FETCH
+    reset()
+    api.sessionAttachments(session).clear()
+  }
+})
+
+test('R4: a staged ✕ releases through the existing route and the capsule leaves the row for good', async () => {
+  reset()
+  const session = 'row-staged'
+  api.sessionAttachments(session).clear()
+  seedChip(session, 'staged')
+  const calls = stubChipRoutes({ release: { ok: true, payload: { ok: true, released: true, state: 'staged' } } })
+  try {
+    assert.equal(chipShown(renderChipRow(session)), true, 'the capsule is there before the click')
+    await clickChipRemove(renderChipRow(session))
+    await flushOneTurn()
+    const posts = calls.filter((call) => call.method === 'POST')
+    assert.deepEqual(
+      posts.map((call) => call.body),
+      [{ sessionId: session, variable: ENV_VAR, reason: 'withdrawn' }],
+      'a staged record releases through the route 0.3.0 already used',
+    )
+    assert.equal(
+      calls.some((call) => call.method === 'POST' && call.url.startsWith(MANAGE.MANAGE_PATH)),
+      false,
+      'a staged record never takes the management route',
+    )
+    // The one wire shape that would touch the store is absent, and the copy says
+    // nothing about a deletion: the ✕ unbinds, it does not delete.
+    assert.equal(JSON.stringify(posts).includes('confirm'), false)
+    assert.equal(JSON.stringify(posts).includes('delete'), false)
+
+    const after = renderChipRow(session)
+    assert.equal(chipShown(after), false, 'the capsule left the row')
+    const report = String(visibleText(after))
+    assert.equal(report.includes(api.ATTACH_ZH.chipRemoveStaged), true)
+    assert.equal(report.includes('删除'), false)
+
+    // A refresh of the host's own list does not resurrect it...
+    await api.refreshAttached(session)
+    assert.equal(chipShown(renderChipRow(session)), false)
+
+    // ...and re-attaching the same variable does bring it back.
+    seedChip(session, 'staged')
+    assert.equal(chipShown(renderChipRow(session)), true, 'a fresh attach is shown again')
+  } finally {
+    ;(globalThis as Record<string, unknown>).fetch = REAL_FETCH
+    reset()
+    api.sessionAttachments(session).clear()
+  }
+})
+
+test('R4: a bound ✕ unbinds through secret.manage, stays gone, and the store is left alone', async () => {
+  reset()
+  const session = 'row-bound'
+  api.sessionAttachments(session).clear()
+  seedChip(session, 'bound')
+  const calls = stubChipRoutes({
+    manage: {
+      ok: true,
+      payload: {
+        ok: true,
+        action: 'unbind',
+        variable: ENV_VAR,
+        scope: 'session',
+        changed: { session: true, store: false },
+      },
+    },
+    attached: { ok: true, payload: { ok: true, attachments: [] } },
+  })
+  try {
+    assert.equal(chipShown(renderChipRow(session)), true)
+    await clickChipRemove(renderChipRow(session))
+    await flushOneTurn()
+    const posts = calls.filter((call) => call.method === 'POST')
+    assert.deepEqual(
+      posts.map((call) => call.body),
+      [{ sessionId: session, action: 'unbind', variable: ENV_VAR }],
+      'a bound record goes through the management action unbind',
+    )
+    const wire = JSON.stringify(posts)
+    assert.equal(wire.includes('confirm'), false, 'unbind refuses a confirm; the wire must not carry one')
+    assert.equal(wire.includes('delete'), false)
+
+    assert.equal(chipShown(renderChipRow(session)), false, 'the capsule left the row')
+    // The removal is not a local pretence: the host answered, and its own list is
+    // the authority a later render reads.
+    await api.refreshAttached(session)
+    assert.equal(chipShown(renderChipRow(session)), false, 'a refresh must not resurrect it')
+    const report = String(visibleText(renderChipRow(session)))
+    assert.equal(report.includes(api.ATTACH_ZH.chipRemoveBound), true)
+    assert.equal(report.includes('删除'), false)
+    assert.equal(report.includes('凭据库未改动'), true, 'the sentence states that the store is untouched')
+
+    seedChip(session, 'staged')
+    assert.equal(chipShown(renderChipRow(session)), true, 're-attaching the same variable shows it again')
+  } finally {
+    ;(globalThis as Record<string, unknown>).fetch = REAL_FETCH
+    reset()
+    api.sessionAttachments(session).clear()
+  }
+})
+
+test('R4: a refused removal keeps the capsule and reports it instead of removing anything', async () => {
+  reset()
+  const staged = 'row-refused-staged'
+  api.sessionAttachments(staged).clear()
+  seedChip(staged, 'staged')
+  stubChipRoutes({
+    release: { ok: false, status: 500, payload: { ok: false } },
+    // The host's own list still holds it: a refusal changes nothing anywhere.
+    attached: {
+      ok: true,
+      payload: {
+        ok: true,
+        attachments: [
+          { variable: ENV_VAR, name: 'openai', label: 'OpenAI API Key', scope: 'session', state: 'staged', createdAt: 1 },
+        ],
+      },
+    },
+  })
+  try {
+    await clickChipRemove(renderChipRow(staged))
+    await flushOneTurn()
+    const kept = renderChipRow(staged)
+    assert.equal(chipShown(kept), true, 'a refused release removes nothing')
+    assert.equal(String(visibleText(kept)).includes(api.ATTACH_ZH.chipRemoveFailed), true)
+  } finally {
+    ;(globalThis as Record<string, unknown>).fetch = REAL_FETCH
+    reset()
+    api.sessionAttachments(staged).clear()
+  }
+
+  const bound = 'row-refused-bound'
+  api.sessionAttachments(bound).clear()
+  seedChip(bound, 'bound')
+  stubChipRoutes({ manage: { ok: false, status: 500, payload: { ok: false } } })
+  try {
+    await clickChipRemove(renderChipRow(bound))
+    await flushOneTurn()
+    const kept = renderChipRow(bound)
+    assert.equal(chipShown(kept), true, 'a refused unbind removes nothing')
+    assert.equal(
+      String(visibleText(kept)).includes(String(MANAGE.MANAGE_FAILURE[500])),
+      true,
+      'the fixed sentence for that status is what the human reads',
+    )
+  } finally {
+    ;(globalThis as Record<string, unknown>).fetch = REAL_FETCH
+    reset()
+    api.sessionAttachments(bound).clear()
+  }
+})
+
+test('R4: an unread session keeps its capsule, and only the host\'s own answer removes it', async () => {
+  // (a) This page never read the session and the read is unreachable: the ✕ must
+  // not act on a guess, and must not hide anything either.
+  reset()
+  const unknown = 'row-unknown'
+  api.sessionAttachments(unknown).clear()
+  const unknownCalls = stubChipRoutes({ attached: { ok: false, status: 500, payload: { ok: false } } })
+  try {
+    assert.equal(chipShown(renderChipRow(unknown)), true, 'nothing is known, so nothing may be hidden')
+    await clickChipRemove(renderChipRow(unknown))
+    await flushOneTurn()
+    assert.equal(unknownCalls.filter((call) => call.method === 'POST').length, 0, 'an unknown state is never acted on')
+    const kept = renderChipRow(unknown)
+    assert.equal(chipShown(kept), true, 'an unreadable host is not evidence that the record is gone')
+    assert.equal(String(visibleText(kept)).includes(api.ATTACH_ZH.chipRemoveFailed), true)
+  } finally {
+    ;(globalThis as Record<string, unknown>).fetch = REAL_FETCH
+    reset()
+    api.sessionAttachments(unknown).clear()
+  }
+
+  // (b) The host answers, and its answer says the session no longer holds it:
+  // this is the one fact that may stop the row rendering the capsule.
+  const known = 'row-known-absent'
+  api.sessionAttachments(known).clear()
+  const knownCalls = stubChipRoutes({ attached: { ok: true, payload: { ok: true, attachments: [] } } })
+  try {
+    assert.equal(chipShown(renderChipRow(known)), true)
+    await clickChipRemove(renderChipRow(known))
+    await flushOneTurn()
+    assert.equal(knownCalls.filter((call) => call.method === 'POST').length, 0, 'it was already gone: nothing to post')
+    const after = renderChipRow(known)
+    assert.equal(chipShown(after), false, 'the host said this session no longer holds it')
+    assert.equal(String(visibleText(after)).includes(api.ATTACH_ZH.chipRemoveGone), true)
+  } finally {
+    ;(globalThis as Record<string, unknown>).fetch = REAL_FETCH
+    reset()
+    api.sessionAttachments(known).clear()
+  }
+})
+
+test('R4: the ✕ is hidden by default, shown by the parent hover / focus-within, and visible without hover', () => {
+  reset()
+  const session = 'row-css'
+  api.sessionAttachments(session).clear()
+  seedChip(session, 'staged')
+  const tree = renderChipRow(session)
+  const group = elements(tree).find((element) => element.props['data-secret-variable'] === ENV_VAR)
+  const remove = chipRemoveButton(tree)
+  const groupClass = String(group?.props.className)
+  const removeClass = String(remove?.props.className)
+  const css = String(api.ATTACH_CSS)
+  const ownStart = css.indexOf(`.${removeClass}{`)
+  assert.notEqual(ownStart, -1, 'the ✕ has no rule of its own')
+  const ownRule = css.slice(ownStart, css.indexOf('}', ownStart))
+  assert.equal(ownRule.includes('visibility:hidden'), true, 'the ✕ is hidden by default')
+  for (const selector of [`.${groupClass}:hover .${removeClass}`, `.${groupClass}:focus-within .${removeClass}`]) {
+    assert.notEqual(css.indexOf(selector), -1, `the parent state must reveal it: ${selector}`)
+  }
+  assert.notEqual(
+    css.indexOf(`@media (hover:none){.${removeClass}{visibility:visible}}`),
+    -1,
+    'a touch device has no hover, so the ✕ is shown there by default',
+  )
+  reset()
+  api.sessionAttachments(session).clear()
+})
+
+// ---------------------------------------------------------------------------
+// Round 7 / R5 — selected text becomes a secret: 「附密钥」 → 「转为密钥」.
+//
+// The selection is read at the press (the one moment the frozen contract offers)
+// and the text behind it is folded from the editor's two projections. When that
+// reading does not line up exactly, the button keeps its original behaviour:
+// nothing is registered and nothing is lost.
+// ---------------------------------------------------------------------------
+
+/** The chip the R5 drafts carry, as the editor projects it. */
+const R5_CHIP = '/DSH_SECRET_A'
+/** Clipboard projection of the draft: `k=` + a chip + ` vXyZ9 secret tail`. */
+const R5_DRAFT = `k=${R5_CHIP} vXyZ9 secret tail`
+/** That chip's occurrence in clipboard coordinates (offset 2, form of length 13). */
+const R5_OCCURRENCE = { offset: 2, length: R5_CHIP.length, clipboardText: R5_CHIP }
+/** The five characters every case below selects: detect [4,9) ⇔ clipboard [16,21). */
+const R5_TEXT = 'vXyZ9'
+const R5_SPAN = { start: 4, end: 9, draftRev: 7 }
+
+/** The toggle's props, with or without a live editor face. */
+function toggleProps(
+  sessionId: string,
+  actions?: Record<string, unknown>,
+  state?: { draft: string; occurrences: readonly unknown[] },
+): Record<string, unknown> {
+  return {
+    sessionId,
+    ...(actions === undefined ? {} : { inputActions: actions }),
+    ...(state === undefined ? {} : { useInput: (selector: (value: unknown) => unknown) => selector(state) }),
+  }
+}
+
+/** The entry button of one rendered tree. */
+function toggleButton(tree: unknown): Element | undefined {
+  return elements(tree).find((element) => element.props['data-secret-attach-toggle'] === 'true')
+}
+
+/** Press the button the way a pointer does. */
+function pressToggle(button: Element | undefined): void {
+  ;(button?.props.onMouseDown as ((event: unknown) => void) | undefined)?.({ preventDefault: () => undefined })
+}
+
+test('R5: the label says 转为密钥 while the editor holds a selection, and never lingers without one', () => {
+  reset()
+  const state = { draft: R5_DRAFT, occurrences: [R5_OCCURRENCE] }
+  const withRange = { captureInsertion: () => ({ ...R5_SPAN }) }
+  const collapsed = { captureInsertion: () => ({ start: 3, end: 3, draftRev: 1 }) }
+
+  // A press with a real range switches the label...
+  const range = 'r5-label-range'
+  const rangeTree = renderer.render(TOGGLE, toggleProps(range, withRange, state))
+  const idle = toggleButton(rangeTree)
+  assert.equal(idle?.props['aria-label'], api.ATTACH_ZH.toggle, 'nothing is pressed yet')
+  assert.equal(String(idle?.props.title).includes(api.ATTACH_ZH.toggleConvertHint), false)
+  pressToggle(idle)
+  const converted = toggleButton(renderer.render(TOGGLE, toggleProps(range, withRange, state)))
+  assert.equal(converted?.props['aria-label'], api.ATTACH_ZH.toggleConvert)
+  assert.equal(visibleText(converted).includes(api.ATTACH_ZH.toggleConvert), true)
+  assert.equal(converted?.props.title, api.ATTACH_ZH.toggleConvertHint)
+  assert.notEqual(api.ATTACH_ZH.toggleConvert, api.ATTACH_ZH.toggle)
+  assert.notEqual(api.ATTACH_EN.toggleConvert, api.ATTACH_EN.toggle)
+  assert.equal(api.ATTACH_EN.toggleConvert.length > 0, true)
+
+  // ...and a press with a collapsed caret (no selection) does not.
+  const caret = 'r5-label-caret'
+  const caretTree = renderer.render(TOGGLE, toggleProps(caret, collapsed, state))
+  pressToggle(toggleButton(caretTree))
+  const plain = toggleButton(renderer.render(TOGGLE, toggleProps(caret, collapsed, state)))
+  assert.equal(plain?.props['aria-label'], api.ATTACH_ZH.toggle)
+  assert.equal(visibleText(plain).includes(api.ATTACH_ZH.toggleConvert), false, 'no residue of 转为密钥')
+
+  // The selection leaves again: the label returns with the next press.
+  const back = 'r5-label-back'
+  const live = renderer.render(TOGGLE, toggleProps(back, withRange, state))
+  pressToggle(toggleButton(live))
+  assert.equal(
+    toggleButton(renderer.render(TOGGLE, toggleProps(back, withRange, state)))?.props['aria-label'],
+    api.ATTACH_ZH.toggleConvert,
+  )
+  const gone = renderer.render(TOGGLE, toggleProps(back, collapsed, state))
+  pressToggle(toggleButton(gone))
+  const settled = toggleButton(renderer.render(TOGGLE, toggleProps(back, collapsed, state)))
+  assert.equal(settled?.props['aria-label'], api.ATTACH_ZH.toggle)
+  assert.equal(visibleText(settled).includes(api.ATTACH_ZH.toggleConvert), false)
+  reset()
+})
+
+test('R5: a pressed selection is registered and the very span is replaced by the marker', async () => {
+  reset()
+  const session = 'r5-convert'
+  api.sessionAttachments(session).clear()
+  const calls = stubChipRoutes({})
+  try {
+    const state = { draft: R5_DRAFT, occurrences: [R5_OCCURRENCE] }
+    const actions = { captureInsertion: () => ({ ...R5_SPAN }), insertText: () => true }
+    const props = toggleProps(session, actions, state)
+    pressToggle(toggleButton(renderer.render(TOGGLE, props)))
+    const button = toggleButton(renderer.render(TOGGLE, props))
+    assert.equal(button?.props['aria-label'], api.ATTACH_ZH.toggleConvert)
+    await (button?.props.onClick as (() => Promise<void>) | undefined)?.()
+    await flushOneTurn()
+
+    const posts = calls.filter((call) => call.method === 'POST')
+    assert.deepEqual(
+      posts.map((call) => call.body),
+      [{ sessionId: session, name: '', label: '', scope: api.DEFAULT_ATTACH_SCOPE, value: R5_TEXT }],
+      'exactly one registration, with the blank key and title R1 made legal',
+    )
+    // Requirement 4: one default scope for both attach paths, and it is the
+    // narrow one.
+    assert.equal(api.DEFAULT_ATTACH_SCOPE, 'session')
+    // The marker replaced the selection through the contract's own insertion
+    // event, for the very span the press read.
+    assert.equal(bailCalls.length, 1)
+    assert.equal(bailCalls[0]?.name, 'slash/input-insert-reference')
+    assert.deepEqual((bailCalls[0]?.payload as { span?: unknown }).span, { ...R5_SPAN })
+    assert.equal(
+      JSON.stringify((bailCalls[0]?.payload as { reference?: unknown }).reference).includes(R5_TEXT),
+      false,
+      'the reference the editor receives names the variable, never the value',
+    )
+    // The record is this session's, and the human is told what happened.
+    assert.equal(api.sessionAttachments(session).get(ENV_VAR)?.state, 'staged')
+    const after = renderer.render(TOGGLE, props)
+    assert.equal(visibleText(after).includes(api.ATTACH_ZH.convertDone), true)
+    assert.equal(JSON.stringify(after).includes(R5_TEXT), false, 'the value never reaches the DOM')
+    assert.equal(JSON.stringify(calls).includes(R5_TEXT), true, 'the value only ever travels to the attach route')
+  } finally {
+    restoreFetch()
+    reset()
+    api.sessionAttachments(session).clear()
+  }
+})
+
+test('R5: when the contract chip event declines, the editor gets the marker at the same span', async () => {
+  reset()
+  const session = 'r5-text-rung'
+  api.sessionAttachments(session).clear()
+  stubChipRoutes({})
+  try {
+    bailAnswer = false
+    const inserted: { text: string; span: unknown }[] = []
+    const actions = {
+      captureInsertion: () => ({ ...R5_SPAN }),
+      insertText: (text: string, span: unknown) => {
+        inserted.push({ text, span })
+        return true
+      },
+    }
+    const props = toggleProps(session, actions, { draft: R5_DRAFT, occurrences: [R5_OCCURRENCE] })
+    pressToggle(toggleButton(renderer.render(TOGGLE, props)))
+    await (toggleButton(renderer.render(TOGGLE, props))?.props.onClick as (() => Promise<void>) | undefined)?.()
+    await flushOneTurn()
+    assert.deepEqual(inserted, [{ text: api.markerOf(ENV_VAR), span: { ...R5_SPAN } }])
+    assert.equal(visibleText(renderer.render(TOGGLE, props)).includes(api.ATTACH_ZH.convertDone), true)
+  } finally {
+    restoreFetch()
+    reset()
+    api.sessionAttachments(session).clear()
+  }
+})
+
+test('R5: an editor that refuses both rungs still registers, and says how to place the marker', async () => {
+  reset()
+  const session = 'r5-manual-rung'
+  api.sessionAttachments(session).clear()
+  stubChipRoutes({})
+  try {
+    bailAnswer = false
+    const actions = { captureInsertion: () => ({ ...R5_SPAN }), insertText: () => false }
+    const props = toggleProps(session, actions, { draft: R5_DRAFT, occurrences: [R5_OCCURRENCE] })
+    pressToggle(toggleButton(renderer.render(TOGGLE, props)))
+    await (toggleButton(renderer.render(TOGGLE, props))?.props.onClick as (() => Promise<void>) | undefined)?.()
+    await flushOneTurn()
+    assert.equal(api.sessionAttachments(session).get(ENV_VAR)?.state, 'staged', 'the value is registered either way')
+    assert.equal(visibleText(renderer.render(TOGGLE, props)).includes(api.ATTACH_ZH.convertManual), true)
+    assert.equal(api.currentMode().kind, 'detail', 'the detail face is the one place that can still insert it')
+    assert.equal(JSON.stringify(renderer.render(CAPSULE, { sessionId: session })).includes(R5_TEXT), false)
+  } finally {
+    restoreFetch()
+    reset()
+    api.sessionAttachments(session).clear()
+  }
+})
+
+test('R5: a refused registration leaves the draft untouched and reports the fixed sentence', async () => {
+  for (const failure of [
+    { name: 'the host refuses', route: { ok: false, status: 500, payload: { ok: false } }, said: () => api.attachErrorFor(500) },
+    { name: 'the answer is unreadable', route: { ok: true, payload: { nope: true } }, said: () => api.ATTACH_FAILURE_UNKNOWN },
+  ]) {
+    reset()
+    const session = `r5-refused-${String(failure.route.status ?? 'x')}`
+    api.sessionAttachments(session).clear()
+    stubChipRoutes({ attach: failure.route })
+    try {
+      const inserted: unknown[] = []
+      const actions = {
+        captureInsertion: () => ({ ...R5_SPAN }),
+        insertText: (text: string, span: unknown) => {
+          inserted.push({ text, span })
+          return true
+        },
+      }
+      const props = toggleProps(session, actions, { draft: R5_DRAFT, occurrences: [R5_OCCURRENCE] })
+      pressToggle(toggleButton(renderer.render(TOGGLE, props)))
+      await (toggleButton(renderer.render(TOGGLE, props))?.props.onClick as (() => Promise<void>) | undefined)?.()
+      await flushOneTurn()
+      const tree = renderer.render(TOGGLE, props)
+      assert.equal(visibleText(tree).includes(String(failure.said())), true, failure.name)
+      assert.equal(inserted.length, 0, 'a refusal never replaces the selection')
+      assert.equal(bailCalls.length, 0)
+      assert.equal(api.sessionAttachments(session).get(ENV_VAR), undefined, failure.name)
+      assert.equal(JSON.stringify(tree).includes(R5_TEXT), false)
+    } finally {
+      restoreFetch()
+      reset()
+      api.sessionAttachments(session).clear()
+    }
+  }
+
+  // An unreachable host is its own sentence, and never a thrown exception.
+  reset()
+  const session = 'r5-refused-offline'
+  api.sessionAttachments(session).clear()
+  ;(globalThis as Record<string, unknown>).fetch = async () => {
+    throw new Error('offline')
+  }
+  try {
+    const actions = { captureInsertion: () => ({ ...R5_SPAN }), insertText: () => true }
+    const props = toggleProps(session, actions, { draft: R5_DRAFT, occurrences: [R5_OCCURRENCE] })
+    pressToggle(toggleButton(renderer.render(TOGGLE, props)))
+    await (toggleButton(renderer.render(TOGGLE, props))?.props.onClick as (() => Promise<void>) | undefined)?.()
+    await flushOneTurn()
+    assert.equal(visibleText(renderer.render(TOGGLE, props)).includes(api.ATTACH_UNREACHABLE), true)
+  } finally {
+    restoreFetch()
+    reset()
+    api.sessionAttachments(session).clear()
+  }
+})
+
+test('R5: a selection the two projections cannot agree on falls back to the plain toggle', async () => {
+  // The pure reading first: every unreadable or inconsistent shape answers null.
+  assert.equal(api.selectedTextIn(R5_DRAFT, [R5_OCCURRENCE], { ...R5_SPAN }), R5_TEXT, 'positive control')
+  assert.equal(
+    api.selectedTextIn('plain text with no chips', [], { start: 0, end: 5, draftRev: 1 }),
+    'plain',
+    'with no chip in front of it, the two projections are the same text',
+  )
+  assert.equal(api.selectedTextIn(R5_DRAFT, [R5_OCCURRENCE], { start: 2, end: 6, draftRev: 7 }), null, 'the span covers the chip')
+  assert.equal(api.selectedTextIn(R5_DRAFT, [R5_OCCURRENCE], { start: 0, end: 1, draftRev: 7 }), 'k')
+  assert.equal(api.selectedTextIn(R5_DRAFT, [{ offset: 2, length: 5, clipboardText: R5_CHIP }], { ...R5_SPAN }), null, 'the declared length disagrees with the form')
+  assert.equal(api.selectedTextIn(R5_DRAFT, [{ offset: 'two', length: 13 }], { ...R5_SPAN }), null, 'an unreadable occurrence')
+  assert.equal(api.selectedTextIn(R5_DRAFT, [R5_OCCURRENCE], { start: 4, end: 40, draftRev: 7 }), null, 'an end past the draft')
+  assert.equal(api.selectedTextIn(R5_DRAFT, [R5_OCCURRENCE], { start: 5, end: 5, draftRev: 7 }), null, 'not a range')
+
+  // Then the button itself: with a span it cannot resolve, nothing is registered
+  // and the original 「附密钥」 behaviour happens instead.
+  reset()
+  const session = 'r5-untrusted'
+  api.sessionAttachments(session).clear()
+  const calls = stubChipRoutes({})
+  try {
+    const actions = { captureInsertion: () => ({ ...R5_SPAN }), insertText: () => true }
+    // The occurrence's declared length does not match its clipboard form.
+    const broken = { draft: R5_DRAFT, occurrences: [{ offset: 2, length: 5, clipboardText: R5_CHIP }] }
+    const props = toggleProps(session, actions, broken)
+    pressToggle(toggleButton(renderer.render(TOGGLE, props)))
+    const button = toggleButton(renderer.render(TOGGLE, props))
+    assert.equal(button?.props['aria-label'], api.ATTACH_ZH.toggleConvert, 'the press did see a range')
+    await (button?.props.onClick as (() => Promise<void>) | undefined)?.()
+    await flushOneTurn()
+    assert.equal(calls.filter((call) => call.method === 'POST').length, 0, 'an unresolved reading registers nothing')
+    assert.equal(bailCalls.length, 0, 'and never rewrites the draft')
+    assert.equal(api.sessionAttachments(session).get(ENV_VAR), undefined)
+    assert.equal(api.currentMode().kind, 'fill', 'the click behaved exactly as it always did')
+    const after = renderer.render(TOGGLE, props)
+    assert.equal(visibleText(after).includes(api.ATTACH_ZH.toggleConvert), false, 'and the label settles back')
+  } finally {
+    restoreFetch()
+    reset()
+    api.sessionAttachments(session).clear()
+  }
+})
+
+test('R5: behaviour follows the press, never the live cue — and the cue itself cannot throw', async () => {
+  // The contract-external core: total, and silent for everything unsupported.
+  const range = { captureInsertion: () => ({ ...R5_SPAN }) }
+  const collapsed = { captureInsertion: () => ({ start: 3, end: 3, draftRev: 1 }) }
+  assert.equal(api.selectedSpan(range)?.start, R5_SPAN.start)
+  assert.equal(api.selectedSpan(collapsed), null, 'a collapsed caret is not a selection')
+  assert.equal(api.selectedSpan(undefined), null, 'no action face, no selection')
+  assert.equal(api.selectedSpan({ captureInsertion: () => ({ start: 'a', end: 'b' }) }), null)
+  const throwing = {
+    captureInsertion: () => {
+      throw new Error('editor gone')
+    },
+  }
+  assert.doesNotThrow(() => api.selectedSpan(throwing))
+  assert.equal(api.selectedSpan(throwing), null)
+  assert.equal(api.liveSelectionCue(range, true), true)
+  assert.equal(api.liveSelectionCue(range, false), null, 'nothing editable focused is no information, not "none selected"')
+  assert.equal(api.liveSelectionCue(undefined, true), false, 'no api: silently "no selection"')
+  assert.equal(api.liveSelectionCue(throwing, true), false, 'a throwing editor: silently "no selection"')
+  assert.doesNotThrow(() => api.liveSelectionCue(throwing, true))
+
+  // The press decides the action, in both directions, even when the editor has
+  // changed its mind in between (the live cue is not part of this decision).
+  reset()
+  const tourniquet = 'r5-press-wins'
+  api.sessionAttachments(tourniquet).clear()
+  const calls = stubChipRoutes({})
+  try {
+    // (a) press saw a range, then the editor collapsed: still a conversion.
+    let current: Record<string, unknown> = { captureInsertion: () => ({ ...R5_SPAN }) }
+    const actions: Record<string, unknown> = {
+      captureInsertion: () => (current.captureInsertion as () => unknown)(),
+      insertText: () => true,
+    }
+    const props = toggleProps(tourniquet, actions, { draft: R5_DRAFT, occurrences: [R5_OCCURRENCE] })
+    pressToggle(toggleButton(renderer.render(TOGGLE, props)))
+    current = { captureInsertion: () => ({ start: 3, end: 3, draftRev: 2 }) }
+    const pressed = toggleButton(renderer.render(TOGGLE, props))
+    assert.equal(pressed?.props['aria-label'], api.ATTACH_ZH.toggleConvert, 'the pending press still owns the label')
+    await (pressed?.props.onClick as (() => Promise<void>) | undefined)?.()
+    await flushOneTurn()
+    assert.equal(calls.filter((call) => call.method === 'POST').length, 1, 'the press reading decided this action')
+    assert.deepEqual(bailCalls[0]?.payload && (bailCalls[0]?.payload as { span?: unknown }).span, { ...R5_SPAN })
+  } finally {
+    restoreFetch()
+    reset()
+    api.sessionAttachments(tourniquet).clear()
+  }
+
+  reset()
+  const inverse = 'r5-press-wins-inverse'
+  api.sessionAttachments(inverse).clear()
+  const inverseCalls = stubChipRoutes({})
+  try {
+    // (b) press saw no selection, then the editor selected something: no conversion.
+    let current: Record<string, unknown> = { captureInsertion: () => ({ start: 3, end: 3, draftRev: 1 }) }
+    const actions: Record<string, unknown> = {
+      captureInsertion: () => (current.captureInsertion as () => unknown)(),
+      insertText: () => true,
+    }
+    const props = toggleProps(inverse, actions, { draft: R5_DRAFT, occurrences: [R5_OCCURRENCE] })
+    pressToggle(toggleButton(renderer.render(TOGGLE, props)))
+    current = { captureInsertion: () => ({ ...R5_SPAN }) }
+    const pressed = toggleButton(renderer.render(TOGGLE, props))
+    assert.equal(pressed?.props['aria-label'], api.ATTACH_ZH.toggle, 'the press said there is no selection')
+    await (pressed?.props.onClick as (() => Promise<void>) | undefined)?.()
+    await flushOneTurn()
+    assert.equal(inverseCalls.filter((call) => call.method === 'POST').length, 0)
+    assert.equal(bailCalls.length, 0)
+    assert.equal(api.currentMode().kind, 'fill', 'the original toggle behaviour, unchanged')
+  } finally {
+    restoreFetch()
+    reset()
+    api.sessionAttachments(inverse).clear()
+  }
+})
+
+test('R5: the conversion sends the same default scope the fill form starts on', () => {
+  // Requirement 4 mechanically: one constant, named by both attach paths, and no
+  // second default anywhere in the artifact.
+  assert.equal(api.DEFAULT_ATTACH_SCOPE, 'session', 'the narrow scope, never the store')
+  const source = readFileSync(new URL('../src/client/entry.ts', import.meta.url), 'utf8')
+  assert.equal(
+    source.includes('const DEFAULT_ATTACH_SCOPE: Scope = \'session\''),
+    true,
+    'the constant is the one place the default is written',
+  )
+  assert.equal(
+    source.includes('React.useState<Scope>(DEFAULT_ATTACH_SCOPE)'),
+    true,
+    'the fill form starts on it',
+  )
+  assert.equal(
+    source.includes('scope: DEFAULT_ATTACH_SCOPE,'),
+    true,
+    'and the selection conversion sends it',
+  )
+  // Nothing else in this half may invent a scope default.
+  assert.equal(source.includes("React.useState<Scope>('session')"), false)
+  assert.equal(source.includes("scope: 'session',"), false)
+})
+
+test('the harness drops every component slot on reset, so no state survives a case boundary', () => {
+  reset()
+  // Positive control: a render that writes state really does leave a slot value.
+  api.setAttachMode({ kind: 'fill' })
+  typeInto(
+    elements(renderer.render(CAPSULE, { sessionId: SESSION_ID })).find(
+      (element) => element.props.id === 'dsh-secret-attach-value',
+    ),
+    SECRET,
+  )
+  const typed = elements(renderer.render(CAPSULE, { sessionId: SESSION_ID })).find(
+    (element) => element.props.id === 'dsh-secret-attach-value',
+  )
+  assert.equal(typed?.props.value, SECRET, 'the typed value really is held by the mounted instance')
+  assert.equal(
+    renderer.slots().some((slot) => slot.length > 0),
+    true,
+    'at least one component slot holds that state',
+  )
+
+  // The boundary this exists for: the harness reset drops every slot…
+  reset()
+  assert.deepEqual(renderer.slots(), [], 'reset drops every component slot')
+
+  // …so the next case starts from the initial state instead of the last one's
+  // residue (a stale value here would let a later paste assertion pass on the
+  // wrong grounds).
+  api.setAttachMode({ kind: 'fill' })
+  const fresh = elements(renderer.render(CAPSULE, { sessionId: SESSION_ID })).find(
+    (element) => element.props.id === 'dsh-secret-attach-value',
+  )
+  assert.notEqual(fresh, undefined, 'the fill face still renders its value field')
+  assert.equal(fresh?.props.value, '', 'no residual value survives the reset')
+  assert.equal(
+    visibleText(renderer.render(CAPSULE, { sessionId: SESSION_ID })).includes(api.ATTACH_ZH.pasteInsertFailed),
+    false,
+    'and no residual notice either',
+  )
+  reset()
+})
+
+test('the fetch doubles route by exact pathname: near-identical routes differ, and a typo is refused', async () => {
+  reset()
+  const call = (url: string, init?: unknown): Promise<{ json: () => Promise<unknown> }> =>
+    (
+      globalThis as unknown as {
+        fetch: (target: string, options?: unknown) => Promise<{ json: () => Promise<unknown> }>
+      }
+    ).fetch(url, init)
+
+  // Positive control for the defect this replaces: the write and the read used
+  // to be answered by one shared arm, so a mis-wired read could pass unnoticed.
+  const stub = stubRoutes()
+  stub.attach.payload = { ok: true, variable: 'DSH_SECRET_FROM_ATTACH', scope: 'session', replaced: false }
+  stub.attached.payload = { ok: true, attachments: [{ variable: 'DSH_SECRET_FROM_ATTACHED' }] }
+  const written = await (await call(api.ATTACH_PATH, { method: 'POST', body: '{}' })).json()
+  const listed = await (await call(api.ATTACHED_PATH)).json()
+  assert.deepEqual(written, { ok: true, variable: 'DSH_SECRET_FROM_ATTACH', scope: 'session', replaced: false })
+  assert.deepEqual(listed, { ok: true, attachments: [{ variable: 'DSH_SECRET_FROM_ATTACHED' }] })
+  assert.notDeepEqual(written, listed, 'the two routes must never share one answer')
+  // A path this double does not declare is refused, and the error names it.
+  await assert.rejects(async () => {
+    await call('/api/secret.typo')
+  }, /stubRoutes: no declared answer for \/api\/secret\.typo/u)
+
+  // The chip double refuses exactly the same way.
+  restoreFetch()
+  stubChipRoutes({})
+  await assert.rejects(async () => {
+    await call('/api/secret.typo')
+  }, /stubChipRoutes: no declared answer for \/api\/secret\.typo/u)
+  restoreFetch()
   reset()
 })

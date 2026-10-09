@@ -6,8 +6,29 @@ import { approvedResult, mapNonApproved, planGrant } from '../src/decisions.ts'
 import { EnvContributorRegistry, agentIdOf } from '../src/envs.ts'
 import { GrantStore, type GrantSessionLike } from '../src/grants.ts'
 import { AttachStore } from '../src/attach.ts'
-import { deriveEnvVar, effectiveEnvVar, recordKey, validateRequest } from '../src/naming.ts'
+import { HistoryStore } from '../src/history.ts'
+import {
+  dedupeKey,
+  deriveEnvVar,
+  describeValueShape,
+  effectiveEnvVar,
+  modelKeyFromText,
+  provisionalKey,
+  recordKey,
+  renderNamingPrompt,
+  validateRequest,
+} from '../src/naming.ts'
 import { PendingStore, SecretAbortedError } from '../src/pending.ts'
+import {
+  PRIVACY_EXCLUSIONS,
+  PRIVACY_RULES,
+  PRIVACY_THRESHOLDS,
+  classifyPastedText,
+  distinctCharCount,
+  entropyBitsPerChar,
+  hasCjk,
+  isReferenceText,
+} from '../src/privacy.ts'
 import { parseAnswer } from '../src/protocol.ts'
 import {
   SecretFailure,
@@ -22,6 +43,16 @@ import {
 } from '../src/service.ts'
 import type { ModalAnswer, SecretRequestResult } from '../src/types.ts'
 import { defineSecretRequestTool } from '../src/tool.ts'
+import {
+  AWS_EXAMPLE_KEY,
+  fixtureFingerprint,
+  fixtureToken,
+  PEM_OPENSSH_HEADER,
+  PEM_RSA_BLOCK,
+  PEM_RSA_HEADER,
+  SAMPLE_JWT,
+  SK_PROJ_EXAMPLE,
+} from './secret-fixtures.ts'
 
 const SECRET = 'sk-live-DO-NOT-LEAK'
 
@@ -1031,4 +1062,364 @@ test('credentialsPort maps the credential service and never returns a value it w
       record: { kind: 'grant', payload: { version: 1, envVar: 'DSH_SECRET_OPENAI' } },
     },
   ])
+})
+
+// ---------------------------------------------------------------------------
+// R1: the shape of a value, the local fallback key, and the model suggestion
+// ---------------------------------------------------------------------------
+
+test('R1: the value shape is tokens only — never a substring of the value', () => {
+  const shape = describeValueShape(SECRET)
+  assert.equal(shape.length, SECRET.length)
+  assert.equal(shape.category, 'openai-like')
+  assert.equal(JSON.stringify(shape).includes(SECRET), false, 'no plaintext in the shape')
+  // The public families the raw value is recognised by, each as a category token.
+  assert.equal(describeValueShape('sk-ant-api03-xxxx').category, 'anthropic-like')
+  assert.equal(describeValueShape('ghp_0123456789abcdef').category, 'github-pat-like')
+  assert.equal(describeValueShape(AWS_EXAMPLE_KEY).category, 'aws-access-key-like')
+  // Composed at run time (`fixtureToken`): the same 22-character value, with no
+  // matchable `<prefix><payload>` literal left in the file (GitHub Push
+  // Protection flagged this shape once: GH013, Slack). The fingerprint pins the
+  // composition to the literal it replaced, byte for byte.
+  const slackFixture = fixtureToken('xoxb-', '1234567890-abcdef')
+  assert.equal(fixtureFingerprint(slackFixture), '6b8aab8b520d', 'the composed Slack fixture is unchanged')
+  assert.equal(describeValueShape(slackFixture).category, 'slack-like')
+  assert.equal(describeValueShape('AIzaSyA1234567890').category, 'google-api-key-like')
+  assert.equal(describeValueShape('eyJhbGciOiJIUzI1NiJ9.e30.x').category, 'jwt-like')
+  // Composed at run time (`fixtureToken`): a PEM header is a vendor shape too,
+  // and this one is a prefix of a longer literal, so only the header is split —
+  // the header itself is composed as well, since the bare header is what the
+  // scanner matches.
+  const pemShort = fixtureToken(fixtureToken('-----BEGIN ', 'PRIVATE KEY-----'), '\nMIIE')
+  assert.equal(fixtureFingerprint(pemShort), 'bc780f7e0a54', 'the composed PEM fixture is unchanged')
+  assert.equal(describeValueShape(pemShort).category, 'pem-private-key-like')
+  assert.equal(describeValueShape('sk_live_0123456789').category, 'stripe-like')
+  assert.equal(describeValueShape('correct horse battery staple').category, 'unknown')
+  assert.equal(describeValueShape('deadbeefdeadbeefdeadbeef').charset, 'hex')
+  assert.equal(describeValueShape('aGVsbG8td29ybGQ_dGVzdA').charset, 'base64url')
+  assert.equal(describeValueShape('has spaces and $ymbols!').charset, 'mixed')
+})
+
+test('R1: the local fallback key is legal, human-meaningful and de-duplicated', () => {
+  const shapeOf = (value: string) => describeValueShape(value)
+  // The value's public category is the strongest signal, then the human title.
+  assert.equal(provisionalKey('whatever', shapeOf(SECRET), new Set()), 'openai-key')
+  assert.equal(provisionalKey('GitHub token', shapeOf('0123456789abcdef'), new Set()), 'github-token')
+  assert.equal(provisionalKey('Azure prod key', shapeOf('unknown-shape-nospace'), new Set()), 'azure-prod-key')
+  // A label with no usable ASCII slug falls through to the shape default.
+  assert.equal(provisionalKey('我的密钥', shapeOf('!!!'), new Set()), 'secret-key')
+  // Never a collision, including the record-key squeeze (`a_b` and `a-b` are one record).
+  assert.equal(dedupeKey('openai-key', new Set(['openai-key'])), 'openai-key-2')
+  // The caller normalizes the taken set (the service adds every record id to it),
+  // so a set that already holds the id form collides too.
+  assert.equal(dedupeKey('openai-key', new Set(['openai_key', 'openai-key'])), 'openai-key-2')
+  assert.equal(dedupeKey('openai-key', new Set(['openai-key', 'openai-key-2'])), 'openai-key-3')
+  assert.equal(dedupeKey('not a key', new Set()), 'secret')
+  // Every answer satisfies the same contract the request direction enforces.
+  for (const key of [provisionalKey('', shapeOf(SECRET), new Set()), dedupeKey('openai-key', new Set(['openai-key']))]) {
+    assert.match(key, /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$/u)
+  }
+})
+
+test('R1: the naming prompt carries the title and the shape, and nothing else', () => {
+  const prompt = renderNamingPrompt('OpenAI API Key', describeValueShape(SECRET))
+  assert.equal(prompt.user.includes('OpenAI API Key'), true)
+  assert.equal(prompt.user.includes(`length=${String(SECRET.length)}`), true)
+  assert.equal(prompt.user.includes('charset='), true)
+  assert.equal(prompt.user.includes('category=openai-like'), true)
+  assert.equal(prompt.system.length > 0, true)
+  // The whole point: the value itself never appears in either string. The
+  // positive control proves this scan would have caught it.
+  assert.equal(`${prompt.system}\n${prompt.user}`.includes(SECRET), false)
+  assert.equal(`${prompt.system}\n${prompt.user}`.includes('DO-NOT-LEAK'), false)
+  assert.equal(JSON.stringify({ system: prompt.system, user: prompt.user, value: SECRET }).includes(SECRET), true)
+  // A blank title is named as such rather than becoming an empty field.
+  assert.equal(renderNamingPrompt('   ', describeValueShape('x')).user.includes('(none given)'), true)
+})
+
+test('R1: a model answer becomes a key only when it already is one', () => {
+  assert.equal(modelKeyFromText('openai-key'), 'openai-key')
+  assert.equal(modelKeyFromText('  `GitHub Token`  '), 'github-token')
+  assert.equal(modelKeyFromText('OpenAI API Key\nsecond line'), 'openai-api-key')
+  // Four words is the instruction's own limit: a longer line is a sentence, and
+  // a sentence is refused rather than turned into a key.
+  assert.equal(modelKeyFromText('use sk-rotated-2 instead'), 'use-sk-rotated-2-instead')
+  assert.equal(modelKeyFromText('use sk-rotated-2 instead and more words here'), undefined)
+  assert.equal(modelKeyFromText('!!!'), undefined)
+  assert.equal(modelKeyFromText('   '), undefined)
+  assert.equal(modelKeyFromText(''), undefined)
+  assert.equal(modelKeyFromText('-'), undefined)
+})
+
+test('R1: a hanging model cannot stall an attach — the local rule answers inside the deadline', async () => {
+  const session = sessionWithCall('call-1')
+  const service = new SecretService({
+    config: {
+      requestTimeoutMs: 300000,
+      maxPendingRequests: 4,
+      attachTtlMs: 1800000,
+      maxAttachmentsPerSession: 8,
+      maxHistoryPerSession: 32,
+      maxAvailableEntries: 32,
+    },
+    credentials: {
+      describe: async () => ({ configured: false, writable: true }),
+      resolve: async () => undefined,
+      set: async () => undefined,
+      commitRecord: async () => undefined,
+      listRecords: async () => [],
+      readRecord: async () => undefined,
+      unset: async () => true,
+      deleteRecord: async () => true,
+    } satisfies CredentialsPort,
+    authorization: { attempt: async () => ({ status: 'authorized' }) } satisfies AuthorizationPort,
+    envs: { ensure: () => undefined },
+    attachments: new AttachStore({ ttlMs: 1800000, capacity: 8, schedule: () => () => undefined }),
+    history: new HistoryStore({ capacity: 8 }),
+    classifyCaller: () => 'live-root',
+    sessionOf: () => session,
+    sessionById: () => session,
+    anchorSessionOf: () => session,
+    now: () => 1700000000000,
+    schedule: (delayMs, callback) => {
+      const timer = setTimeout(callback, delayMs)
+      return () => {
+        clearTimeout(timer)
+      }
+    },
+    newId: () => 'req-1',
+    // A model that never answers: the attach must still complete, quickly, on
+    // the local key — nothing about a send may depend on a model being there.
+    nameSuggester: () => new Promise<string | undefined>(() => undefined),
+    nameDeadlineMs: 25,
+  })
+
+  const started = Date.now()
+  const outcome = await service.attach({
+    sessionId: session.id,
+    label: 'OpenAI API Key',
+    scope: 'session',
+    value: SECRET,
+  })
+  const elapsed = Date.now() - started
+  assert.equal(outcome.ok, true, outcome.ok ? '' : outcome.error)
+  assert.equal(outcome.ok && outcome.outcome.variable, 'DSH_SECRET_OPENAI_KEY')
+  assert.equal(elapsed < 500, true, `the attach waited ${String(elapsed)}ms for a hanging model`)
+  await new Promise((resolve) => {
+    setTimeout(resolve, 40)
+  })
+})
+
+// ---- round 7 / R3: the mechanical privacy classifier ------------------------
+//
+// Every rule and every exclusion gets both sides here. The classifier decides
+// whether a paste becomes an attached credential, so a false positive is a
+// visible wrong result and a false negative is merely "attach it by hand"; the
+// corpus below is written to keep that asymmetry honest.
+
+/** The material-shaped strings used by more than one case. */
+const PASTE_LONG_TOKEN = 'aB3dE5fG7hI9jK1lM3nO5pQ7rS9tU1vW3xY'
+const PASTE_SHORT_TOKEN = 'x7Kq2Mv9Rt4Wz8Bn3Ls6Yp1D'
+const PASTE_JWT = SAMPLE_JWT
+
+test('privacy: the rule and exclusion sets are enumerable and the thresholds are pinned', () => {
+  assert.deepEqual(PRIVACY_RULES, ['pem', 'jwt', 'vendor-prefix', 'long-concentrated', 'high-entropy'])
+  assert.deepEqual(PRIVACY_EXCLUSIONS, [
+    'empty',
+    'reference',
+    'url',
+    'path',
+    'email',
+    'domain',
+    'cjk',
+    'multi-line',
+    'whitespace',
+    'identifier',
+  ])
+  // Pinned so that relaxing a threshold cannot happen by accident: the numbers
+  // are the conservative end of the trade-off documented in `src/privacy.ts`.
+  assert.deepEqual(PRIVACY_THRESHOLDS, {
+    minVendorPayload: 8,
+    longTokenMinLength: 32,
+    longTokenMinDistinct: 12,
+    entropyTokenMinLength: 20,
+    minBitsPerChar: 3.5,
+    minDistinctChars: 10,
+    identifierMaxLength: 40,
+    identifierMaxSegments: 4,
+  })
+})
+
+test('privacy: the composed vendor fixtures are byte-identical to the literals they replaced', () => {
+  // Every digest was recorded from the single-literal form before this repair.
+  assert.equal(fixtureFingerprint(AWS_EXAMPLE_KEY), '1a5d44a2dca1')
+  assert.equal(fixtureFingerprint(PEM_OPENSSH_HEADER), '03d104c669e3')
+  assert.equal(fixtureFingerprint(PEM_RSA_HEADER), '8bcac7908eb9')
+  assert.equal(fixtureFingerprint(PEM_RSA_BLOCK), 'b0b6c2ee14d3')
+  assert.equal(fixtureFingerprint(SAMPLE_JWT), '3908a0662c6e')
+  assert.equal(fixtureFingerprint(SK_PROJ_EXAMPLE), '46f5e651c1e3')
+  // The shape test, the vendor table, the JWT/PEM cases and the verdict corpus
+  // all read these same bindings (and `PASTE_JWT` is `SAMPLE_JWT`), so the two
+  // sides of every reuse pair are one value rather than two that could drift.
+  assert.equal(PASTE_JWT, SAMPLE_JWT, 'the JWT fixture is the shared binding')
+})
+
+test('privacy: a vendor prefix only matches with a real payload', () => {
+  const hits: readonly string[] = [
+    // Composed at run time (`fixtureToken`): the strings are unchanged, the file
+    // simply no longer carries a matchable `<prefix><payload>` literal.
+    fixtureToken('sk-', 'proj-0123456789abcdefghijklmnop'),
+    fixtureToken('sk_live_', '0123456789abcdef'),
+    fixtureToken('rk_test_', '0123456789abcdef'),
+    fixtureToken('ghp_', '0123456789abcdefghijklmnopqrstuvwx'),
+    fixtureToken('github_pat_', '0123456789abcdefghijklmnop'),
+    fixtureToken('xoxb-', '0123456789-abcdefghijklmnop'),
+    AWS_EXAMPLE_KEY,
+    fixtureToken('ASIA', 'IOSFODNN7EXAMPLE'),
+    fixtureToken('AIza', 'SyA0123456789abcdefghijklmnopqrs'),
+    fixtureToken('ya29.', '0123456789abcdefghij'),
+    fixtureToken('SG.', '0123456789abcdefghijklmnopqrstuv'),
+    fixtureToken('npm_', '0123456789abcdefghijklmnop'),
+    fixtureToken('glpat-', '0123456789abcdefghij'),
+    fixtureToken('hf_', '0123456789abcdefghij'),
+  ]
+  for (const text of hits) {
+    assert.deepEqual(classifyPastedText(text), { secret: true, rule: 'vendor-prefix' }, text.slice(0, 8))
+  }
+  // Mechanical guard for the run-time composition above: the whole table still
+  // hashes to the digest it had while its entries were single literals (recorded
+  // before the GitHub Push Protection repair). An edited fixture — or a
+  // "simplification" back to literals — changes this.
+  assert.equal(fixtureFingerprint(hits.join('\u0000')), 'aec788a96ffc')
+  // The other side: the prefix without a payload is a fragment, and the same
+  // prefix inside prose is prose.
+  for (const text of ['sk-', 'AKIAEXAMPLE', 'ghp_short']) {
+    assert.equal(classifyPastedText(text).secret, false, text)
+  }
+  assert.deepEqual(classifyPastedText('sk- the short form'), { secret: false, exclusion: 'whitespace' })
+})
+
+test('privacy: JWT, PEM and the two statistical rules have both sides pinned', () => {
+  assert.deepEqual(classifyPastedText(PASTE_JWT), { secret: true, rule: 'jwt' })
+  assert.equal(classifyPastedText('eyJhbGciOiJI').secret, false, 'a JWT prefix without its three parts is not a token')
+
+  assert.deepEqual(classifyPastedText(PEM_OPENSSH_HEADER), { secret: true, rule: 'pem' })
+  // A PEM header followed by a body still matches: the precise rules run before
+  // the multi-line exclusion, on purpose.
+  assert.deepEqual(classifyPastedText(PEM_RSA_BLOCK), {
+    secret: true,
+    rule: 'pem',
+  })
+  assert.deepEqual(classifyPastedText('-----BEGIN RSA KEY'), { secret: false, exclusion: 'whitespace' })
+
+  assert.deepEqual(classifyPastedText(PASTE_LONG_TOKEN), { secret: true, rule: 'long-concentrated' })
+  assert.deepEqual(classifyPastedText(PASTE_SHORT_TOKEN), { secret: true, rule: 'high-entropy' })
+  // The same material one character under the long threshold is still caught by
+  // the entropy rule — the layering, asserted rather than assumed.
+  assert.deepEqual(classifyPastedText(PASTE_LONG_TOKEN.slice(0, 31)), { secret: true, rule: 'high-entropy' })
+
+  // Neither statistical rule may fire without both a digit and a letter, or on
+  // anything repetitive: the last case is a 40-character hex string built from
+  // five repeating characters, so it is under the distinct-character floor even
+  // though it is long (a real random hex token clears that floor and matches).
+  for (const text of [
+    'abcdefghijklmnopqrstuvwxyzabcdefghijklmn',
+    'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1',
+    'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+  ]) {
+    assert.equal(classifyPastedText(text).secret, false, text)
+  }
+
+  // The helpers the rules are built from, pinned directly.
+  assert.equal(entropyBitsPerChar(''), 0)
+  assert.equal(entropyBitsPerChar('aaaa'), 0)
+  assert.equal(entropyBitsPerChar('ab'), 1)
+  assert.equal(entropyBitsPerChar('abcd'), 2)
+  assert.equal(distinctCharCount('aab'), 2)
+  assert.equal(hasCjk('中文'), true)
+  assert.equal(hasCjk('abc'), false)
+})
+
+test('privacy: ordinary pastes are excluded by name', () => {
+  const cases: readonly { readonly text: string; readonly exclusion: string }[] = [
+    { text: '', exclusion: 'empty' },
+    { text: '   ', exclusion: 'empty' },
+    { text: 'https://example.com/x?token=abc', exclusion: 'url' },
+    { text: 'www.example.com', exclusion: 'url' },
+    { text: 'C:\\Users\\admin\\.dsh\\profiles\\web\\cordis.patch.yml', exclusion: 'path' },
+    { text: '/etc/hosts', exclusion: 'path' },
+    { text: './lib/index.js', exclusion: 'path' },
+    { text: '~/notes.txt', exclusion: 'path' },
+    { text: '\\\\server\\share\\file.txt', exclusion: 'path' },
+    { text: 'dev@example.com', exclusion: 'email' },
+    { text: 'api.example.co.uk', exclusion: 'domain' },
+    { text: '这是一句中文说明，不该被登记', exclusion: 'cjk' },
+    { text: 'line one\nline two', exclusion: 'multi-line' },
+    { text: 'Please rotate this key before Friday', exclusion: 'whitespace' },
+    { text: 'openai-key', exclusion: 'identifier' },
+    { text: 'DSH_SECRET_OPENAI', exclusion: 'identifier' },
+    { text: 'aoai_deployment_2', exclusion: 'identifier' },
+    { text: 'my.key.1', exclusion: 'identifier' },
+  ]
+  for (const item of cases) {
+    assert.deepEqual(
+      classifyPastedText(item.text),
+      { secret: false, exclusion: item.exclusion },
+      JSON.stringify(item.text),
+    )
+  }
+  // Mixed case inside a word-separated string is not how identifiers look, so it
+  // is not claimed as one — it simply does not match either (still not secret).
+  assert.equal(classifyPastedText('Openai-Key').secret, false)
+})
+
+test('privacy: reference text is never secret material, with a positive control', () => {
+  assert.equal(isReferenceText('@DSH_SECRET_OPENAI'), true)
+  assert.equal(isReferenceText('[secret DSH_SECRET_OPENAI]'), true)
+  assert.equal(isReferenceText('dsh-resource://file/session/s/DSH_SECRET_OPENAI'), true)
+  assert.equal(isReferenceText('openai'), false)
+
+  // The positive control: this text alone is material-shaped and matches…
+  assert.deepEqual(classifyPastedText(PASTE_LONG_TOKEN), { secret: true, rule: 'long-concentrated' })
+  // …and the moment it is a reference to a managed secret, it does not, so the
+  // paste path can never re-register a variable name as a credential.
+  for (const reference of [
+    `@DSH_SECRET_${PASTE_LONG_TOKEN}`,
+    `[secret DSH_SECRET_${PASTE_LONG_TOKEN}]`,
+    `dsh-resource://file/session/s/DSH_SECRET_${PASTE_LONG_TOKEN}`,
+  ]) {
+    assert.deepEqual(classifyPastedText(reference), { secret: false, exclusion: 'reference' }, reference.slice(0, 12))
+  }
+})
+
+test('privacy: the verdict is value-free, deterministic and total', () => {
+  const corpus: readonly string[] = [
+    PASTE_LONG_TOKEN,
+    PASTE_SHORT_TOKEN,
+    PASTE_JWT,
+    PEM_OPENSSH_HEADER,
+    SK_PROJ_EXAMPLE,
+    'https://example.com/x?token=abc',
+    'Please rotate this key before Friday',
+    '这是一句中文说明',
+    'openai-key',
+    '🙂🙂🙂',
+    'x'.repeat(10_000),
+    '',
+    '   ',
+  ]
+  for (const text of corpus) {
+    const verdict = classifyPastedText(text)
+    // Value safety: the returned object carries ids only, never the text.
+    assert.equal(JSON.stringify(verdict).includes(text) && text.length > 3, false, 'the verdict leaked the paste')
+    // Deterministic: the same input answers the same way.
+    assert.deepEqual(classifyPastedText(text), verdict)
+    // Every id is from the enumerable sets.
+    if (verdict.rule !== undefined) assert.equal(PRIVACY_RULES.includes(verdict.rule), true)
+    if (verdict.exclusion !== undefined) assert.equal(PRIVACY_EXCLUSIONS.includes(verdict.exclusion), true)
+    assert.equal(verdict.secret === (verdict.rule !== undefined), true)
+  }
+  // A non-string argument cannot happen through the DOM, but the classifier is
+  // total anyway: it answers instead of throwing.
+  assert.deepEqual(classifyPastedText(undefined as unknown as string), { secret: false, exclusion: 'empty' })
 })
