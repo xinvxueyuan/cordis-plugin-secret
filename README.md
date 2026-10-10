@@ -363,9 +363,9 @@ if ($env:DSH_SECRET_OPENAI) { "present length=$($env:DSH_SECRET_OPENAI.Length)" 
 - **默认作用域 = `session`**：附加面板与转换路径**共用同一个常量** `DEFAULT_ATTACH_SCOPE`（`session`），即**仅本会话内存有效**；空键 / 空标题交给 R1 的自动命名。
 - **实时文案是契约外手段（重要）**：公开 API 只能**按下时**读取选区、**没有选区变化通知**，所以按钮的实时文案依赖**契约外的 DOM `selectionchange` 监听**。失效模式、退回行为与「需真人确认」见「边界与已知限制 → 已知限制」里那一条；**行为永不依赖它**。
 
-### 0.6.0 的修复与需求变更（本轮，将随 0.6.0 发布）
+### 0.6.0 的修复与需求变更（0.6.0 已建 GitHub Release；npm / GitHub Packages 由 0.6.1 交付）
 
-> **版本说明**：截至本轮开发段，`package.json` 仍是 **0.5.0**，**0.6.0 尚未 bump、也未发布**；本节的「0.6.0」指下列内容**将随 0.6.0 发布**。发布事实与 registry 现状只在「npm 发布」一节按已发布版本写。本节示例一律是**假值**（如 `sk-EXAMPLE-…`），不是任何真实凭据。
+> **版本说明（如实）**：这些改动已随 **0.6.0** 交付到 GitHub Release —— `v0.6.0` 的 annotated + GPG tag、三资产（tgz / `SHA256SUMS` / `SHA256SUMS.asc`）与 build provenance 都已建立。**但 0.6.0 的 npm staged 发布与 GitHub Packages 都没有发生**：`publish.yml` 运行 `38039557549` 在 `Test (node 24)` 上失败（该 job 当时没有 build 前置，而 `lib/` 是 gitignore 的，CI 的 checkout 里没有客户端产物），于是 `Stage for npm` 与 `Publish to GitHub Packages` 被**跳过**；npm 与 GitHub Packages 因此停在 **0.5.0**，**没有 0.6.0 的 stage id**。该 CI 缝隙已修（`npm test` 自身先跑构建），这四项修复与需求变更由 **0.6.1** 交付到 npm / GitHub Packages。本节示例一律是**假值**（如 `sk-EXAMPLE-…`），不是任何真实凭据。
 
 ### 1. 附加面板输入行对齐（D1）
 

@@ -30,10 +30,13 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      # 五个测试文件（unit / register / client-card / attach / client-attach）就是本仓库全部可自动化的
-      # 验证：Host 纯逻辑、装配、以及浏览器产物在真 cordis 上下文里的 boot，均无网络、无凭据依赖。
-      # 发布进入 stage 队列（npm stage publish），人工 2FA 批准后上线。
+      # 九个测试文件（unit / register / real-connection / client-card / attach / attach-wiring /
+      # client-attach / client-artifact / history）就是本仓库全部可自动化的验证：Host 纯逻辑、装配、
+      # 以及浏览器产物在真 cordis 上下文里的 boot，均无网络、无凭据依赖。
+      # 注意：`npm test` 自身会先跑 `npm run build` —— client-artifact 门禁断言的是构建产物，
+      # 而 CI 的 checkout 里没有 lib/（lib/ 是 gitignore 的）。
 
+  # 发布进入 stage 队列（npm stage publish），人工 2FA 批准后上线。
   publish:
     name: Stage for npm (trusted publishing + human 2FA approval)
     if: startsWith(github.ref, 'refs/tags/v') || inputs.target == 'npm' || inputs.target == 'both'
