@@ -764,3 +764,51 @@ npm --prefix projects/cordis-plugin-secret run build       # exit 0；lib/client
 - **R5 实现 = §11 的 A + B 基线之上再加 C**：行为以**按下时刻** `captureInsertion()`（`start !== end`）为准；选中文本经 `useInput` 的 `draft` + `occurrences` 换算；**任何不一致退回「附密钥」原行为**；默认作用域 `session`（`DEFAULT_ATTACH_SCOPE` 两处共用）；空键 / 空标题走 §12.1 的自动命名。
 - **C 是契约外手段（必须如实读）**：实时文案依赖对 DOM `selectionchange` 的监听。**失效模式**：① 非浏览器环境（无 `document`）**不注册** ⇒ 退回"按下时切换文案"；② 回调抛错被吞掉 ⇒ 同样退回；③ 无可编辑元素聚焦时回答「无信息」（不猜）；④ 选区变化不生成本插件事件 ⇒ 文案可能**滞后一个事件循环**。**注册这一层在本套件里未经执行验证**（测试 React stub 把 `useEffect` 置为 no-op，用例只到 props 层），**也从未在活体 DOM 上验证过** ⇒ **需真人确认**。**行为永不依赖 C**（C 只影响文案实时性）。
 - **seam 新增键（全部 test-only，无生产路径读取）**：`ATTACH_CSS`、8 个 privacy 键（`PRIVACY_RULES` / `PRIVACY_EXCLUSIONS` / `PRIVACY_THRESHOLDS` / `classifyPastedText` / `entropyBitsPerChar` / `distinctCharCount` / `isReferenceText` / `hasCjk`）、`ATTACH_EN`、`selectedSpan`、`selectedTextIn`、`liveSelectionCue`、`DEFAULT_ATTACH_SCOPE`；均为常量或纯函数，无状态、不含任何值。
+
+---
+
+## 13. 实施结果（0.6.0）——D1 / D2 / D4b / D5 / t46 / 产物加壳（逐节对照，原文保留）
+
+> 体例同 §12：**上文原文一律不删**；这里只写 0.6.0 的**已落地 / 被取代 / 属用户变更**。版本状态：截至本轮文档段，`package.json` 仍是 **0.5.0**，0.6.0 **尚未 bump、未发布**（发布事实由发布任务在 bump 后写）。
+> **证据来源纪律**：凡标「证据来源：t·」的，是**他人**的验证/实现报告，本文件只转述；未标注的条目是本文件作者可自证或直接读代码/亲跑得到的。
+
+### 13.1 §3.2 的 composer 半边 —— **被用户裁定取代（删除按钮）**
+
+- **用户原话（需求变更）**："官方的底部输入区的外置的那个「粘贴」按钮没什么用，按下也是正常粘贴，没有询问是否转为胶囊，直接删掉"。
+- **落地**：composer 座位上的「粘贴」按钮**及其剪贴板读取路径**已删除（`SecretComposerPaste` 的 `pasteAction({…})` 与只服务它的 `insert()`）；**座位 `conversation.input.right` 保留**，用途变更为 **§13.3 接管提示的渲染位**。
+- **为什么**：它与 Ctrl+V 接管构成**同一意图的两种行为**（按钮＝纯粘贴且会弹剪贴板授权；Ctrl+V＝智能接管）。**这不是实现缺陷，是用户的需求变更**，故 §3.2 中关于"composer 放一个粘贴按钮"的契约部分**自本条起失效**，其余（7 个字段按钮）继续有效。
+- **删后现状**：composer 侧**只剩接管路径**——不再读剪贴板、不再弹授权、不再有自己的粘贴按钮；我方 **7 个字段按钮一个都没少**（源级 `pasteAction({` 计数恰 7、composer 区间 0 处，是防回退断言）。
+
+### 13.2 §3.3 的"粘贴命中即真登记" —— **被 D2 取代（先提议、不登记）**
+
+- **现行行为**：在值输入框（胶囊「密钥内容」）粘贴**命中规则**的文本时，**先弹确认条、不做任何登记**——未选择前 **0 请求、不清空、不关面板、不切详情面**；两个显式答案是**「登记为密钥」**（`pasteAskRegister`，走同一 attach 真登记路径）与**「按普通文本粘贴」**（`pasteAskText`，按普通文本写入、0 请求）；确认条带 `data-secret-paste-ask="value"`。
+- **取代范围**：§3.3 里"命中即 register"的时序描述由本条取代；§12.3 记录的其它结论（规则集所在模块、只覆盖值输入框、引用文本第一步排除、失败回写原文）**仍然有效**。
+- **证据来源：t49 真机四条**（选择前 attach=0、字段未清空、面板未关、未切 detail；两个答案各自的后果）。
+
+### 13.3 composer 粘贴接管（t46）—— 新增事实，0.6.0 起是 composer 侧唯一粘贴行为
+
+- **能力面**：**capture 相位**监听 `paste`（`doc.addEventListener('paste', onPaste, true)`，`entry.ts:3814`），仅对 composer 输入区内、命中隐私规则的文本接管。
+- **明文不进草稿**；提示**只含形状名与长度**（`composerAskShape`，如「形状: vendor-prefix · 43」）；两条出路：「转为密钥」（真登记 + 插入引用标记）与「按普通文本粘贴」（原样交给编辑器、0 新增请求）；**不命中即一次性原生放行**；**失败不困住用户内容**。提示挂在**我们自己的座位**里（`data-secret-paste-ask="composer"`，`entry.ts:4026`）。
+- **失败文案的渲染位点（方法学，供后人）**：**`p[role="alert"][data-kind="error"]`**（主渲染点约 `entry.ts:4949`，行号会漂移，**用选择器**）；同一个文件里 `role="status"` 还用于提示/不可用类文案（如 `:5127` 的 `manageUnavailable`），**不要用它找错误**。
+- **真机判据（方法学）**：**不能用 `ClipboardEvent.defaultPrevented` 判断"是不是我方接管"**——编辑器自身（Lexical）也会 `preventDefault`；可归因判据是**我方提示是否出现** + **草稿内容**（明文有没有进草稿、长度变没变）。
+
+### 13.4 D1（输入行对齐）与 D4/D4b（切换会话收起面板）
+
+- **D1**：`.sra_inputRow` 的 `align-items` 由 `center` 改为 **`flex-end`**（`entry.ts:1836`；真机三行 `dyTop +2 / dyCenter +1`，修复前 `−11 / −12`）。**证据来源：t49 真机**。
+- **D4/D4b（本条比结论更值得后人记住的是"为什么"）**：面板开关是**模块级 UI 状态**（`attachMode`），而真实会话切换会让组件**卸载重挂** ⇒ **单实例渲染期的会话比较不足以**覆盖真实切换（残留的模块级状态会跟着新会话被渲染出来）。**修法**：mode 带上会话身份 + `noteActiveSession()` 由三个常驻座位在**渲染期**调用，观测到会话真的变了且残留属旧会话就**静默清理**（只改模块变量、不唤醒监听器 ⇒ 同一次渲染读到的已是清空值，不产生"渲染中更新其它组件状态"的告警/循环）；`setAttachModeFor()` 给"明知会话"的调用点显式绑定，**外来身份永不被继承**；`resetSessionObservation()` 供测试清观测。**为什么不走朴素 `useEffect`**：会在**同会话无关重挂**时误关本该开着的面板，且清理发生在提交后、**会闪现一帧**旧面板；反向保护（同会话重挂后面板保持打开）有专门用例。**证据来源：t53 的 RED→GREEN 真机复现 + t49 真机四信号**。
+
+### 13.5 客户端产物加壳（F1 / t47）—— 新增事实与其**边界**
+
+- **现象**：客户端产物原本是**扁平顶层 classic script**；宿主模块系统**按设计会在同一文档再次求值**同一 bundle（`dsh-client-modules/lib/client.js:451-452` 每次新建 `<script>`）⇒ 第二次求值时顶层 `const`/`class` 声明在**解析期**即冲突，整份新副本**解析期失败** ⇒ **页面停留旧版本、必须整页硬刷新**。**证据来源：t45 的 vm 双求值实验**。
+- **修复（构建链变化）**：`npm run build` = `tsc -p tsconfig.build.json && tsc -p tsconfig.client.json && node scripts/wrap-client.mjs`；末步把产物**包进函数作用域**并写入幂等标记 `/*__secret_iife_wrapper__*/`；**顶层声明 242 → 0**（**证据来源：t47 实测**；本仓库门禁 `test/client-artifact.test.ts` 持续断言顶层声明 0、标记恰 1 处、0 import/export、重复加壳幂等、含顶层 import/export 的文件被拒绝）。产物**仍是 classic script**。
+  - **量法（后人别量错）**：门禁的 `parseCensus` 用**解析器**数**脚本级词法声明**（`ts.createSourceFile` + `let/const/class/function`），**不是数行首文本**——壳是 `HEAD + 产物 + TAIL` 的 **Buffer 级拼接、不缩进**（`scripts/wrap-client.mjs:50-65`），壳内声明文本上仍顶格，行首统计会得出完全误导的数字。门禁同时断言产物**能干净解析**（`parseDiagnostics` 为 0）与**剥壳后回到扁平脚本**。
+- **边界（必须写清）**：加壳**只消除"解析期整份失效"**这一种失败模式。宿主对**"未先 invalidate 就再次注册同一 factory"**仍然抛错——`dsh-client-modules/lib/client.js:575` 逐字：
+  `client-modules: duplicate factory registration for "…" (bundle executed twice without invalidate?)`
+  这是**宿主契约、客户端不能解除**；**合法 HMR 必须先 invalidate 再求值**（同文件 `:540-542` `invalidateForReplacement → invalidate(id, rev)`；`:541` 替换 bootstrap 模块必须整页刷新）。**证据来源：t47 幂等/HMR 实验 + t49 在真正下发字节里切壳并逐字节比对**（合并包与单插件包里切出的我方段落与本地产物逐字节相同，标记恰 1 处）。
+- **跨插件事实**：我们的 client 与其它插件**合并成同一个 classic script 下发** ⇒ 顶层声明污染共享词法作用域是**真实风险**；加壳后我们对该作用域**零贡献**（顶层声明 0）。**证据来源：t45（vm 双求值）+ t49（合并下载 URL 30,600,397B / 单插件 278,353B 的切壳比对）**。
+
+### 13.6 §7.1 / §12.7 的"需真人确认" —— 更新（一律不得写成已验证）
+
+- **0.6.0 新增**：① **D5 删除后的真机观感**（用户需**再重启一次 `dsh web`** 才会加载新产物：确认底部输入区不再有那颗按钮、Ctrl+V 粘贴密钥时提示照旧）；② **剪贴板权限真机表现**（授予/拒绝各一次）——注意 composer 侧已不读剪贴板，**拒绝授权不应再影响 composer 的粘贴**（这本身是要看的行为）；③ **D1 排版**与聚焦/点击手感；④ **D2 两个答案**的真机后果（「登记为密钥」恰 1 请求、「按普通文本粘贴」0 请求）；⑤ **t46 接管**的提示内容（只有形状与长度）与明文不进草稿。
+- **仍待真人（0.5.0 遗留）**：自动填充/密码管理器在真实浏览器里的现场行为、**R5 的契约外实时文案**（§12.7 的 C）。
+- **未真机重测、只到替身级的细项（如实标注）**：composer 路径的「转为密钥」点击、往我们自己字段粘贴不被拦、cleanup 后监听数 0、一次性原生放行；另 **`mousedown` 的 `preventDefault` 在真机上不能靠 `btn.onmousedown` 读**（React 在根节点委托，该属性恒为空）——它有产物级证据但没有真机读数。**证据来源：t49 的如实标注**。

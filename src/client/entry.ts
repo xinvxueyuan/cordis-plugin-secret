@@ -1447,6 +1447,21 @@ const ATTACH_ZH: Record<string, string> = {
   // two things that actually failed (no scripted-insert capability, or nowhere to
   // put the text) and still tells the human how to get it in.
   pasteInsertFailed: '无法把内容插入输入框（编辑器不支持脚本插入，或当前没有可插入的光标位置），请手动粘贴（按 Ctrl/⌘+V）。',
+  // D2: what happens after a paste the rules recognise. The lead is a question,
+  // and the two answers are the two buttons — no timer, no toast.
+  pasteAskLabel: '粘贴确认',
+  pasteAskLead: '这段内容看起来像密钥。要登记为密钥，还是按普通文本粘贴？',
+  pasteAskRegister: '登记为密钥',
+  pasteAskText: '按普通文本粘贴',
+  // (3): the click's first answer. The browser's permission prompt can hold
+  // `readText()` for a while; without this the button looks dead.
+  pasteReading: '正在读取剪贴板…',
+  // t46: the composer's own takeover. The shape line is a rule name and a
+  // length — a sanitized token, never a fragment of what was pasted.
+  composerAskLabel: '粘贴确认',
+  composerAskLead: '这段内容看起来像密钥，要转为密钥吗？',
+  composerAskRegister: '转为密钥',
+  composerAskShape: '形状',
   historyLink: '历史记录',
   historyTitle: '本会话的附加与授权记录',
   historyEmpty: '本进程内暂无记录。',
@@ -1611,6 +1626,15 @@ const ATTACH_EN: Record<string, string> = {
   pasteDenied: 'Reading the clipboard was refused (a permission may be missing). Paste by hand instead.',
   pasteEmpty: 'The clipboard holds no text to paste.',
   pasteInsertFailed: 'Could not insert the text into the composer (this editor does not accept scripted insertion, or there is no caret to insert at). Paste by hand instead (press Ctrl/⌘+V).',
+  pasteAskLabel: 'Paste confirmation',
+  pasteAskLead: 'This looks like a secret. Register it as a key, or paste it as plain text?',
+  pasteAskRegister: 'Register as a key',
+  pasteAskText: 'Paste as plain text',
+  pasteReading: 'Reading the clipboard…',
+  composerAskLabel: 'Paste confirmation',
+  composerAskLead: 'This looks like a secret. Turn it into a key?',
+  composerAskRegister: 'Turn into a key',
+  composerAskShape: 'shape',
   historyLink: 'History',
   historyTitle: 'Attachments and authorizations of this session',
   historyEmpty: 'Nothing recorded in this process yet.',
@@ -1758,6 +1782,9 @@ const A = {
   label: `${AP}_label`,
   input: `${AP}_input`,
   inputRow: `${AP}_inputRow`,
+  seat: `${AP}_seat`,
+  seatNotice: `${AP}_seatNotice`,
+  seatOffer: `${AP}_seatOffer`,
   toggle: `${AP}_toggle`,
   scope: `${AP}_scope`,
   option: `${AP}_option`,
@@ -1806,7 +1833,12 @@ const ATTACH_CSS = `
 .${A.field}{flex-direction:column;gap:6px;display:flex;min-width:0}
 .${A.fieldGroup}{flex:auto;flex-direction:column;gap:6px;display:flex;min-width:0}
 .${A.label}{color:var(--dsw-alias-label-caption);font-size:12px;line-height:18px}
-.${A.inputRow}{align-items:center;gap:8px;display:flex}
+.${A.inputRow}{align-items:flex-end;gap:8px;display:flex}
+/* D1: the identifier rows hold a caption+control column beside the action button.
+   Centering would center the button against the caption too, which is half a line
+   higher than the control it belongs to. The controls in these rows are all the
+   same 32px tall, so bottom-aligning the row puts the button exactly on the
+   control's own box — no magic offsets, and every row agrees. */
 .${A.input}{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-label-primary);flex:auto;font:inherit;font-size:13px;height:32px;min-width:0;outline:none;padding:0 10px}
 .${A.input}::placeholder{color:var(--dsw-alias-label-caption)}
 .${A.input}:focus{border-color:var(--dsw-alias-state-business-primary)}
@@ -1827,6 +1859,15 @@ const ATTACH_CSS = `
 .${A.action}:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .${A.action}[data-kind=primary]{background:var(--dsw-alias-button-primary-fill);border-color:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground)}
 .${A.action}:disabled,.${A.input}:disabled,.${A.toggle}:disabled{cursor:default;opacity:.55}
+/* (2): the composer seat's notice must never move the button it belongs to. It
+   is taken out of the row's flow (absolute, hanging to the left of the button)
+   so appearing and disappearing change nothing about where the button sits. */
+.${A.seat}{position:relative;display:inline-flex;align-items:center}
+.${A.seatNotice}{background:var(--dsw-alias-bg-layer-2);border-radius:var(--dsw-radius-sm);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;padding:6px 10px;position:absolute;right:calc(100% + 8px);top:50%;transform:translateY(-50%);width:max-content;max-width:min(60vw,420px);overflow-wrap:anywhere}
+/* t46: the composer's paste offer. Same discipline as the notice above: out of
+   the row's flow, so it cannot move the button it belongs to. */
+.${A.seatOffer}{background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-sm);bottom:0;color:var(--dsw-alias-label-secondary);display:flex;flex-direction:column;gap:6px;font-size:12px;line-height:18px;padding:8px 10px;position:absolute;right:calc(100% + 8px);width:max-content;max-width:min(70vw,520px);overflow-wrap:anywhere}
+.${A.seatOffer} .${A.notice}{background:0 0;padding:0}
 .${A.row}{align-items:baseline;gap:8px;display:flex;min-width:0}
 .${A.rowLabel}{color:var(--dsw-alias-label-caption);flex:none;font-size:12px;line-height:18px;min-width:56px}
 .${A.rowValue}{color:var(--dsw-alias-label-primary);font-size:13px;line-height:18px;overflow-wrap:anywhere}
@@ -2131,18 +2172,88 @@ const withdrawTimers = new Map<string, { readonly generation: number; cancel: ()
  */
 const observed = { sessionId: '', draft: '', phase: 'plain', pendingText: '' }
 const attachedListeners = new Set<() => void>()
-let attachMode: AttachMode = { kind: 'idle' }
+/** The one idle answer, so every "closed" read is the same object. */
+const IDLE_MODE: AttachMode = { kind: 'idle' }
+/** The live mode **and the session it was opened in** (D4b). */
+let attachMode: { readonly sessionId: string | null; readonly mode: AttachMode } | null = null
 const modeListeners = new Set<() => void>()
+/**
+ * The session the visible view belongs to, as observed by our own components
+ * during render (D4b). One conversation view is mounted at a time, so this is the
+ * session a click handler is acting for.
+ */
+let observedSession: string | null = null
 
-/** The live mode, for components that subscribe instead of re-reading props. */
-function currentMode(): AttachMode {
-  return attachMode
+/**
+ * Read the live mode for one session.
+ *
+ * The mode carries the session it was opened in: a mode opened in another session
+ * is *not* the current mode, so a remount in session B cannot draw the panel that
+ * session A left open. With no session to check against — or a mode stored before
+ * any session was observed — the stored mode is the answer, which is the
+ * behaviour every existing caller already had.
+ */
+function currentMode(sessionId?: string): AttachMode {
+  if (attachMode === null) return IDLE_MODE
+  if (sessionId === undefined || attachMode.sessionId === null) return attachMode.mode
+  return attachMode.sessionId === sessionId ? attachMode.mode : IDLE_MODE
 }
 
-/** Move the capsule between faces and wake every subscriber. */
+/**
+ * Observe which session the visible view belongs to, and drop a mode left over
+ * from another one (D4b).
+ *
+ * Called **during render** by the session-scoped components: that is the only
+ * moment this plugin gets before the new session's first frame, and the whole
+ * point is that the new session must not draw the previous session's panel even
+ * once. For that reason the clear is **silent** — it does not wake
+ * `modeListeners`, which would mean updating other components' state in the middle
+ * of rendering this one. It does not need to: every read in this same render goes
+ * through `currentMode(sessionId)` and sees the cleared value anyway.
+ */
+function noteActiveSession(sessionId: string): void {
+  if (observedSession === sessionId) return
+  const previous = observedSession
+  observedSession = sessionId
+  if (previous === null || attachMode === null) return
+  if (attachMode.sessionId !== null && attachMode.sessionId !== sessionId) attachMode = null
+}
+
+/**
+ * Move the capsule between faces and wake every subscriber.
+ *
+ * A mode that is already bound to a session stays bound to it (every face
+ * transition happens inside that session); a mode opened with no session at hand
+ * takes the observed one, which is how the shell's own `open`/`close` callbacks —
+ * invoked for the visible view — still bind the panel to a session (D4b).
+ */
 function setAttachMode(next: AttachMode): void {
-  attachMode = next
+  // A mode already bound to the session currently being observed stays bound to
+  // it (every face transition happens inside that session). Anything else — a
+  // mode stored before any view was observed, or a leftover from a session that
+  // is no longer the observed one — is re-bound to what is observed now, so a
+  // foreign session's identity can never be inherited by a later panel (D4b).
+  const bound =
+    attachMode !== null && attachMode.sessionId !== null && attachMode.sessionId === observedSession
+      ? attachMode.sessionId
+      : observedSession
+  attachMode = { sessionId: bound, mode: next }
   for (const listener of [...modeListeners]) listener()
+}
+
+/** Open or close the panel for a session the caller knows first-hand. */
+function setAttachModeFor(sessionId: string, next: AttachMode): void {
+  attachMode = { sessionId, mode: next }
+  for (const listener of [...modeListeners]) listener()
+}
+
+/**
+ * Forget which session the view belongs to. Called when there is no view (the
+ * test harness tears one down between cases), so a later panel cannot inherit the
+ * previous session's identity.
+ */
+function resetSessionObservation(): void {
+  observedSession = null
 }
 
 /** Subscribe to attachment changes. Returns the unsubscribe function. */
@@ -3269,7 +3380,7 @@ function sourceOnPick(input: PickInputLike): undefined | 'handled' | { readonly 
   if (sessionId === undefined || sessionId === '') return 'handled'
   const name = text((candidate as { readonly name?: unknown }).name) ?? pick.v
   pendingPick = { sessionId, variable: pick.v, name, span: readSpan(input.span) }
-  setAttachMode({ kind: 'confirm', variable: pick.v, name })
+  setAttachModeFor(sessionId, { kind: 'confirm', variable: pick.v, name })
   return 'handled'
 }
 
@@ -3545,6 +3656,226 @@ function seatT(props: { readonly t?: unknown }): (key: string) => string {
  * three insert-side branches answer with that message instead of throwing or
  * silently doing nothing, and focus is never taken from the editor.
  */
+/** The composer editor the shell mounts (Lexical), as the live page measures it. */
+const COMPOSER_EDITOR_SELECTOR = '[data-lexical-editor][data-composer-input]'
+
+/**
+ * Is this event target inside the composer editor?
+ *
+ * The composer's DOM belongs to the shell, so this is a query rather than a
+ * contract: an element that cannot answer it — or throws while trying — is
+ * simply not the editor, and the paste stays native. Our own panel inputs live
+ * in other subtrees, so they never answer yes (t46 requirement: no friendly fire).
+ */
+function insideComposerEditor(target: unknown): boolean {
+  if (target === null || typeof target !== 'object') return false
+  const node = target as { readonly closest?: unknown; readonly matches?: unknown }
+  try {
+    if (typeof node.closest === 'function') {
+      return (node.closest as (selector: string) => unknown)(COMPOSER_EDITOR_SELECTOR) !== null
+    }
+    if (typeof node.matches === 'function') {
+      return (node.matches as (selector: string) => boolean)(COMPOSER_EDITOR_SELECTOR) === true
+    }
+  } catch {
+    return false
+  }
+  return false
+}
+
+/** The offered paste's shape: a rule name and a length, and nothing else. */
+function composeOfferShape(verdict: { readonly rule?: string }, length: number): string {
+  return `${verdict.rule ?? 'secret'} · ${length}`
+}
+
+/** One pending composer paste offer. Module scope, like the panel's mode: a
+ *  single value, rendered by the seat, never carried into another session. */
+let composerOffer: {
+  readonly sessionId: string
+  readonly text: string
+  readonly shape: string
+  readonly span: TokenSpanLike | null
+} | null = null
+
+/** The offer belonging to this session, or nothing: a stale one is not rendered. */
+function pendingComposerOffer(sessionId: string): typeof composerOffer {
+  return composerOffer !== null && composerOffer.sessionId === sessionId ? composerOffer : null
+}
+function setComposerOffer(offer: NonNullable<typeof composerOffer>): void {
+  composerOffer = offer
+}
+function clearComposerOffer(): void {
+  composerOffer = null
+}
+
+interface ComposerPasteGuard {
+  readonly uninstall: () => void
+  /** Let the next paste through untouched: the human's content is never trapped. */
+  readonly allowNextPaste: () => void
+}
+
+/** The installed guard, so the seat's failure path can arm one native pass. */
+let composerGuard: ComposerPasteGuard | null = null
+
+/**
+ * Decide what one composer paste should do. No DOM and no globals: everything it
+ * needs is passed in, so the decision can be reasoned about (and tested) on its
+ * own, and the listener below is only its delivery.
+ *
+ * `null` means "leave it alone": any other paste — prose, a code snippet, an
+ * image with no text part — keeps the browser's behaviour.
+ */
+function composerPasteOffer(input: {
+  readonly text: string
+  readonly target: unknown
+  readonly actions: InputActionsLike | undefined
+  readonly recognize: (text: string) => { readonly secret?: boolean; readonly rule?: string }
+}): { readonly text: string; readonly shape: string; readonly span: TokenSpanLike | null } | null {
+  if (!insideComposerEditor(input.target)) return null
+  // Both capabilities are needed before anything is taken over: without
+  // `insertText` the text could never reach the draft again.
+  if (typeof input.actions?.captureInsertion !== 'function') return null
+  if (typeof input.actions?.insertText !== 'function') return null
+  if (input.text.length === 0) return null
+  let verdict: { readonly secret?: boolean; readonly rule?: string }
+  try {
+    verdict = input.recognize(input.text)
+  } catch {
+    return null
+  }
+  if (verdict.secret !== true) return null
+  // Taken now, at the moment of the paste: the editor's own handler runs after
+  // this capture listener and would move the caret.
+  let span: TokenSpanLike | null = null
+  try {
+    span = input.actions.captureInsertion() ?? null
+  } catch {
+    span = null
+  }
+  return { text: input.text, shape: composeOfferShape(verdict, input.text.length), span }
+}
+
+/**
+ * Watch the composer for a paste we must take over (t46).
+ *
+ * The listener is capture-phase on `document`, which is the only phase that runs
+ * before the editor's own paste handling (Lexical takes the event on the editor
+ * element itself). It is defensive by construction: a document that cannot
+ * listen, a target that is not the editor, a classifier that throws — each of
+ * those simply leaves the paste native. `preventDefault` and `stopPropagation`
+ * happen **only** for an offer we actually take; stopping there does not silence
+ * other listeners on this same node (that would need
+ * `stopImmediatePropagation`), so the shell's own document-level handling still
+ * sees the event.
+ */
+function guardComposerPaste(options: {
+  readonly doc?: unknown
+  readonly actions: InputActionsLike | undefined
+  readonly recognize?: (text: string) => { readonly secret?: boolean; readonly rule?: string }
+  readonly onOffer: (offer: {
+    readonly text: string
+    readonly shape: string
+    readonly span: TokenSpanLike | null
+  }) => void
+}): ComposerPasteGuard {
+  const doc = (options.doc ?? (typeof document === 'undefined' ? undefined : document)) as
+    | { readonly addEventListener?: unknown; readonly removeEventListener?: unknown }
+    | undefined
+  const recognize = options.recognize ?? ((value: string) => classifyPastedText(value))
+  let passNext = false
+  const onPaste = (event: unknown): void => {
+    try {
+      if (passNext) {
+        // The previous attempt could not place the text anywhere: this paste is
+        // the human's next chance, and it goes to the browser untouched.
+        passNext = false
+        return
+      }
+      const paste = event as {
+        readonly clipboardData?: { readonly getData?: (type: string) => string }
+        readonly preventDefault?: () => void
+        readonly stopPropagation?: () => void
+        readonly target?: unknown
+      }
+      const text = paste.clipboardData?.getData?.('text/plain') ?? ''
+      const offer = composerPasteOffer({ text, target: paste.target, actions: options.actions, recognize })
+      if (offer === null) return
+      paste.preventDefault?.()
+      paste.stopPropagation?.()
+      options.onOffer(offer)
+    } catch {
+      // Silent on purpose: nothing was prevented, so the paste is still native.
+    }
+  }
+  const listening =
+    doc !== undefined && typeof doc.addEventListener === 'function' && typeof doc.removeEventListener === 'function'
+  if (listening) {
+    try {
+      ;(doc.addEventListener as (type: string, listener: unknown, capture: boolean) => void)('paste', onPaste, true)
+    } catch {
+      // A document that refuses the listener leaves every paste native.
+    }
+  }
+  const handle: ComposerPasteGuard = {
+    uninstall: () => {
+      if (composerGuard === handle) composerGuard = null
+      try {
+        if (listening) {
+          ;(doc?.removeEventListener as (type: string, listener: unknown, capture: boolean) => void)(
+            'paste',
+            onPaste,
+            true,
+          )
+        }
+      } catch {
+        // Nothing to undo when the document refuses the removal.
+      }
+    },
+    allowNextPaste: () => {
+      passNext = true
+    },
+  }
+  // The seat's failure paths reach the live guard through this reference, and a
+  // test can install one exactly the way the seat's effect does.
+  composerGuard = handle
+  return handle
+}
+
+/**
+ * Register the offered text as a secret and put its **marker** where the paste
+ * was. The text itself only ever reaches `postAttach`; the draft receives the
+ * marker, never the plaintext.
+ */
+async function attachComposerOffer(options: {
+  readonly sessionId: string
+  readonly text: string
+  readonly span: TokenSpanLike
+  readonly actions: InputActionsLike | undefined
+  readonly settle: () => void
+  readonly fail: (message: string) => void
+}): Promise<void> {
+  try {
+    const attempt = await postAttach({
+      sessionId: options.sessionId,
+      // R1: an empty key and label are completed by the Host, so a human never
+      // has to invent a key just to turn a paste into a secret.
+      name: '',
+      label: '',
+      scope: DEFAULT_ATTACH_SCOPE,
+      value: options.text,
+    })
+    if (!attempt.ok) {
+      options.fail(attempt.error)
+      return
+    }
+    noteStaged(options.sessionId, attempt.variable, '', '', attempt.scope)
+    insertChip(options.sessionId, attempt.variable, options.span, options.actions)
+    options.settle()
+  } catch {
+    options.fail(ATTACH_UNREACHABLE)
+  }
+}
+
 function SecretComposerPaste(props: {
   readonly sessionId?: unknown
   readonly t?: unknown
@@ -3553,43 +3884,162 @@ function SecretComposerPaste(props: {
   const h = React.createElement
   const t = seatT(props)
   const actions = props.inputActions
+  const sessionKey = text(props.sessionId) ?? ''
   const [notice, setNotice] = React.useState<string | null>(null)
+  const [, setBump] = React.useState(0)
+  const reflow = (): void => setBump((previous: number) => previous + 1)
 
-  const insert = (text: string): void => {
-    const insertText = actions?.insertText
-    if (typeof insertText !== 'function') {
-      // The capability is missing. The clipboard read above this call already
-      // succeeded, so the insert-side message is the honest one here.
-      setNotice(t('pasteInsertFailed'))
-      return
+  // t46: watch the composer for a paste we have to take over. The composer's DOM
+  // belongs to the shell, so this is an out-of-contract listener: it is installed
+  // by a guard that catches its own errors and is removed on unmount and on every
+  // session change, and a paste it cannot help with stays native.
+  React.useEffect(() => {
+    const guard = guardComposerPaste({
+      actions,
+      onOffer: (offer) => {
+        setComposerOffer({ sessionId: sessionKey, ...offer })
+        reflow()
+      },
+    })
+    return guard.uninstall
+  }, [sessionKey])
+  // Another session's pending offer is never rendered, and is dropped rather than
+  // left for whenever that session comes back. This seat is always mounted for the
+  // visible session, so it observes the session change too (D4b).
+  noteActiveSession(sessionKey)
+  if (composerOffer !== null && composerOffer.sessionId !== sessionKey) clearComposerOffer()
+  const offer = pendingComposerOffer(sessionKey)
+
+  /** The caret span the offer should use: the paste-time one, re-read if it was not given. */
+  const offerSpan = (): TokenSpanLike | null => {
+    if (offer === null) return null
+    if (offer.span !== null) return offer.span
+    try {
+      return actions?.captureInsertion?.() ?? null
+    } catch {
+      return null
     }
-    const span = actions?.captureInsertion?.() ?? null
+  }
+
+  /** 「转为密钥」: register through the existing route, then insert the marker. */
+  const registerOffer = (): void => {
+    const pending = offer
+    if (pending === null) return
+    const span = offerSpan()
     if (span === null) {
-      // Without a caret to insert at, the plugin cannot place the text: say so
-      // rather than dropping it or moving focus.
+      // Nowhere to put the marker. Keep the offer (the plain-text escape is still
+      // there) and let the NEXT paste through untouched, so the human's content
+      // is never trapped behind a takeover that cannot finish.
       setNotice(t('pasteInsertFailed'))
+      composerGuard?.allowNextPaste()
       return
     }
-    if (insertText.call(actions, text, span) !== true) {
-      // The editor declined the insertion: say so instead of losing the text.
+    void attachComposerOffer({
+      sessionId: sessionKey,
+      text: pending.text,
+      span,
+      actions,
+      settle: () => {
+        setNotice(null)
+        clearComposerOffer()
+        reflow()
+      },
+      fail: (message) => {
+        // A refusal keeps the offer — and the escape — on screen, and never puts
+        // the plaintext into the draft.
+        setNotice(message)
+        reflow()
+      },
+    })
+  }
+
+  /** 「按普通文本粘贴」: the escape hatch — the original text, in its place, no request. */
+  const pasteOfferAsText = (): void => {
+    const pending = offer
+    if (pending === null) return
+    const span = offerSpan()
+    const insertText = actions?.insertText
+    let inserted = false
+    if (span !== null && typeof insertText === 'function') {
+      try {
+        inserted = insertText.call(actions, pending.text, span) === true
+      } catch {
+        inserted = false
+      }
+    }
+    if (!inserted) {
+      // The editor would not take it back either: hand the next paste to the
+      // browser and say what happened, rather than keeping the text hostage.
       setNotice(t('pasteInsertFailed'))
+      composerGuard?.allowNextPaste()
+      clearComposerOffer()
+      reflow()
       return
     }
     setNotice(null)
+    clearComposerOffer()
+    reflow()
   }
+
+  const answer = (
+    action: string,
+    label: string,
+    primary: boolean,
+    onClick: () => void,
+  ): unknown =>
+    h(
+      'button',
+      {
+        type: 'button',
+        className: A.action,
+        'aria-label': label,
+        'data-action': action,
+        'data-kind': primary ? 'primary' : 'secondary',
+        onMouseDown: (event: { preventDefault?: () => void }) => {
+          event.preventDefault?.()
+        },
+        onClick,
+      },
+      label,
+    )
 
   return h(
     'span',
-    { 'data-secret-paste-seat': 'composer' },
-    pasteAction({
-      t,
-      className: A.toggle,
-      // Never disabled by the missing capability: the click is what explains it.
-      disabled: false,
-      setNotice,
-      apply: insert,
-    }),
-    notice === null ? null : h('span', { className: A.optionHint, role: 'status' }, notice),
+    { 'data-secret-paste-seat': 'composer', className: A.seat },
+    // D5: this seat carries **no** 「粘贴」 button any more. It used to read the
+    // clipboard and insert the text at the caret — a plain paste, behind a browser
+    // permission prompt — while Ctrl+V inside the composer is now taken over by
+    // the guard above. Two behaviours for one intention is exactly what this
+    // plugin avoids, so the button is gone; the seat stays, because it is where
+    // the takeover's own notice and offer are rendered.
+    // (2): outside the row's flow, so appearing and disappearing changes nothing
+    // about where anything else sits.
+    notice === null ? null : h('span', { className: A.seatNotice, role: 'status' }, notice),
+    // t46: the takeover's offer. The shape is a rule name and a length; the text
+    // itself stays in the module's pending slot and is never rendered.
+    offer === null
+      ? null
+      : h(
+          'span',
+          {
+            className: A.seatOffer,
+            'data-secret-paste-ask': 'composer',
+            role: 'group',
+            'aria-label': t('composerAskLabel'),
+          },
+          h('span', { className: A.notice, role: 'status' }, t('composerAskLead')),
+          h(
+            'span',
+            { className: A.label, 'data-secret-paste-shape': offer.shape },
+            `${t('composerAskShape')}: ${offer.shape}`,
+          ),
+          h(
+            'span',
+            { className: A.actions },
+            answer('composer-ask-register', t('composerAskRegister'), true, registerOffer),
+            answer('composer-ask-text', t('pasteAskText'), false, pasteOfferAsText),
+          ),
+        ),
   )
 }
 
@@ -3662,7 +4112,10 @@ function SecretAttachToggle(props: {
   const occurrencesSeat = useInputSeat((state: InputStateLike) => state.occurrences)
   const occurrences = Array.isArray(occurrencesSeat) ? occurrencesSeat : []
 
-  const open = currentMode().kind !== 'idle'
+  // D4b: this control is always mounted for the visible session, so it is one of
+  // the places the session change is observed — before the panel below reads it.
+  noteActiveSession(sessionId)
+  const open = currentMode(sessionId).kind !== 'idle'
   const count = attachmentCount(sessionId)
   // The label: a press that is still pending wins (it is what the click will act
   // on); otherwise the live cue; otherwise the last press verdict. With no
@@ -3684,11 +4137,11 @@ function SecretAttachToggle(props: {
   const togglePanel = (): undefined => {
     if (open) {
       if (props.close !== undefined) props.close()
-      else setAttachMode({ kind: 'idle' })
+      else setAttachModeFor(sessionId, { kind: 'idle' })
       return undefined
     }
     if (props.open !== undefined) props.open()
-    else setAttachMode({ kind: 'fill' })
+    else setAttachModeFor(sessionId, { kind: 'fill' })
     return undefined
   }
 
@@ -3819,10 +4272,46 @@ function SecretAttachCapsule(props: {
   const [busy, setBusy] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [tier, setTier] = React.useState<string | null>(null)
+  /**
+   * Material-shaped text the classifier recognised, waiting for the human's
+   * explicit choice (D2). While this is set **nothing has happened**: the pasted
+   * text is in the value field, and the two buttons under it are the only way
+   * forward — no request, no clearing, no view change.
+   */
+  const [pasteOffer, setPasteOffer] = React.useState<string | null>(null)
   // The management flow's own state. The value a human types here lives in this
   // one component and in the request it is submitted with, nowhere else.
   const [editValue, setEditValue] = React.useState('')
   const [editReveal, setEditReveal] = React.useState(false)
+  /**
+   * D4: the session this panel belongs to.
+   *
+   * The comparison happens **during render** (this component's stubbed React has
+   * no deps-aware effect, and a deps-aware one would run after paint anyway),
+   * and the panel state itself is module-level, so a changed session closes the
+   * panel before the new session's first frame draws: the idle guard below also
+   * honours this flag, so not one frame of the previous session's face — or its
+   * half-filled fields — is ever shown under the new session. The key is exactly
+   * the session id: an unrelated re-render must never close a panel the human is
+   * filling in.
+   */
+  const [seenSession, setSeenSession] = React.useState(sessionId)
+  const sessionChanged = seenSession !== sessionId
+  if (sessionChanged) {
+    setSeenSession(sessionId)
+    setAttachMode({ kind: 'idle' })
+    setKey('')
+    setLabel('')
+    setValue('')
+    setReveal(false)
+    setScope(DEFAULT_ATTACH_SCOPE)
+    setBusy(false)
+    setError(null)
+    setTier(null)
+    setPasteOffer(null)
+    setEditValue('')
+    setEditReveal(false)
+  }
   React.useEffect(() => subscribeAttached(() => setSnap((previous: number) => previous + 1)), [])
   void snap
 
@@ -3836,7 +4325,8 @@ function SecretAttachCapsule(props: {
   const phaseSeat = text(useInputSeat((state: InputStateLike) => state.phase)) ?? 'plain'
   const pendingSeat = useSessionSeat((state: SessionSnapshotLike) => state.pendingSubmissions)
 
-  const mode = currentMode()
+  noteActiveSession(sessionId)
+  const mode = currentMode(sessionId)
   const historyOpen = mode.kind === 'history'
   // Opening the history face is what asks the host for it. The dependency is the
   // boolean, not the mode object: the read publishes an attachment change, which
@@ -3863,7 +4353,7 @@ function SecretAttachCapsule(props: {
     observeComposer(sessionId, { draft: draftSeat, phase: phaseSeat, pendingSubmissions: pendingSeat })
     return undefined
   }, [sessionId, watching, draftSeat, phaseSeat, pendingSeat])
-  if (mode.kind === 'idle') return null
+  if (mode.kind === 'idle' || sessionChanged) return null
 
   /**
    * Register one attach: the single place a value leaves this component.
@@ -3874,12 +4364,11 @@ function SecretAttachCapsule(props: {
    * validation, the same request, the same success handling (insert the chip,
    * open the detail face) — instead of a second, parallel one.
    *
-   * `restore` is the paste path's safety net: when the click took the text out of
-   * the human's hands, any refusal puts it back into the field (after whatever
-   * was there, the way an insertion would have), so a failure never loses what
-   * they pasted.
+   * The value field already holds whatever the human pasted — every path that
+   * reaches here put it there — so a refusal simply leaves it in place, exactly
+   * where they can see it, and nothing is lost.
    */
-  async function registerValue(pasted: string, restore = false): Promise<void> {
+  async function registerValue(pasted: string): Promise<void> {
     if (busy) return
     const name = key.trim()
     // R1: the key is optional. An empty one is completed by the Host — the local
@@ -3887,7 +4376,6 @@ function SecretAttachCapsule(props: {
     // so a human never has to invent a key just to attach a secret.
     if (name.length > 0 && !ATTACH_KEY_RE.test(name)) {
       setError(t('badKey'))
-      if (restore) setValue(value + pasted)
       return
     }
     if (pasted.length === 0) {
@@ -3896,6 +4384,8 @@ function SecretAttachCapsule(props: {
     }
     setBusy(true)
     setError(null)
+    // The human chose "register" on the paste offer, so the offer is answered.
+    setPasteOffer(null)
     const span = actions?.captureInsertion?.() ?? null
     try {
       // The request itself lives in `postAttach`, shared with the selection
@@ -3911,7 +4401,6 @@ function SecretAttachCapsule(props: {
       })
       if (!attempt.ok) {
         setError(attempt.error)
-        if (restore) setValue(value + pasted)
         return
       }
       // The value leaves this component here, and this is the only place it is
@@ -3923,7 +4412,6 @@ function SecretAttachCapsule(props: {
       setAttachMode({ kind: 'detail', variable: attempt.variable })
     } catch {
       setError(ATTACH_UNREACHABLE)
-      if (restore) setValue(value + pasted)
     } finally {
       setBusy(false)
     }
@@ -3935,18 +4423,18 @@ function SecretAttachCapsule(props: {
   }
 
   /**
-   * The value field's paste paths (R3).
+   * The value field's paste paths (R3 + D2).
    *
    * The native paste event and the 「粘贴」 button both land here, so one
-   * intention has one behaviour. Material-shaped text is registered through the
-   * form's own route; anything else is written exactly as typing it would be.
+   * intention has one behaviour. Material-shaped text is **offered**, never
+   * registered on its own: the clipboard read already succeeded by now and the
+   * text is in the field, so whether it becomes a secret is the human's call
+   * (the two buttons under the field). Anything else is written exactly as
+   * typing it would be.
    */
   function pasteIntoValue(text: string): void {
-    if (classifyPastedText(text).secret) {
-      void registerValue(text, true)
-      return
-    }
     setValue(text)
+    setPasteOffer(classifyPastedText(text).secret ? text : null)
   }
 
   /**
@@ -3954,7 +4442,7 @@ function SecretAttachCapsule(props: {
    *
    * A paste the classifier does not recognise keeps the browser's own behaviour
    * (the field's `onChange` runs, as with typing) — the plugin must not swallow
-   * text it cannot account for.
+   * text it cannot account for. A recognised one is still only *offered* here.
    */
   function onValuePaste(event: {
     readonly clipboardData?: { getData?: (type: string) => string }
@@ -4346,7 +4834,7 @@ function SecretAttachCapsule(props: {
               },
               reveal ? t('hide') : t('show'),
             ),
-            // R2 + R3: the same classify-and-register path the native paste takes.
+            // R2 + R3: the button takes the same offer path the native paste does.
             pasteAction({
               t,
               className: A.toggle,
@@ -4355,6 +4843,58 @@ function SecretAttachCapsule(props: {
               apply: pasteIntoValue,
             }),
           ),
+          // D2: the explicit choice. Nothing above registered anything — these two
+          // buttons are the whole decision, and both keep focus where the human
+          // was working (mousedown is prevented) while staying keyboard-reachable.
+          pasteOffer === null
+            ? null
+            : h(
+                'div',
+                {
+                  className: A.actions,
+                  'data-secret-paste-ask': 'value',
+                  role: 'group',
+                  'aria-label': t('pasteAskLabel'),
+                },
+                h('span', { className: A.notice }, t('pasteAskLead')),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: A.action,
+                    'data-action': 'paste-ask-register',
+                    'data-kind': 'primary',
+                    disabled: busy,
+                    'aria-label': t('pasteAskRegister'),
+                    onMouseDown: (event: { preventDefault?: () => void }) => {
+                      event.preventDefault?.()
+                    },
+                    onClick: () => {
+                      void registerValue(pasteOffer)
+                    },
+                  },
+                  t('pasteAskRegister'),
+                ),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: A.action,
+                    'data-action': 'paste-ask-text',
+                    disabled: busy,
+                    'aria-label': t('pasteAskText'),
+                    onMouseDown: (event: { preventDefault?: () => void }) => {
+                      event.preventDefault?.()
+                    },
+                    onClick: () => {
+                      // Plain text: the field keeps what was pasted, and nothing
+                      // else happens — no request, no clearing, no view change.
+                      setPasteOffer(null)
+                    },
+                  },
+                  t('pasteAskText'),
+                ),
+              ),
         ),
         h(
           'div',
@@ -6189,7 +6729,11 @@ async function pasteFromClipboard(options: {
   readonly setNotice: (message: string | null) => void
   readonly apply: (text: string) => void
 }): Promise<void> {
-  options.setNotice(null)
+  // (3): answer the click immediately. The browser's permission prompt can hold
+  // `readText()` for a noticeable while, and a button that says nothing for that
+  // long reads as broken. This is the same visible component and the same
+  // dictionary; the outcome below replaces it.
+  options.setNotice(options.t('pasteReading'))
   const read = clipboardReader()
   if (read === undefined) {
     options.setNotice(options.t('pasteUnavailable'))
@@ -6207,6 +6751,9 @@ async function pasteFromClipboard(options: {
     options.setNotice(options.t('pasteEmpty'))
     return
   }
+  // The reading state has been answered; whatever `apply` does next (including
+  // setting its own message) is the outcome.
+  options.setNotice(null)
   options.apply(text)
 }
 
@@ -6343,6 +6890,13 @@ const ATTACH_SEAM = Object.freeze({
   formatHistoryStamp,
   historyRowMeta,
   insertChip,
+  composerPasteOffer,
+  guardComposerPaste,
+  pendingComposerOffer,
+  setComposerOffer,
+  clearComposerOffer,
+  insideComposerEditor,
+  COMPOSER_EDITOR_SELECTOR,
   refreshAvailable,
   availableOf,
   readAvailableList,
@@ -6374,6 +6928,9 @@ const ATTACH_SEAM = Object.freeze({
   AttachDetailTab,
   currentMode,
   setAttachMode,
+  setAttachModeFor,
+  resetSessionObservation,
+  noteActiveSession,
   subscribeAttached,
   attachmentCount,
   sessionAttachments,
@@ -6458,6 +7015,8 @@ loader?.load({
               id: 'secret-attach-toggle',
               order: 30,
               inject: () => ({
+                // The shell calls these for the visible view: `setAttachMode`
+                // binds the panel to the session observed for that view (D4b).
                 open: () => setAttachMode({ kind: 'fill' }),
                 close: () => setAttachMode({ kind: 'idle' }),
               }),

@@ -302,6 +302,11 @@ const sources = full.sources
 
 /** Reset the module-scope surface so one test cannot colour the next. */
 function reset(): void {
+  // No session is observed between cases (there is no view), and that has to be
+  // forgotten *before* the mode is reset: the mode takes its session from the
+  // observation, so the idle written here is unbound rather than inheriting the
+  // last case's session (D4b).
+  api.resetSessionObservation()
   api.setAttachMode({ kind: 'idle' })
   for (const sessionId of [SESSION_ID, 'other-session']) api.sessionAttachments(sessionId).clear()
   // Component state too: every mounted registration is dropped, so no slot can
@@ -2654,6 +2659,11 @@ test('R2: every capsule field owns a 粘贴 action, disabled exactly when its fi
   const editButton = pasteButtonFor(edit, editField)
   assert.equal(editButton?.props['aria-label'], api.ATTACH_ZH.paste)
   assert.equal(editButton?.props.disabled, editField?.props.disabled)
+  assert.equal(
+    elements(edit).filter((element) => element.props['data-secret-paste'] === 'true').length,
+    1,
+    'the manage face owns exactly one paste field button',
+  )
 
   const manageCard = MANAGE.SecretManageCard as (props: unknown) => unknown
   const card = manageCard({
@@ -2701,10 +2711,11 @@ test('R2: the click reads the clipboard, writes the field through its own setter
   reset()
 })
 
-test('R3: both paste paths in the value field register through the attach route and clear the field', async () => {
+test('D2: a recognised paste in the value field is offered, and registers only after the human chooses', async () => {
   const accepted = { ok: true, variable: ENV_VAR, scope: 'session', replaced: false }
 
-  // Path one: the native paste event, taken over for material-shaped text.
+  // Path one: the native paste event. It takes the paste over, but registers
+  // nothing and changes no view until the human answers the offer.
   reset()
   const native = stubRoutes()
   native.attached.payload = accepted
@@ -2715,7 +2726,7 @@ test('R3: both paste paths in the value field register through the attach route 
     const field = elements(tree).find((element) => element.props.id === 'dsh-secret-attach-value')
     // This renderer keeps one component instance across tests, so the field may
     // hold text from an earlier case: what matters is that *this* paste did not
-    // put the token there, and that the registration clears it on success.
+    // put the token there.
     assert.equal(String(field?.props.value ?? '').includes(PASTE_TOKEN), false)
     let prevented = false
     ;(field?.props.onPaste as ((event: unknown) => void) | undefined)?.({
@@ -2726,24 +2737,65 @@ test('R3: both paste paths in the value field register through the attach route 
     })
     assert.equal(prevented, true, 'the plugin takes the paste over instead of leaving material in the field')
     await flushOneTurn()
-    assert.equal(native.calls.length, 1, 'exactly one registration')
+
+    // D2's four promises, before any human choice: no request, the text stays,
+    // the panel stays, the view stays.
+    assert.equal(native.calls.length, 0, 'nothing is registered before the human chooses')
+    const offered = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(fieldValue(offered, 'dsh-secret-attach-value'), PASTE_TOKEN, 'the pasted text stays in the field')
+    assert.notEqual(
+      elements(offered).find((element) => element.props.id === 'dsh-secret-attach-value'),
+      undefined,
+      'the panel does not close',
+    )
+    assert.equal(api.currentMode().kind, 'fill', 'the view does not jump to the detail face')
+    assert.equal(visibleText(offered).includes(api.ATTACH_ZH.pasteAskLead), true, 'the question is on screen')
+
+    const register = elements(offered).find((element) => element.props['data-action'] === 'paste-ask-register')
+    const plain = elements(offered).find((element) => element.props['data-action'] === 'paste-ask-text')
+    assert.notEqual(register, undefined, 'the offer offers registering')
+    assert.notEqual(plain, undefined, 'and offers pasting as plain text')
+    const answers: readonly { readonly button: Element | undefined; readonly label: string }[] = [
+      { button: register, label: api.ATTACH_ZH.pasteAskRegister },
+      { button: plain, label: api.ATTACH_ZH.pasteAskText },
+    ]
+    for (const answer of answers) {
+      assert.equal(answer.button?.props.type, 'button', 'an answer is a plain button')
+      assert.equal(answer.button?.props['aria-label'], answer.label, 'named by the dictionary the page renders')
+      let preventedMouseDown = false
+      ;(answer.button?.props.onMouseDown as ((event: unknown) => void) | undefined)?.({
+        preventDefault: () => {
+          preventedMouseDown = true
+        },
+      })
+      assert.equal(preventedMouseDown, true, 'pressing an answer never takes focus from the field')
+    }
+
+    // The explicit answer: register — the old automatic behaviour, now chosen.
+    ;(register?.props.onClick as (() => void) | undefined)?.()
+    await flushOneTurn()
+    assert.equal(native.calls.length, 1, 'choosing to register makes exactly one request')
     assert.equal(native.calls[0]?.url, api.ATTACH_PATH)
     assert.equal((native.calls[0]?.body as Record<string, unknown>)['value'], PASTE_TOKEN, '真登记: the paste is the value')
-    const afterNative = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    const afterRegister = renderer.render(CAPSULE, { sessionId: SESSION_ID })
     assert.equal(
-      elements(afterNative).some((element) => element.props.id === 'dsh-secret-attach-value'),
+      elements(afterRegister).some((element) => element.props.id === 'dsh-secret-attach-value'),
       false,
-      'the success path hands over to the detail face, exactly as a manual submit does',
+      'a successful registration hands over to the detail face, exactly as a manual submit does',
     )
     api.setAttachMode({ kind: 'fill' })
-    const reopened = renderer.render(CAPSULE, { sessionId: SESSION_ID })
-    assert.equal(fieldValue(reopened, 'dsh-secret-attach-value'), '', 'the registered value left the field')
+    assert.equal(
+      fieldValue(renderer.render(CAPSULE, { sessionId: SESSION_ID }), 'dsh-secret-attach-value'),
+      '',
+      'the registered value left the field',
+    )
   } finally {
     restoreFetch()
     reset()
   }
 
-  // Path two: the 「粘贴」 button on the same field, same route, same outcome.
+  // Path two: the 「粘贴」 button on the same field. Same offer; its other answer
+  // keeps the text as plain text — no request, and the offer goes away.
   reset()
   const clicked = stubRoutes()
   clicked.attached.payload = accepted
@@ -2759,29 +2811,269 @@ test('R3: both paste paths in the value field register through the attach route 
       )
       await flushOneTurn()
       await flushOneTurn()
-      assert.equal(clicked.calls.length, 1, 'the button registers through the same route')
-      assert.equal(clicked.calls[0]?.url, api.ATTACH_PATH)
-      const body = clicked.calls[0]?.body as Record<string, unknown>
-      assert.equal(body['value'], PASTE_TOKEN)
-      assert.deepEqual(Object.keys(body).sort(), ['label', 'name', 'scope', 'sessionId', 'value'])
-      const after = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      assert.equal(clicked.calls.length, 0, 'the button offers instead of registering')
+      const offered = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+      assert.equal(fieldValue(offered, 'dsh-secret-attach-value'), PASTE_TOKEN, 'the text is in the field')
+      assert.equal(focused, 1, 'focus comes back to the field on the offer path too')
+
+      const plain = elements(offered).find((element) => element.props['data-action'] === 'paste-ask-text')
+      ;(plain?.props.onClick as (() => void) | undefined)?.()
+      await flushOneTurn()
+      assert.equal(clicked.calls.length, 0, 'plain text never reaches the host')
+      const kept = renderer.render(CAPSULE, { sessionId: SESSION_ID })
       assert.equal(
-        elements(after).some((element) => element.props.id === 'dsh-secret-attach-value'),
+        fieldValue(kept, 'dsh-secret-attach-value'),
+        PASTE_TOKEN,
+        'the plaintext stays where the human pasted it',
+      )
+      assert.equal(
+        elements(kept).some((element) => element.props['data-secret-paste-ask'] === 'value'),
         false,
-        'the button path hands over to the detail face as well',
+        'answering the offer dismisses it',
       )
-      api.setAttachMode({ kind: 'fill' })
-      assert.equal(
-        fieldValue(renderer.render(CAPSULE, { sessionId: SESSION_ID }), 'dsh-secret-attach-value'),
-        '',
-        'the registered value left the field',
-      )
-      assert.equal(focused, 1, 'focus comes back to the field even on the success path')
     })
   } finally {
     restoreFetch()
     reset()
   }
+})
+
+test('D1: the three identifier rows share one row container, aligned to the control they hold', () => {
+  reset()
+  api.setAttachMode({ kind: 'fill' })
+  const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+  const inputFor = (label: string): Element | undefined =>
+    elements(tree).find((element) => element.type === 'input' && element.props['aria-label'] === label)
+  // An identifier row holds a caption+control column; the control's own row is the
+  // container the action button shares with it.
+  const rowOf = (input: Element | undefined): Element | undefined => {
+    if (input === undefined) return undefined
+    const parent = parentOf(tree, input)
+    const grandparent = parent === undefined ? undefined : parentOf(tree, parent)
+    return grandparent !== undefined && String(grandparent.props.className ?? '').includes('inputRow')
+      ? grandparent
+      : parent
+  }
+  const rows = [
+    rowOf(inputFor('标题')),
+    rowOf(inputFor('凭据键')),
+    rowOf(elements(tree).find((element) => element.props.id === 'dsh-secret-attach-value')),
+  ]
+  const classes = rows.map((row) => String(row?.props.className ?? ''))
+  assert.equal(classes.every((value) => value.length > 0), true, `every identifier row is a container: ${classes.join(' | ')}`)
+  assert.equal(new Set(classes).size, 1, `the three rows must be ONE container class, got ${classes.join(' | ')}`)
+  const buttons = elements(tree).filter(
+    (element) =>
+      element.props['data-secret-paste'] === 'true' && rows.some((row) => row !== undefined && parentOf(tree, element) === row),
+  )
+  assert.equal(buttons.length, 3, 'exactly the three identifier rows carry the 粘贴 action')
+  // Why they line up is the rule itself, not an offset: the row aligns its
+  // controls to the edge they all share (every control in these rows is 32px).
+  const source = readFileSync(new URL('../src/client/entry.ts', import.meta.url), 'utf8')
+  const rule = /\.\$\{A\.inputRow\}\{([^}]*)\}/.exec(source)
+  assert.notEqual(rule, null, 'the row rule is declared where the element is styled')
+  assert.equal(rule?.[1]?.includes('align-items:flex-end'), true, 'the row aligns its controls to their shared edge')
+  assert.equal(
+    source.includes('half a line'),
+    true,
+    'and the reason is recorded beside it, so nobody re-centres it back out of alignment',
+  )
+  reset()
+})
+
+test('(2)+(3): the seat notice cannot move its button, and a click answers before the clipboard does', async () => {
+  // (2) The notice is out of the row's flow: the CSS says so, and that is the
+  // only thing keeping the button still when a long message appears.
+  const source = readFileSync(new URL('../src/client/entry.ts', import.meta.url), 'utf8')
+  const seat = /\.\$\{A\.seat\}\{([^}]*)\}/.exec(source)
+  const notice = /\.\$\{A\.seatNotice\}\{([^}]*)\}/.exec(source)
+  assert.notEqual(seat, null, 'the seat has its own rule')
+  assert.notEqual(notice, null, 'and the notice has its own rule')
+  assert.equal(seat?.[1]?.includes('position:relative'), true, 'the seat is the notice’s positioning context')
+  assert.equal(notice?.[1]?.includes('position:absolute'), true, 'the notice is taken out of the row’s flow')
+  assert.equal((notice?.[1] ?? '').includes('right:calc(100% + 8px)'), true, 'hanging to the left of the button')
+
+  // (3) The click answers immediately; the outcome replaces that answer.
+  reset()
+  stubRoutes()
+  let release: ((value: string) => void) | undefined
+  const pendingRead = new Promise<string>((resolve) => {
+    release = resolve
+  })
+  await withClipboard({ readText: () => pendingRead as unknown as Promise<string> }, async () => {
+    api.setAttachMode({ kind: 'fill' })
+    const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    const field = elements(tree).find((element) => element.props.id === 'dsh-secret-attach-value')
+    ;(pasteButtonFor(tree, field)?.props.onClick as ((event: unknown) => void) | undefined)?.(
+      { currentTarget: fakeButtonNode() },
+    )
+    await flushOneTurn()
+    const reading = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(
+      visibleText(reading).includes(api.ATTACH_ZH.pasteReading),
+      true,
+      'while the permission prompt is up, the click already says what it is doing',
+    )
+    release?.(PASTE_TOKEN)
+    await flushOneTurn()
+    await flushOneTurn()
+    const settled = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(visibleText(settled).includes(api.ATTACH_ZH.pasteReading), false, 'the outcome replaces it')
+    assert.equal(visibleText(settled).includes(api.ATTACH_ZH.pasteAskLead), true, 'and the paste is offered (D2)')
+  })
+  restoreFetch()
+  reset()
+})
+
+test('D4b: a remount in another session finds the panel closed (the module mode does not survive)', () => {
+  reset()
+  const a = 'd4b-session-a'
+  const b = 'd4b-session-b'
+  // Open it the way the app does: through the toggle, in session A. That is also
+  // what gives the module's mode its session identity.
+  const toggleA = toggleButton(renderer.render(TOGGLE, toggleProps(a)))
+  assert.equal(toggleA?.props['aria-pressed'], false, 'the toggle starts closed')
+  pressToggle(toggleA)
+  ;(toggleButton(renderer.render(TOGGLE, toggleProps(a)))?.props.onClick as (() => void) | undefined)?.()
+  assert.equal(api.currentMode().kind, 'fill', 'the panel is open in A')
+  assert.notEqual(
+    elements(renderer.render(CAPSULE, { sessionId: a })).find(
+      (element) => element.props.id === 'dsh-secret-attach-value',
+    ),
+    undefined,
+    'and it really renders in A',
+  )
+
+  // The real path: switching sessions unmounts that view. `resetSlots` is that
+  // unmount — every component's own state is gone, and the module's mode is
+  // exactly what survives it. The new session must not inherit it.
+  renderer.resetSlots()
+  const atB = renderer.render(CAPSULE, { sessionId: b })
+  assert.equal(api.currentMode().kind, 'idle', 'the residual mode is gone in B')
+  assert.equal(
+    elements(atB).find((element) => element.props.id === 'dsh-secret-attach-value'),
+    undefined,
+    'no panel is drawn in B',
+  )
+  const toggleB = toggleButton(renderer.render(TOGGLE, toggleProps(b)))
+  assert.equal(toggleB?.props['aria-pressed'], false, 'and the toggle reports closed')
+  assert.equal(toggleB?.props['aria-label'], api.ATTACH_ZH.toggle, 'with the closed-state label')
+
+  // Coming back does not revive it.
+  renderer.resetSlots()
+  assert.equal(
+    elements(renderer.render(CAPSULE, { sessionId: a })).find(
+      (element) => element.props.id === 'dsh-secret-attach-value',
+    ),
+    undefined,
+    'returning to A does not reopen the panel',
+  )
+  reset()
+})
+
+test('D4b: a remount in the SAME session leaves an open panel open', () => {
+  reset()
+  const a = 'd4b-same-session'
+  const toggle = toggleButton(renderer.render(TOGGLE, toggleProps(a)))
+  pressToggle(toggle)
+  ;(toggleButton(renderer.render(TOGGLE, toggleProps(a)))?.props.onClick as (() => void) | undefined)?.()
+  assert.equal(api.currentMode().kind, 'fill', 'the panel is open in A')
+  // An unrelated remount of the same view: component state is rebuilt, but the
+  // session did not change, so nothing may close what the human is filling in.
+  renderer.resetSlots()
+  const again = renderer.render(CAPSULE, { sessionId: a })
+  assert.equal(api.currentMode().kind, 'fill', 'the same session keeps its panel open')
+  assert.notEqual(
+    elements(again).find((element) => element.props.id === 'dsh-secret-attach-value'),
+    undefined,
+    'and it still renders',
+  )
+  reset()
+})
+
+test('D4: a changed session closes the panel, carries nothing over, and does not revive it', async () => {
+  const other = 'other-session'
+  reset()
+  const stub = stubRoutes()
+
+  await withClipboard({ readText: async () => PASTE_TOKEN }, async () => {
+    // A session with the panel open and a half-finished paste offer on screen.
+    api.setAttachMode({ kind: 'fill' })
+    const tree = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    const field = elements(tree).find((element) => element.props.id === 'dsh-secret-attach-value')
+    ;(pasteButtonFor(tree, field)?.props.onClick as ((event: unknown) => void) | undefined)?.(
+      { currentTarget: fakeButtonNode() },
+    )
+    await flushOneTurn()
+    await flushOneTurn()
+    const offered = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(fieldValue(offered, 'dsh-secret-attach-value'), PASTE_TOKEN, 'the offer holds the pasted text')
+    assert.notEqual(
+      elements(offered).find((element) => element.props['data-secret-paste-ask'] === 'value'),
+      undefined,
+      'and the offer is on screen',
+    )
+    assert.equal(api.currentMode().kind, 'fill')
+
+    // An unrelated re-render of the SAME session must not close what is being
+    // filled in: the reset is keyed on the session id alone.
+    api.setAttachMode({ kind: 'fill' })
+    const again = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(fieldValue(again, 'dsh-secret-attach-value'), PASTE_TOKEN, 'the same session keeps its work')
+
+    // The active session changes: the very first frame is already closed.
+    const switched = renderer.render(CAPSULE, { sessionId: other })
+    assert.equal(api.currentMode().kind, 'idle', 'the panel closes on the session change')
+    assert.equal(
+      elements(switched).some((element) => element.props.id === 'dsh-secret-attach-value'),
+      false,
+      'the new session’s first frame draws none of the previous panel',
+    )
+    const nextFrame = renderer.render(CAPSULE, { sessionId: other })
+    assert.equal(
+      elements(nextFrame).some((element) => element.props['data-secret-paste-ask'] === 'value'),
+      false,
+      'and none of the previous session’s pending offer',
+    )
+
+    // Coming back does not revive it either…
+    renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(api.currentMode().kind, 'idle', 'returning to the old session does not reopen its panel')
+    // …and what it had is gone when it is opened again by hand.
+    api.setAttachMode({ kind: 'fill' })
+    const reopened = renderer.render(CAPSULE, { sessionId: SESSION_ID })
+    assert.equal(
+      fieldValue(reopened, 'dsh-secret-attach-value'),
+      '',
+      'the half-filled field did not survive the switch',
+    )
+    assert.equal(
+      elements(reopened).some((element) => element.props['data-secret-paste-ask'] === 'value'),
+      false,
+      'nor did the pending offer',
+    )
+
+    // …and nothing the human left behind follows them into the session that
+    // took over: opening that session's own panel starts empty, with no offer
+    // in flight — the reset is symmetric, so the leak is closed in both
+    // directions, not just out of the old session.
+    renderer.render(CAPSULE, { sessionId: other })
+    api.setAttachMode({ kind: 'fill' })
+    const fresh = renderer.render(CAPSULE, { sessionId: other })
+    assert.equal(
+      fieldValue(fresh, 'dsh-secret-attach-value'),
+      '',
+      'the session that took over starts with an empty field',
+    )
+    assert.equal(
+      elements(fresh).some((element) => element.props['data-secret-paste-ask'] === 'value'),
+      false,
+      'and none of the previous session’s pending offer travelled with the human',
+    )
+  })
+  assert.equal(stub.calls.length, 0, 'closing the panel is local: it asks the host for nothing')
+  restoreFetch()
+  reset()
 })
 
 test('R2/R3: no failed paste is swallowed, and none of them throws', async () => {
@@ -2846,6 +3138,13 @@ test('R2/R3: no failed paste is swallowed, and none of them throws', async () =>
         { currentTarget: fakeButtonNode() },
       )
       await flushOneTurn()
+      await flushOneTurn()
+      // D2: the paste only offered — the human's answer is what makes the attempt.
+      const register = elements(renderer.render(CAPSULE, { sessionId: SESSION_ID })).find(
+        (element) => element.props['data-action'] === 'paste-ask-register',
+      )
+      assert.notEqual(register, undefined, 'the offer is on screen before the attempt')
+      ;(register?.props.onClick as (() => void) | undefined)?.()
       await flushOneTurn()
     })
     assert.equal(failing.calls.length, 1, 'the attempt was made')
@@ -2926,136 +3225,437 @@ test('R2/R3: a pasted key still hits the key validation, and non-value fields ne
 // This case parks the capsule in `busy` on purpose (its submit never resolves),
 // so it is deliberately the last test in the file: nothing after it may be
 // affected by that state.
-test('R2: the composer seat inserts at the caret through inputActions, and reports a missing capability', async () => {
-  // The seat is the composer's right rail, registered once, by id, and it is a
-  // *list* seat: other plugins' entries are untouched by this one.
-  const seats = registrations.filter((entry) => entry.name === 'conversation.input.right')
-  assert.equal(seats.length, 1, 'exactly one composer paste entry')
-  assert.equal(seats[0]?.id, 'secret-paste-composer')
-  const component = seats[0]?.component as (props: unknown) => unknown
-  assert.notEqual(component, undefined)
+// ---------------------------------------------------------------------------
+// t46: the composer's own takeover. Pasted into the Lexical editor, a
+// material-shaped string must never reach the draft: it becomes an offer, and
+// only the human's answer decides what happens. The editor's DOM belongs to the
+// shell, so the interception travels through a guarded capture-phase listener —
+// these tests install that guard themselves, with a local fake document, exactly
+// the way the seat's effect does.
+// ---------------------------------------------------------------------------
 
-  // A fake editor, as the harness's `InputActions` face: captureInsertion hands
-  // back the caret span, insertText records what it was asked to insert.
+/** One offer, as the guard hands it over. */
+interface ComposerOffer {
+  readonly text: string
+  readonly shape: string
+  readonly span: unknown
+}
+
+interface FakeListener {
+  readonly type: string
+  readonly listener: (event: unknown) => void
+  readonly capture: boolean
+}
+
+function fakeDocument(): { readonly doc: unknown; readonly listeners: FakeListener[] } {
+  const listeners: FakeListener[] = []
+  const doc = {
+    addEventListener: (type: string, listener: (event: unknown) => void, capture: boolean): void => {
+      listeners.push({ type, listener, capture })
+    },
+    removeEventListener: (type: string, listener: (event: unknown) => void, capture: boolean): void => {
+      const index = listeners.findIndex(
+        (entry) => entry.type === type && entry.listener === listener && entry.capture === capture,
+      )
+      if (index >= 0) listeners.splice(index, 1)
+    },
+  }
+  return { doc, listeners }
+}
+
+/** The composer editor, as far as the guard can tell. */
+const fakeComposerEditor = {
+  closest: (selector: string): unknown => (selector === api.COMPOSER_EDITOR_SELECTOR ? fakeComposerEditor : null),
+}
+/** One of our own fields (panel or card): never the composer. */
+const fakeOwnField = { closest: (): unknown => null }
+
+/** One paste event, with the flags the guard may set. */
+function fakePaste(
+  target: unknown,
+  text: string,
+  flags: { prevented: boolean; stopped: boolean },
+): Record<string, unknown> {
+  return {
+    target,
+    clipboardData: { getData: () => text },
+    preventDefault: () => {
+      flags.prevented = true
+    },
+    stopPropagation: () => {
+      flags.stopped = true
+    },
+  }
+}
+
+test('t46: a secret pasted into the composer is offered, never written to the draft', async () => {
+  reset()
+  const seats = registrations.filter((entry) => entry.name === 'conversation.input.right')
+  const component = seats[0]?.component as (props: unknown) => unknown
+
   const inserted: { text: string; span: unknown }[] = []
   const editor = {
-    captureInsertion: () => ({ start: 3, end: 3, draftRev: 7 }),
+    captureInsertion: () => ({ start: 5, end: 5, draftRev: 9 }),
     insertText: (text: string, span: unknown) => {
       inserted.push({ text, span })
       return true
     },
   }
-
-  await withClipboard({ readText: async () => `  ${PASTE_TOKEN}  ` }, async () => {
-    const tree = renderer.render(component, { sessionId: SESSION_ID, inputActions: editor })
-    const button = elements(tree).find((element) => element.props['data-secret-paste'] === 'true')
-    assert.notEqual(button, undefined, 'the seat renders one paste action')
-    assert.equal(button?.props.type, 'button')
-    assert.equal(button?.props['aria-label'], api.ATTACH_ZH.paste)
-    // Pressing it must not move focus out of the editor…
-    let prevented = false
-    ;(button?.props.onMouseDown as ((event: unknown) => void) | undefined)?.({
-      preventDefault: () => {
-        prevented = true
-      },
-    })
-    assert.equal(prevented, true, 'the editor keeps focus: mousedown is prevented')
-    // …and the text goes in at the caret the editor reported, trimmed, through
-    // its own insert path (no controlled value is written from here).
-    ;(button?.props.onClick as ((event: unknown) => void) | undefined)?.({ currentTarget: null })
-    await flushOneTurn()
-    assert.deepEqual(
-      inserted,
-      [{ text: PASTE_TOKEN, span: { start: 3, end: 3, draftRev: 7 } }],
-      'the clipboard text is inserted at the captured caret span',
-    )
-  })
-
-  // No clipboard at all: the same three messages the capsule uses, and a throw
-  // would fail this test (the click path is synchronous on the outside).
-  for (const item of [
-    { clipboard: undefined, key: 'pasteUnavailable' },
-    { clipboard: { readText: async () => { throw new Error('denied') } }, key: 'pasteDenied' },
-    { clipboard: { readText: async () => '   ' }, key: 'pasteEmpty' },
-  ] as const) {
-    await withClipboard(item.clipboard, async () => {
-      const tree = renderer.render(component, { sessionId: SESSION_ID, inputActions: editor })
-      const button = elements(tree).find((element) => element.props['data-secret-paste'] === 'true')
-      ;(button?.props.onClick as ((event: unknown) => void) | undefined)?.({ currentTarget: null })
-      await flushOneTurn()
-      const after = renderer.render(component, { sessionId: SESSION_ID, inputActions: editor })
-      assert.equal(
-        visibleText(after).includes(api.ATTACH_ZH[item.key]),
-        true,
-        `${item.key} is the same dictionary string the capsule shows`,
-      )
-      // The other direction of the same rule: a clipboard-side failure is never
-      // reported as an insert failure (that is a different cause).
-      assert.equal(
-        visibleText(after).includes(api.ATTACH_ZH.pasteInsertFailed),
-        false,
-        `${item.key} is not the insert-side message`,
-      )
-    })
+  // A stand-in for the browser's own insertion: what a native paste would do.
+  let draft = 'please use '
+  const nativePaste = (text: string): void => {
+    draft += text
   }
-  assert.equal(inserted.length, 1, 'a failed read inserts nothing')
 
-  // The editor offers no insertion capability at all: the insert-side message is
-  // the honest one — the clipboard read above already succeeded, so blaming the
-  // clipboard would name the wrong cause. Never a throw, never a stolen focus,
-  // never a silent no-op.
-  await withClipboard({ readText: async () => PASTE_TOKEN }, async () => {
-    const tree = renderer.render(component, {
-      sessionId: SESSION_ID,
-      inputActions: { captureInsertion: () => ({ start: 0, end: 0, draftRev: 1 }) },
-    })
-    const button = elements(tree).find((element) => element.props['data-secret-paste'] === 'true')
-    ;(button?.props.onClick as ((event: unknown) => void) | undefined)?.({ currentTarget: null })
+  const { doc, listeners } = fakeDocument()
+  const offers: ComposerOffer[] = []
+  const guard = api.guardComposerPaste({
+    doc,
+    actions: editor,
+    // What the seat's own effect does with an offer: park it for the session and
+    // re-render. These tests drive that same path.
+    onOffer: (offer: ComposerOffer) => {
+      offers.push(offer)
+      api.setComposerOffer({ sessionId: SESSION_ID, text: offer.text, shape: offer.shape, span: offer.span as never })
+    },
+  }) as { uninstall: () => void; allowNextPaste: () => void }
+  try {
+    assert.equal(listeners.length, 1, 'the guard listens once')
+    assert.equal(listeners[0]?.type, 'paste')
+    assert.equal(listeners[0]?.capture, true, 'capture phase: it must run before the editor’s own handler')
+
+    // ① The interception itself.
+    const flags = { prevented: false, stopped: false }
+    listeners[0]?.listener(fakePaste(fakeComposerEditor, PASTE_TOKEN, flags))
+    assert.equal(flags.prevented, true, 'the plaintext never reaches the draft')
+    assert.equal(flags.stopped, true, 'and the editor’s own paste handler never sees it')
+    nativePaste(flags.prevented ? '' : PASTE_TOKEN)
+    assert.equal(draft, 'please use ', 'the draft is byte-for-byte what it was before the paste')
+    assert.equal(draft.includes(PASTE_TOKEN), false, 'and it does not contain the plaintext')
+    assert.equal(inserted.length, 0, 'nothing was inserted either')
+    assert.equal(offers.length, 1, 'the paste became an offer')
+    assert.equal(offers[0]?.text, PASTE_TOKEN, 'the offer holds the text for the human’s decision')
+    assert.deepEqual(offers[0]?.span, { start: 5, end: 5, draftRev: 9 }, 'the caret span is taken at paste time')
+    const expectedShape = `${api.classifyPastedText(PASTE_TOKEN).rule} · ${PASTE_TOKEN.length}`
+    assert.equal(offers[0]?.shape, expectedShape, 'the shape is the rule name and the length')
+
+    // ② The offer as rendered: the whole DOM string is checked for leaks.
+    const offer = offers[0] as ComposerOffer
+    const tree = renderer.render(component, { sessionId: SESSION_ID, inputActions: editor })
+    const dom = JSON.stringify(tree)
+    assert.equal(dom.includes(PASTE_TOKEN), false, 'the rendered DOM never contains the plaintext')
+    assert.equal(dom.includes(PASTE_TOKEN.slice(0, 4)), false, 'nor its first four characters')
+    const register = elements(tree).find((element) => element.props['data-action'] === 'composer-ask-register')
+    const escape = elements(tree).find((element) => element.props['data-action'] === 'composer-ask-text')
+    assert.notEqual(register, undefined, 'the offer carries 「转为密钥」')
+    assert.notEqual(escape, undefined, 'and the 「按普通文本粘贴」 escape')
+    for (const answer of [register, escape]) {
+      assert.equal(answer?.props.type, 'button', 'an answer is a plain button (keyboard-operable)')
+      let kept = false
+      ;(answer?.props.onMouseDown as ((event: unknown) => void) | undefined)?.({
+        preventDefault: () => {
+          kept = true
+        },
+      })
+      assert.equal(kept, true, 'pressing an answer does not take focus')
+    }
+    assert.equal(register?.props['aria-label'], api.ATTACH_ZH.composerAskRegister)
+    assert.equal(escape?.props['aria-label'], api.ATTACH_ZH.pasteAskText)
+
+    // ③ 「转为密钥」: exactly one attach, R1 naming, and the marker at the span.
+    const stub = stubRoutes()
+    stub.attach.payload = { ok: true, variable: ENV_VAR, scope: 'session', replaced: false }
+    assert.equal(bailCalls.length, 0, 'the takeover itself inserted nothing')
+    ;(register?.props.onClick as (() => void) | undefined)?.()
     await flushOneTurn()
-    const after = renderer.render(component, {
-      sessionId: SESSION_ID,
-      inputActions: { captureInsertion: () => ({ start: 0, end: 0, draftRev: 1 }) },
-    })
+    await flushOneTurn()
+    assert.equal(stub.calls.length, 1, 'exactly one registration')
+    assert.equal(stub.calls[0]?.url, api.ATTACH_PATH)
+    const body = stub.calls[0]?.body as Record<string, unknown>
+    assert.equal(body['value'], PASTE_TOKEN)
+    assert.equal(body['name'], '', 'R1: the key is left to the Host')
+    assert.equal(body['label'], '', 'and so is the label')
+    assert.equal(body['scope'], 'session', 'the module default, unchanged')
+    // The marker goes in through the contract's own scoped insertion, at the span
+    // the paste was made in — and the insertion carries the reference, never the
+    // plaintext.
+    assert.equal(bailCalls.length, 1, 'the marker was inserted once')
+    assert.equal(bailCalls[0]?.name, 'slash/input-insert-reference')
+    const placed = bailCalls[0]?.payload as { reference: { ref: string; clipboardText: string }; span: unknown }
+    assert.deepEqual(placed.span, { start: 5, end: 5, draftRev: 9 }, 'at the span the paste was made in')
+    assert.equal(placed.reference.ref, ENV_VAR)
+    assert.equal(JSON.stringify(placed).includes(PASTE_TOKEN), false, 'the draft receives the marker, not the text')
+    assert.equal(inserted.length, 0, 'and the plaintext never travels through insertText on this path')
+    assert.equal(api.pendingComposerOffer(SESSION_ID), null, 'the offer is answered and gone')
+
+    // ④ 「按普通文本粘贴」: the original text, in its place, with no request.
+    listeners[0]?.listener(fakePaste(fakeComposerEditor, PASTE_TOKEN, { prevented: false, stopped: false }))
+    const second = renderer.render(component, { sessionId: SESSION_ID, inputActions: editor })
+    const escapeAgain = elements(second).find((element) => element.props['data-action'] === 'composer-ask-text')
+    const callsBefore = stub.calls.length
+    ;(escapeAgain?.props.onClick as (() => void) | undefined)?.()
+    await flushOneTurn()
+    assert.equal(stub.calls.length, callsBefore, 'the escape asks the host for nothing')
+    assert.equal(inserted.length, 1, 'it inserts the original text')
+    assert.equal(inserted[0]?.text, PASTE_TOKEN)
+    assert.deepEqual(inserted[0]?.span, { start: 5, end: 5, draftRev: 9 }, 'in the place it was pasted')
+    assert.equal(api.pendingComposerOffer(SESSION_ID), null, 'and the offer is dismissed')
+
+    // ⑤ A second paste replaces the pending offer: nothing is silently dropped.
+    listeners[0]?.listener(fakePaste(fakeComposerEditor, PASTE_TOKEN, { prevented: false, stopped: false }))
+    listeners[0]?.listener(fakePaste(fakeComposerEditor, 'sk-second-DO-NOT-LEAK', { prevented: false, stopped: false }))
+    assert.equal(api.pendingComposerOffer(SESSION_ID)?.text, 'sk-second-DO-NOT-LEAK', 'the last paste wins')
+
+    // ⑥ Another session never renders this one's offer, and does not keep it.
+    const foreign = renderer.render(component, { sessionId: 'other-session', inputActions: editor })
     assert.equal(
-      visibleText(after).includes(api.ATTACH_ZH.pasteInsertFailed),
-      true,
-      'a missing insertText capability is reported as an insert failure',
-    )
-    assert.equal(
-      visibleText(after).includes(api.ATTACH_ZH.pasteUnavailable),
+      elements(foreign).some((element) => element.props['data-secret-paste-ask'] === 'composer'),
       false,
-      'the clipboard is not blamed: its read already succeeded',
+      'the other session shows no offer',
     )
-  })
-  // And without a caret to insert at, the same insert-side answer.
-  await withClipboard({ readText: async () => PASTE_TOKEN }, async () => {
-    const tree = renderer.render(component, { sessionId: SESSION_ID, inputActions: { insertText: () => true } })
-    const button = elements(tree).find((element) => element.props['data-secret-paste'] === 'true')
-    ;(button?.props.onClick as ((event: unknown) => void) | undefined)?.({ currentTarget: null })
+    assert.equal(api.pendingComposerOffer(SESSION_ID), null, 'and the previous session’s offer is dropped')
+  } finally {
+    guard.uninstall()
+    restoreFetch()
+    reset()
+  }
+  assert.equal(listeners.length, 0, 'uninstalling removes the listener')
+})
+
+test('t46: the composer guard leaves every other paste alone, and survives its own failures', async () => {
+  reset()
+  const rejections: unknown[] = []
+  const onRejection = (reason: unknown): void => {
+    rejections.push(reason)
+  }
+  process.on('unhandledRejection', onRejection)
+  const inserted: { text: string; span: unknown }[] = []
+  const editor = {
+    captureInsertion: () => ({ start: 1, end: 1, draftRev: 2 }),
+    insertText: (text: string, span: unknown) => {
+      inserted.push({ text, span })
+      return true
+    },
+  }
+  const { doc, listeners } = fakeDocument()
+  const offers: unknown[] = []
+  const guard = api.guardComposerPaste({
+    doc,
+    actions: editor,
+    onOffer: (offer: ComposerOffer) => {
+      offers.push(offer)
+      api.setComposerOffer({ sessionId: SESSION_ID, text: offer.text, shape: offer.shape, span: offer.span as never })
+    },
+  }) as {
+    uninstall: () => void
+    allowNextPaste: () => void
+  }
+  try {
+    // ① Prose, ② an image-only paste: neither is touched, neither is stopped.
+    for (const text of ['just some prose', '']) {
+      const flags = { prevented: false, stopped: false }
+      listeners[0]?.listener(fakePaste(fakeComposerEditor, text, flags))
+      assert.equal(flags.prevented, false, `“${text}” keeps the browser’s own paste`)
+      assert.equal(flags.stopped, false, 'and is not stopped either')
+    }
+    // ③ Our own fields are never intercepted (no friendly fire): the panel's
+    // value field and a card field are both outside the composer editor.
+    for (const target of [fakeOwnField, { closest: () => null }]) {
+      const flags = { prevented: false, stopped: false }
+      listeners[0]?.listener(fakePaste(target, PASTE_TOKEN, flags))
+      assert.equal(flags.prevented, false, 'our own inputs paste natively')
+      assert.equal(flags.stopped, false)
+    }
+    assert.equal(offers.length, 0, 'none of those became an offer')
+
+    // ④ A missing capability means silence, not a broken paste.
+    const noInsert = { captureInsertion: editor.captureInsertion }
+    const { doc: doc2, listeners: listeners2 } = fakeDocument()
+    const guard2 = api.guardComposerPaste({
+      doc: doc2,
+      actions: noInsert as never,
+      onOffer: (offer: ComposerOffer) => offers.push(offer),
+    }) as { uninstall: () => void }
+    const flags2 = { prevented: false, stopped: false }
+    listeners2[0]?.listener(fakePaste(fakeComposerEditor, PASTE_TOKEN, flags2))
+    assert.equal(flags2.prevented, false, 'without insertText nothing is taken over')
+    guard2.uninstall()
+
+    // ⑤ A document that cannot listen: no listener, no throw.
+    const bad = api.guardComposerPaste({ doc: {}, actions: editor, onOffer: () => undefined }) as {
+      uninstall: () => void
+    }
+    bad.uninstall()
+
+    // ⑥ The failure path that must never trap the human's content: the paste-time
+    // span is missing and the register path finds none either, so the offer stays
+    // (the escape is still there) and the NEXT paste goes native.
+    const blind = { captureInsertion: () => null, insertText: editor.insertText }
+    const { doc: doc3, listeners: listeners3 } = fakeDocument()
+    const guard3 = api.guardComposerPaste({
+      doc: doc3,
+      actions: blind as never,
+      onOffer: (offer: ComposerOffer) => {
+        offers.push(offer)
+        api.setComposerOffer({ sessionId: SESSION_ID, text: offer.text, shape: offer.shape, span: offer.span as never })
+      },
+    }) as { uninstall: () => void }
+    const first = { prevented: false, stopped: false }
+    listeners3[0]?.listener(fakePaste(fakeComposerEditor, PASTE_TOKEN, first))
+    assert.equal(first.prevented, true, 'without a caret the paste is still taken over (no plaintext in the draft)')
+    assert.equal(offers.length, 1, 'and it is still offered')
+    const seats = registrations.filter((entry) => entry.name === 'conversation.input.right')
+    const component = seats[0]?.component as (props: unknown) => unknown
+    const tree = renderer.render(component, { sessionId: SESSION_ID, inputActions: blind })
+    const register = elements(tree).find((element) => element.props['data-action'] === 'composer-ask-register')
+    const stub = stubRoutes()
+    ;(register?.props.onClick as (() => void) | undefined)?.()
     await flushOneTurn()
-    const after = renderer.render(component, { sessionId: SESSION_ID, inputActions: { insertText: () => true } })
+    assert.equal(stub.calls.length, 0, 'nothing is registered when the marker has nowhere to go')
+    const afterFailure = renderer.render(component, { sessionId: SESSION_ID, inputActions: blind })
     assert.equal(
-      visibleText(after).includes(api.ATTACH_ZH.pasteInsertFailed),
+      visibleText(afterFailure).includes(api.ATTACH_ZH.pasteInsertFailed),
       true,
-      'no caret to insert at is reported as an insert failure',
+      'the failure is visible',
     )
-    assert.equal(visibleText(after).includes(api.ATTACH_ZH.pasteUnavailable), false)
-  })
-  // And when the editor itself declines the insertion, the same.
-  await withClipboard({ readText: async () => PASTE_TOKEN }, async () => {
-    const refusing = { captureInsertion: () => ({ start: 0, end: 0, draftRev: 1 }), insertText: () => false }
-    const tree = renderer.render(component, { sessionId: SESSION_ID, inputActions: refusing })
-    const button = elements(tree).find((element) => element.props['data-secret-paste'] === 'true')
-    ;(button?.props.onClick as ((event: unknown) => void) | undefined)?.({ currentTarget: null })
-    await flushOneTurn()
-    const after = renderer.render(component, { sessionId: SESSION_ID, inputActions: refusing })
-    assert.equal(
-      visibleText(after).includes(api.ATTACH_ZH.pasteInsertFailed),
-      true,
-      'an insertion the editor declined is reported as an insert failure',
+    assert.notEqual(
+      elements(afterFailure).find((element) => element.props['data-action'] === 'composer-ask-text'),
+      undefined,
+      'the escape is still offered',
     )
-    assert.equal(visibleText(after).includes(api.ATTACH_ZH.pasteUnavailable), false)
+    const next = { prevented: false, stopped: false }
+    listeners3[0]?.listener(fakePaste(fakeComposerEditor, PASTE_TOKEN, next))
+    assert.equal(next.prevented, false, 'the next paste goes back to the browser: the content is never trapped')
+    guard3.uninstall()
+  } finally {
+    guard.uninstall()
+    process.off('unhandledRejection', onRejection)
+    api.clearComposerOffer()
+    restoreFetch()
+    reset()
+  }
+  assert.equal(rejections.length, 0, 'nothing throws out of the listener')
+})
+
+test('D5: the composer seat has no 粘贴 button — it is the takeover’s render slot only', async () => {
+  reset()
+  // The takeover's slot is module state: start from "nothing pending".
+  api.clearComposerOffer()
+  // The seat itself survives: it is where the takeover's notice and offer render.
+  const seats = registrations.filter((entry) => entry.name === 'conversation.input.right')
+  assert.equal(seats.length, 1, 'exactly one composer entry')
+  assert.equal(seats[0]?.id, 'secret-paste-composer')
+  const component = seats[0]?.component as (props: unknown) => unknown
+  assert.notEqual(component, undefined)
+
+  // ② No clipboard read on this path. It is counted here, so re-adding the
+  // button — whose whole job was a read then an insert — would show up as one.
+  let reads = 0
+  const editor = {
+    captureInsertion: () => ({ start: 3, end: 3, draftRev: 7 }),
+    insertText: () => true,
+  }
+  await withClipboard(
+    {
+      readText: async () => {
+        reads += 1
+        return `  ${PASTE_TOKEN}  `
+      },
+    },
+    async () => {
+      // ① The button is gone; the seat is still registered and still renders.
+      const idle = renderer.render(component, { sessionId: SESSION_ID, inputActions: editor })
+      assert.equal(
+        elements(idle).some((element) => element.props['data-secret-paste'] === 'true'),
+        false,
+        'the composer seat renders no 粘贴 button',
+      )
+      assert.equal(
+        elements(idle).some((element) => element.props['data-secret-paste-ask'] === 'composer'),
+        false,
+        'and nothing is offered while it is idle',
+      )
+      assert.equal(reads, 0, 'the seat reads no clipboard')
+
+      // ③ Idle means empty: the seat node is there, and nothing else is.
+      // (`elements` counts the node it is given, so an idle seat is exactly one
+      // node; its `null` children render no DOM at all.)
+      const seat = elements(idle).find((element) => element.props['data-secret-paste-seat'] === 'composer')
+      assert.notEqual(seat, undefined, 'the seat node itself is still there')
+      const subtree = elements(seat) as readonly unknown[]
+      assert.equal(subtree.length, 1, 'the idle seat subtree holds nothing but the seat itself')
+      assert.equal(subtree[0], seat, 'and that one node is the seat')
+
+      // ④ A pending offer still renders *here*: the two answers of the takeover.
+      api.setComposerOffer({
+        sessionId: SESSION_ID,
+        text: PASTE_TOKEN,
+        shape: 'high-entropy · 32',
+        span: { start: 3, end: 3, draftRev: 7 },
+      })
+      const offering = renderer.render(component, { sessionId: SESSION_ID, inputActions: editor })
+      assert.notEqual(
+        elements(offering).find((element) => element.props['data-secret-paste-ask'] === 'composer'),
+        undefined,
+        'the takeover still renders inside this seat',
+      )
+      for (const action of ['composer-ask-register', 'composer-ask-text']) {
+        assert.notEqual(
+          elements(offering).find((element) => element.props['data-action'] === action),
+          undefined,
+          `${action} is still offered here`,
+        )
+      }
+      assert.equal(reads, 0, 'an offer needs no clipboard read either')
+      assert.equal(
+        elements(offering).some((element) => element.props['data-secret-paste'] === 'true'),
+        false,
+        'and the seat never grows a 粘贴 button back',
+      )
+      api.clearComposerOffer()
+    },
+  )
+
+  // Layer one of the field-button guard: the source has exactly the seven field
+  // actions, and the seat is not one of them. (Layer two is the DOM: the panel's
+  // three in the identifier-row test, the card's two in client-card.test.ts, and
+  // the two management surfaces below.)
+  const source = readFileSync(new URL('../src/client/entry.ts', import.meta.url), 'utf8')
+  assert.equal((source.match(/pasteAction\(\{/g) ?? []).length, 7, 'exactly the seven field buttons call pasteAction')
+  const seatSource = source.slice(
+    source.indexOf('function SecretComposerPaste'),
+    source.indexOf('function SecretAttachToggle'),
+  )
+  assert.equal(seatSource.length > 0, true, 'the seat source was found')
+  assert.equal(seatSource.includes('pasteAction('), false, 'and the composer seat calls it nowhere')
+  assert.equal(
+    source.includes("t('pasteInsertFailed')"),
+    true,
+    'the insert-failure copy is still in use (the takeover reports it when no caret can be had)',
+  )
+
+  // The management confirmation card keeps its own single field button.
+  const manageCard = MANAGE.SecretManageCard as (props: unknown) => unknown
+  const card = manageCard({
+    node: {
+      data: {
+        callId: 'call-d5',
+        request: { action: 'value', target: 'session' },
+        requestUnreadable: false,
+        settled: false,
+        outcome: null,
+        failure: null,
+      },
+    },
+    sessionId: SESSION_ID,
   })
+  assert.equal(
+    elements(card).filter((element) => element.props['data-secret-paste'] === 'true').length,
+    1,
+    'the management confirmation card owns exactly one paste field button',
+  )
+  restoreFetch()
+  reset()
 })
 
 test('R2: a field busy with a submit in flight disables its own paste action', async () => {
