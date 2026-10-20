@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="Secret Channels">
+  <path fill="#1b4f9c" d="M16 2.6 26.8 6.7v9c0 7-4.5 12.7-10.8 14.9C9.7 28.4 5.2 22.7 5.2 15.7v-9Z"/>
+  <circle cx="16" cy="12.8" r="3.5" fill="#ffffff"/>
+  <path d="M16 15.1v6.3" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+</svg>

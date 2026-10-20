@@ -65,6 +65,7 @@ profile 的组合树是「root 空清单 → `dsh.profile.bundles` 里每个 bun
 - insert:
     - id: secret
       name: '@xinvxueyuan/cordis-plugin-secret'
+      inject: [tools, authorization, credentials, shellEnv, sessions, agents, connection]
       config:
         requestTimeoutMs: 300000
         maxPendingRequests: 4
@@ -77,6 +78,25 @@ profile 的组合树是「root 空清单 → `dsh.profile.bundles` 里每个 bun
 注意：对**同一个 `link:` 依赖**重复按绝对路径安装是 no-op，此时安装器报 `changed: false` + `application: "failed"` + `error.code: "ambiguous-install"`——它按 profile 依赖的 diff 归属安装目标，而路径 spec 与已存在的同名依赖对不上。这不代表插件没生效（该次调用没有改动任何文件）；用 `cordis_inspect_query` 核对更可靠：host `Tool/listTools` 应出现 `secret_request`，host `Config/listConfigs` 应出现 `include:secret`，client `Slots/listSubTree {root:"conversation.chat.node"}` 的 occupants 应出现 `secret-request`（若同时看 `{root:"shell.overlay"}`，判据是那里**不应再有** `secret.request.dialog`）。
 
 来源构建：`npm install && npm run build`（`lib/` 是 loader 与浏览器实际加载的产物；`src/` 为 TypeScript 源码）。
+
+## 组合节点（官方）
+
+Host 半声明 **7 个硬依赖**。Loader 会让这一行等待这些服务：缺任何一个时插件保持未 `apply`（不抛错），在该 profile 里表现为「不出现」而不是「出现但坏了」。
+
+| 服务键 | 官方提供方（row / 包） | 必需性 | 用途 |
+| --- | --- | --- | --- |
+| `tools` | `tools` / `@deepseek-ai/dsh-tools` | 硬 | 注册 `secret_request` 与 `secret_manage` 两个工具。 |
+| `authorization` | `authorization` / `@deepseek-ai/dsh-authorization` | 硬 | 用官方的凭据获取流程承载持久授权（每个 key 一次 attempt）。 |
+| `credentials` | `credentials` / `@deepseek-ai/dsh-credentials-local` | 硬 | `persistent` 范围的落库与回读；记录空间里那条不含密钥材料的标记也写在这里。 |
+| `shellEnv` | `shell-env` / `@deepseek-ai/dsh-shell-env` | 硬 | 为每个变量名声明 contributor，按会话、按执行解析 `DSH_SECRET_*`。 |
+| `sessions` | `session` / `@deepseek-ai/dsh-session` | 硬 | `ctx.sessions.get(id)` 把授权锚定到活会话，并校验锚点仍在会话表面上。 |
+| `agents` | `agent` / `@deepseek-ai/dsh-agent` | 硬 | `ctx.agents.get/roots` 把调用归到发起它的 Agent（live root / delegated / 失效 id）。 |
+| `connection` | `connection` / `@deepseek-ai/dsh-client-connection`（`dsh-web-app` 层） | 硬 | 在官方信任栅栏内挂 `/api/secret.*` 路由（本机 / 可信 Host、同源、签名 Cookie）。 |
+| `llm` | `llm` / `@deepseek-ai/dsh-llm` | **可选** | 附加密钥时让模型**建议**一个变量键名；缺 `llm` 时插件**仍激活**、附加仍成功，只是退回本地规则命名。 |
+
+`llm` **故意不进 `inject`**：它经 `ctx.get('llm')` 可选获取（`src/index.ts` 的注释写明了这一点），把它写进硬依赖会让没有 llm 的 profile 直接失去整个插件。
+
+**一致性约束**：patch 的 `inject:` 与 `src/index.ts` 的 `export const inject` 是同一份依赖名单的两个声明处——前者决定 Loader 等哪些服务才激活该行，后者决定插件自己何时 `apply`。**两处必须集合相等**，改一处而漏另一处会造成「行已激活但插件不 apply」或反之。`test/manifest.test.ts` 从这两个文件各自的文本里提取列表并比对，不硬编码名单；它随 `npm test` 一起跑。
 
 ## 配置（Config）
 

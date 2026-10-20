@@ -1,9 +1,12 @@
 # Bundle patch for @xinvxueyuan/cordis-plugin-secret.
 # Applied by `plugin_manager install_bundle` (or any bundle layer that selects
 # this bundle); the id below is the Loader entry id and the name is this package.
+# `inject` mirrors `export const inject` in src/index.ts and is guarded by
+# test/manifest.test.ts — keep both lists identical (compare as sets).
 - insert:
     - id: secret
       name: '@xinvxueyuan/cordis-plugin-secret'
+      inject: [tools, authorization, credentials, shellEnv, sessions, agents, connection]
       config:
         # One secret_request waits this long for the human before failing closed.
         requestTimeoutMs: 300000

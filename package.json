@@ -1,16 +1,20 @@
 {
   "name": "@xinvxueyuan/cordis-plugin-secret",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Cordis (DeepSeek Harness) plugin: secrets travel between a human and the agent in both directions — the agent asks, or the human attaches one to their own message — and the agent only ever receives an opaque session-scoped variable name (DSH_SECRET_*), never the value",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
+  "icon": "icon.svg",
   "exports": {
     ".": {
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
     "./client": "./lib/client/entry.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
@@ -18,6 +22,8 @@
     "lib",
     "src",
     "cordis.patch.yml",
+    "locale",
+    "icon.svg",
     "README.md",
     "LICENSE-MIT",
     "LICENSE-APACHE"
@@ -53,7 +59,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.client.json && node scripts/wrap-client.mjs",
     "prepublishOnly": "npm run build",
-    "test": "npm run build && node --test test/unit.test.ts test/register.test.ts test/real-connection.test.ts test/client-card.test.ts test/attach.test.ts test/attach-wiring.test.ts test/client-attach.test.ts test/client-artifact.test.ts test/history.test.ts",
+    "test": "npm run build && node --test test/manifest.test.ts test/unit.test.ts test/register.test.ts test/real-connection.test.ts test/client-card.test.ts test/attach.test.ts test/attach-wiring.test.ts test/client-attach.test.ts test/client-artifact.test.ts test/history.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json && tsc --noEmit -p tsconfig.test.json"
   },
   "repository": {
